@@ -28,6 +28,25 @@ final class AVIOReader: @unchecked Sendable {
     private var position: Int64 = 0
     private var fileSize: Int64 = -1
 
+    /// Cumulative bytes returned by every `fetchChunk` (seekable mode)
+    /// and `StreamingDelegate.didReceive` (streaming mode) since the
+    /// reader was opened. Read by the engine's memory probe to compare
+    /// against RSS growth — if RSS climbs faster than this counter,
+    /// the leak is downstream of the network read (AVPlayer, IOSurface,
+    /// Foundation cache, etc.). Atomic via `counterLock`.
+    private let counterLock = NSLock()
+    private var _cumulativeBytesFetched: Int64 = 0
+    var cumulativeBytesFetched: Int64 {
+        counterLock.lock()
+        defer { counterLock.unlock() }
+        return _cumulativeBytesFetched
+    }
+    private func addBytesFetched(_ n: Int) {
+        counterLock.lock()
+        _cumulativeBytesFetched &+= Int64(n)
+        counterLock.unlock()
+    }
+
     /// True when the source is a live stream (no Content-Length).
     private var isStreaming: Bool { fileSize <= 0 }
 
@@ -327,6 +346,7 @@ final class AVIOReader: @unchecked Sendable {
             self.streamLock.lock()
             self.streamBuffer.append(data)
             self.streamLock.unlock()
+            self.addBytesFetched(data.count)
             self.streamDataReady.signal()
         } onComplete: { [weak self] in
             self?.streamLock.lock()
@@ -470,6 +490,7 @@ final class AVIOReader: @unchecked Sendable {
                    http.statusCode != 200 && http.statusCode != 206 {
                     return nil
                 }
+                addBytesFetched(data.count)
                 return data
             } catch {
                 lastError = error

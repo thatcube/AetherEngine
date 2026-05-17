@@ -296,6 +296,15 @@ final class AudioBridge: @unchecked Sendable {
         cleanup()
     }
 
+    /// Current FIFO depth in samples (per channel). Used by the engine
+    /// memory probe to spot drain stalls. Steady-state is below
+    /// `encoderCtx.frame_size` (~4608 at 48 kHz); a growing value
+    /// indicates the encoder isn't keeping up with the resampler.
+    var fifoSampleCount: Int {
+        guard let f = fifo else { return 0 }
+        return Int(av_audio_fifo_size(f))
+    }
+
     /// Mark a fragment boundary. Drains the FIFO (drops the partial
     /// frame's worth of samples that was buffered for the next
     /// encoder packet, max ~96 ms at 48 kHz), and rebases the

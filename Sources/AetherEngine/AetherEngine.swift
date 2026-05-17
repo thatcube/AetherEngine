@@ -1505,16 +1505,40 @@ public final class AetherEngine: ObservableObject {
                     }
                 }
 
-                EngineLog.emit(
-                    "[AetherEngine] memprobe t=\(elapsed)s "
-                    + "rss=\(rssMB)MB subCues=\(cueCount) "
+                // Pipeline counters from the native HLS engine. Zero
+                // when the SW path is active (no HLSVideoEngine) or
+                // pre-start. Read once per probe — fields are not
+                // mutually atomic but the 30 s cadence makes drift
+                // irrelevant for trend analysis.
+                let stats = self.nativeVideoSession?.diagnosticStats()
+                let avioMB = (stats?.avioBytesFetched ?? 0) / 1024 / 1024
+                let cacheMB = (stats?.segmentCacheBytes ?? 0) / 1024 / 1024
+                let cacheCount = stats?.segmentCacheCount ?? 0
+                let packetsWritten = stats?.producerPacketsWritten ?? 0
+                let audioFifo = stats?.audioFifoSamples ?? 0
+
+                let line = "[AetherEngine] memprobe t=\(elapsed)s "
+                    + "rss=\(rssMB)MB "
+                    + "avioFetchedMB=\(avioMB) "
+                    + "cacheCount=\(cacheCount) cacheMB=\(cacheMB) "
+                    + "packetsWritten=\(packetsWritten) "
+                    + "audioFifo=\(audioFifo) "
+                    + "subCues=\(cueCount) "
                     + "audioTracks=\(self.audioTracks.count) "
                     + "subTracks=\(self.subtitleTracks.count) "
                     + "subActive=\(self.isSubtitleActive) "
                     + "avBufAhead=\(String(format: "%.1f", bufferAheadSec))s "
-                    + "avBufBehind=\(String(format: "%.1f", bufferBehindSec))s",
-                    category: .engine
-                )
+                    + "avBufBehind=\(String(format: "%.1f", bufferBehindSec))s"
+
+                EngineLog.emit(line, category: .engine)
+                // Also write to stdout so the line shows up in Xcode's
+                // debug console even on devices where the OSLog stream
+                // isn't being captured. EngineLog's own stdout fallback
+                // is suppressed once Sodalite installs its LogTap
+                // handler, so we duplicate the memprobe line here only.
+                // One line per 30 s is cheap; the rest of EngineLog stays
+                // single-sink to avoid console spam.
+                print(line)
             }
         }
     }

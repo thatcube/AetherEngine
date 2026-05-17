@@ -922,6 +922,33 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// only make sense when AVPlayer can engage an HDR pipeline.
     public private(set) var servingMasterPlaylist: Bool = false
 
+    // MARK: - Diagnostics
+
+    /// Snapshot of internal pipeline counters for the engine memory
+    /// probe. All fields are point-in-time reads; no locking across
+    /// fields, so individual values may be from slightly different
+    /// instants (acceptable for a 30 s probe).
+    public struct DiagnosticStats {
+        public let segmentCacheCount: Int
+        public let segmentCacheBytes: Int
+        public let producerPacketsWritten: Int
+        public let avioBytesFetched: Int64
+        public let audioFifoSamples: Int
+    }
+
+    /// Read the current pipeline counters. Returns zeros for any
+    /// sub-system that hasn't been constructed yet (pre-start or
+    /// post-stop).
+    public func diagnosticStats() -> DiagnosticStats {
+        DiagnosticStats(
+            segmentCacheCount: cache?.count ?? 0,
+            segmentCacheBytes: cache?.totalBytes ?? 0,
+            producerPacketsWritten: producer?.packetsWrittenCount ?? 0,
+            avioBytesFetched: demuxer?.avioBytesFetched ?? 0,
+            audioFifoSamples: audioBridge?.fifoSampleCount ?? 0
+        )
+    }
+
     public func stop() {
         restartLock.lock()
         producer?.stop()

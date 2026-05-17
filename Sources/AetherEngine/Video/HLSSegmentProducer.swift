@@ -269,6 +269,24 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var pumpStarted = false
     private var shouldStop = false
 
+    /// Cumulative count of `av_write_frame` calls the pump has made for
+    /// video packets. Promoted from a local `packetsWritten` in
+    /// `runPumpLoop` to an instance var so the engine memprobe can
+    /// observe pump throughput. Audio-bridge packets are not counted
+    /// here (they go through a different write path).
+    private let packetCounterLock = NSLock()
+    private var _packetsWrittenCount: Int = 0
+    var packetsWrittenCount: Int {
+        packetCounterLock.lock()
+        defer { packetCounterLock.unlock() }
+        return _packetsWrittenCount
+    }
+    private func bumpPacketsWritten() {
+        packetCounterLock.lock()
+        _packetsWrittenCount &+= 1
+        packetCounterLock.unlock()
+    }
+
     /// Set once the pump exits (EOF, error, or `stop()`). Read by
     /// `waitForFinish(timeout:)` so the host can synchronously
     /// tear down this producer before constructing a successor at a
@@ -523,7 +541,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
         let pumpStart = DispatchTime.now()
         var packetsRead = 0
-        var packetsWritten = 0
         let lastError: Int32 = 0
 
         do {
@@ -857,7 +874,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     }
                     if let prev = pendingVideoPkt {
                         finalizeAndWriteVideo(prev, nextDts: packet.pointee.dts, ctx: ctx)
-                        packetsWritten += 1
+                        bumpPacketsWritten()
                     }
                     pendingVideoPkt = packet
                     pktPtr = nil  // hand ownership to pendingVideoPkt; suppress defer-free
@@ -913,7 +930,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // the source.
         if let prev = pendingVideoPkt {
             finalizeAndWriteVideo(prev, nextDts: nil, ctx: ctx)
-            packetsWritten += 1
+            bumpPacketsWritten()
             pendingVideoPkt = nil
         }
         if let prev = pendingAudioPkt, let audio = audioConfig {
@@ -928,7 +945,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - pumpStart.uptimeNanoseconds) / 1_000_000
         EngineLog.emit(
             "[HLSSegmentProducer] pump finished: packetsRead=\(packetsRead) "
-            + "packetsWritten=\(packetsWritten) trailer=\(trailerRet) lastError=\(lastError) "
+            + "packetsWritten=\(packetsWrittenCount) trailer=\(trailerRet) lastError=\(lastError) "
             + "elapsed=\(String(format: "%.0f", elapsedMs))ms cacheCount=\(cache.count)",
             category: .session
         )

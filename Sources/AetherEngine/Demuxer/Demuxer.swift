@@ -28,6 +28,14 @@ final class Demuxer: @unchecked Sendable {
     /// Retained while the format context is open for HTTP streams.
     private var avioReader: AVIOReader?
 
+    /// Cumulative bytes fetched by the AVIO reader since the source
+    /// was opened. Used by the engine's memory probe to compare
+    /// network throughput against RSS growth. Zero for `file://`
+    /// sources (no AVIOReader is involved).
+    var avioBytesFetched: Int64 {
+        avioReader?.cumulativeBytesFetched ?? 0
+    }
+
     /// Open a media URL and probe its streams.
     ///
     /// `extraHeaders` are attached to every HTTP request the AVIO

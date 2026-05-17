@@ -198,6 +198,15 @@ final class SegmentCache {
         return entries.count
     }
 
+    /// Sum of all resident segment bytes (excluding the pinned init
+    /// segment). Tells the memory probe whether the cache is honouring
+    /// its window or growing unbounded.
+    var totalBytes: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return entries.values.reduce(0) { $0 + $1.count }
+    }
+
     // MARK: - Internal
 
     /// Drop any entries outside `[currentTarget - backwardWindow,
