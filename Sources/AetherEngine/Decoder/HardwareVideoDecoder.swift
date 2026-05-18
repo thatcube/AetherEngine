@@ -114,24 +114,18 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
         formatDescription = formatDesc
 
-        // 2. Decoder specification: REQUIRE hardware. Refuse the
-        //    session creation outright if VT would otherwise fall
-        //    back to software decode on this platform/codec, because
-        //    the whole point of routing HEVC through this path is
-        //    HW decode under our explicit lifecycle. Software-decode
-        //    HEVC is rejected by the user and would tank CPU at 4K
-        //    anyway. Key is iOS 17 / tvOS 17 (`require`); pre-iOS 17
-        //    falls back to the `prefer` key which gives the same
-        //    behaviour on devices with HW decode but allows SW
-        //    fallback if unavailable.
-        let decoderSpec: NSDictionary
+        // 2. Decoder specification: REQUIRE hardware on tvOS 17+ so VT
+        //    refuses session creation outright rather than silently
+        //    falling back to SW decode (which we'd see only as
+        //    pathological CPU + frame drops at 4K, not a clear
+        //    failure). The Require key was added in tvOS 17 / iOS 17;
+        //    pre-17 we pass nil which lets VT choose, but Sodalite's
+        //    deployment target is tvOS 26 so the if-available branch
+        //    is the only one taken in production.
+        var decoderSpec: NSDictionary?
         if #available(tvOS 17.0, iOS 17.0, *) {
             decoderSpec = [
                 kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: true,
-            ]
-        } else {
-            decoderSpec = [
-                kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: true,
             ]
         }
 
