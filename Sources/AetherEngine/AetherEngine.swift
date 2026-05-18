@@ -248,12 +248,24 @@ public final class AetherEngine: ObservableObject {
 
     /// DIAGNOSTIC POC: how often the memprobe should trigger an
     /// AVPlayerItem reload. Zero disables the POC (production
-    /// behaviour). Non-zero triggers `nativeHost.reloadCurrentItem()`
-    /// every `N` seconds during playback so we can measure whether
-    /// AVPlayer actually releases its accumulated state on item
-    /// replacement. Set on the native path only — software path is
-    /// untouched.
-    private static let DIAG_RELOAD_INTERVAL_SEC: TimeInterval = 300
+    /// behaviour). Single test run (2026-05-18) with this at 300s
+    /// confirmed:
+    ///   - reload mechanism functions (AVPlayer rebuilds item, seek
+    ///     to position restores correctly)
+    ///   - RSS drop after reload + 2s wait was only ~73 MB out of
+    ///     ~900 MB above baseline → most accumulated state survives
+    ///     item replacement
+    ///   - playback broke 30s after reload because the producer-side
+    ///     pipeline had pruned the next-up segments based on the
+    ///     pre-reload AVPlayer target; AVPlayer asked for them after
+    ///     reload, cache timed out → 404 → stall
+    /// Conclusion: AVPlayer's deep state (HEVC decoder pool,
+    /// IOSurface pool, internal HLS-fMP4 demuxer cache) does NOT
+    /// release on item replacement. The AVQueuePlayer-chunked
+    /// approach would have the same fundamental limitation. Path
+    /// scrapped — see test results in PR / commit history.
+    /// Keep at 0 in production.
+    private static let DIAG_RELOAD_INTERVAL_SEC: TimeInterval = 0
 
     /// Wall-clock timestamp of the last POC reload, or nil if no reload
     /// has fired yet this session. Compared against the memprobe tick
