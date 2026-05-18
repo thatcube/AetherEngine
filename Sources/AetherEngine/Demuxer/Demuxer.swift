@@ -63,7 +63,10 @@ final class Demuxer: @unchecked Sendable {
         applyProbeBudget(allocated)
 
         let urlString = url.isFileURL ? url.path : url.absoluteString
-        let ret = avformat_open_input(&ctx, urlString, nil, nil)
+        var opts: OpaquePointer? = nil
+        Self.applyDemuxerOptions(&opts)
+        let ret = avformat_open_input(&ctx, urlString, nil, &opts)
+        av_dict_free(&opts)
         guard ret == 0, let openedCtx = ctx else {
             throw DemuxerError.openFailed(code: ret)
         }
@@ -89,7 +92,10 @@ final class Demuxer: @unchecked Sendable {
 
         // 3. Open input, pass nil for URL since pb is already set
         var ctxPtr: UnsafeMutablePointer<AVFormatContext>? = ctx
-        let ret = avformat_open_input(&ctxPtr, nil, nil, nil)
+        var opts: OpaquePointer? = nil
+        Self.applyDemuxerOptions(&opts)
+        let ret = avformat_open_input(&ctxPtr, nil, nil, &opts)
+        av_dict_free(&opts)
         guard ret == 0 else {
             formatContext = nil
             avioReader?.close()
@@ -114,6 +120,20 @@ final class Demuxer: @unchecked Sendable {
     private func applyProbeBudget(_ ctx: UnsafeMutablePointer<AVFormatContext>) {
         ctx.pointee.probesize = 50 * 1024 * 1024
         ctx.pointee.max_analyze_duration = 60 * 1_000_000
+    }
+
+    /// Demuxer options passed to every `avformat_open_input` call.
+    /// Currently sets `fflags=+genpts` so libavformat regenerates
+    /// missing pts/dts values using its own (battle-tested) algorithm
+    /// rather than relying on our custom NOPTS-dts repair logic + the
+    /// monotonic-bump fallback. Per DrHurt's pointer on AetherEngine#4
+    /// this is the same option Jellyfin's server-side remux uses to
+    /// handle broken MKVs cleanly, and the goal is to stop producing
+    /// the subtle fragment artifacts that have been triggering the
+    /// pathological AVPlayer HLS-fMP4 buffer growth on long-form
+    /// 4K HDR HEVC playback.
+    private static func applyDemuxerOptions(_ opts: inout OpaquePointer?) {
+        av_dict_set(&opts, "fflags", "+genpts", 0)
     }
 
     /// Common stream probing after open.
