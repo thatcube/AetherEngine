@@ -220,7 +220,7 @@ final class MP4SegmentMuxer {
 
         // Allocate the mp4 muxer. URL string is a placeholder; the
         // muxer never opens a real file because we hand it our own
-        // AVIO context via io_open.
+        // AVIO context attached directly to `ctx.pb` below.
         var ctxOut: UnsafeMutablePointer<AVFormatContext>?
         let allocRet = avformat_alloc_output_context2(&ctxOut, nil, "mp4", "segment.m4s")
         guard allocRet == 0, let ctx = ctxOut else {
@@ -236,12 +236,21 @@ final class MP4SegmentMuxer {
         // setting; mp4 muxer respects the same compliance level.
         ctx.pointee.strict_std_compliance = -2
 
-        // Wire io trampolines so write_header / packet writes / trailer
-        // all route through the FragmentSplitter into our staging fd
-        // instead of opening a real file.
-        ctx.pointee.opaque = Unmanaged.passUnretained(self).toOpaque()
-        ctx.pointee.io_open = mp4SegmentMuxerIOOpen
-        ctx.pointee.io_close2 = mp4SegmentMuxerIOClose
+        // Pre-attach the AVIO context routing through our
+        // FragmentSplitter. The mp4 muxer writes directly to `s->pb`;
+        // unlike hlsenc it does NOT call `s->io_open` to allocate one
+        // on demand, so we must have a real pb in place before
+        // avformat_write_header runs (the previous trampoline-only
+        // wiring crashed in mov_init at first pb dereference with a
+        // 0x90-offset EXC_BAD_ACCESS).
+        guard let pb = Self.allocAVIOContext(muxer: self) else {
+            avformat_free_context(ctx)
+            self.formatContext = nil
+            close(fd)
+            try? FileManager.default.removeItem(at: stagingPath)
+            throw MuxerError.avioAllocFailed
+        }
+        ctx.pointee.pb = pb
 
         // Video stream.
         guard let videoStream = avformat_new_stream(ctx, nil) else {
@@ -357,15 +366,32 @@ final class MP4SegmentMuxer {
 
     // MARK: - Internal cleanup
 
-    /// Free the format context + any buffer libavformat allocated for
-    /// its io callbacks. Safe to call multiple times.
+    /// Free the format context + the AVIO context attached to its
+    /// `pb`. The avio buffer (`pb->buffer`) was allocated via
+    /// `av_malloc` and `avio_context_free` does NOT free it, so we
+    /// drop that explicitly first. Safe to call multiple times.
     private func cleanup() {
         if let ctx = formatContext {
-            // Clear opaque first so any late io_open from the muxer's
-            // own teardown path doesn't dereference a self we're about
-            // to deinit. avformat_free_context shouldn't trigger
-            // io_open at this point but defensive.
-            ctx.pointee.opaque = nil
+            // Flush + free the AVIO context. The mp4 muxer's
+            // write_trailer should already have flushed via avio_flush
+            // (or our writePacket path), but call it defensively in
+            // case the muxer is being torn down mid-segment after a
+            // header-write failure.
+            if let pb = ctx.pointee.pb {
+                avio_flush(pb)
+                // Free the avio buffer (separate alloc from the
+                // AVIOContext struct itself).
+                if pb.pointee.buffer != nil {
+                    withUnsafeMutablePointer(to: &pb.pointee.buffer) { bufRef in
+                        bufRef.withMemoryRebound(to: Optional<UnsafeMutableRawPointer>.self, capacity: 1) { raw in
+                            av_freep(UnsafeMutableRawPointer(raw))
+                        }
+                    }
+                }
+                var pbVar: UnsafeMutablePointer<AVIOContext>? = pb
+                avio_context_free(&pbVar)
+                ctx.pointee.pb = nil
+            }
             avformat_free_context(ctx)
             formatContext = nil
         }
@@ -377,16 +403,17 @@ final class MP4SegmentMuxer {
         }
     }
 
-    // MARK: - AVIO trampoline plumbing
+    // MARK: - AVIO
 
-    /// Called by the io_open trampoline to allocate a per-context AVIO
-    /// buffer that routes writes back into the FragmentSplitter.
-    /// Returns nil on alloc failure.
-    fileprivate func makeAVIOContext() -> UnsafeMutablePointer<AVIOContext>? {
+    /// Allocate the AVIO context the mp4 muxer writes through. The
+    /// muxer accesses `s->pb` directly (it never calls `s->io_open`,
+    /// unlike hlsenc's wrap), so this gets attached to
+    /// `ctx.pointee.pb` before `avformat_write_header`.
+    fileprivate static func allocAVIOContext(muxer: MP4SegmentMuxer) -> UnsafeMutablePointer<AVIOContext>? {
         let bufSize: Int32 = 65536
         guard let raw = av_malloc(Int(bufSize)) else { return nil }
         let buf = raw.assumingMemoryBound(to: UInt8.self)
-        let opaque = Unmanaged.passUnretained(self).toOpaque()
+        let opaque = Unmanaged.passUnretained(muxer).toOpaque()
         guard let pb = avio_alloc_context(
             buf,
             bufSize,
@@ -401,22 +428,6 @@ final class MP4SegmentMuxer {
         }
         pb.pointee.seekable = 0
         return pb
-    }
-
-    /// Called by the io_close2 trampoline to flush + free a per-context
-    /// AVIO buffer. Walks the FragmentSplitter to push any buffered
-    /// bytes, then releases the avformat-side state.
-    fileprivate func releaseAVIOContext(_ pb: UnsafeMutablePointer<AVIOContext>) {
-        avio_flush(pb)
-        if pb.pointee.buffer != nil {
-            withUnsafeMutablePointer(to: &pb.pointee.buffer) { bufRef in
-                bufRef.withMemoryRebound(to: Optional<UnsafeMutableRawPointer>.self, capacity: 1) { raw in
-                    av_freep(UnsafeMutableRawPointer(raw))
-                }
-            }
-        }
-        var pbVar: UnsafeMutablePointer<AVIOContext>? = pb
-        avio_context_free(&pbVar)
     }
 
     /// Receive a chunk of muxer output. Routes through the
@@ -450,38 +461,7 @@ private final class ByteCounter {
     var writeFailed: Bool = false
 }
 
-// MARK: - C callback bridges
-
-/// `s->io_open` trampoline. Recovers the MP4SegmentMuxer via the
-/// format context's opaque and asks it for a fresh AVIO context.
-private func mp4SegmentMuxerIOOpen(
-    s: UnsafeMutablePointer<AVFormatContext>?,
-    pb: UnsafeMutablePointer<UnsafeMutablePointer<AVIOContext>?>?,
-    url: UnsafePointer<CChar>?,
-    flags: Int32,
-    options: UnsafeMutablePointer<OpaquePointer?>?
-) -> Int32 {
-    guard let s = s, let pb = pb, let opaque = s.pointee.opaque else {
-        return -1
-    }
-    let muxer = Unmanaged<MP4SegmentMuxer>.fromOpaque(opaque).takeUnretainedValue()
-    guard let ctx = muxer.makeAVIOContext() else { return -1 }
-    pb.pointee = ctx
-    return 0
-}
-
-/// `s->io_close2` trampoline. Frees the AVIO context allocated in
-/// io_open. The MP4SegmentMuxer holds the strong reference to the
-/// splitter so the splitter's accumulated state isn't lost.
-private func mp4SegmentMuxerIOClose(
-    s: UnsafeMutablePointer<AVFormatContext>?,
-    pb: UnsafeMutablePointer<AVIOContext>?
-) -> Int32 {
-    guard let s = s, let pb = pb, let opaque = s.pointee.opaque else { return 0 }
-    let muxer = Unmanaged<MP4SegmentMuxer>.fromOpaque(opaque).takeUnretainedValue()
-    muxer.releaseAVIOContext(pb)
-    return 0
-}
+// MARK: - C callback bridge
 
 /// `avio_alloc_context` write callback. Recovers the muxer via the
 /// avio opaque (set to the MP4SegmentMuxer instance) and forwards the
