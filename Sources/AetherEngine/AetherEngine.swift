@@ -1,4 +1,5 @@
 import Foundation
+import Darwin.Mach
 import QuartzCore
 import CoreMedia
 import CoreVideo
@@ -1541,9 +1542,17 @@ public final class AetherEngine: ObservableObject {
                     vmStr = ""
                 }
 
+                let mallocStr: String
+                if let m = Self.mallocZoneSummary() {
+                    mallocStr = "mallocBlocks=\(m.blocksInUse) mallocMB=\(m.sizeInUseMB) "
+                } else {
+                    mallocStr = ""
+                }
+
                 let line = "[AetherEngine] memprobe t=\(elapsed)s "
                     + "rss=\(rssMB)MB "
                     + vmStr
+                    + mallocStr
                     + "avioFetchedMB=\(avioMB) "
                     + "cacheCount=\(cacheCount) cacheMB=\(cacheMB) "
                     + "packetsWritten=\(packetsWritten) "
@@ -1622,6 +1631,22 @@ public final class AetherEngine: ObservableObject {
             iosurfaceMB: Int(info.device / 1024 / 1024),
             physFootprintMB: Int(info.phys_footprint / 1024 / 1024)
         )
+    }
+
+    /// Malloc-zone statistics for the default zone. `blocks_in_use`
+    /// counts how many distinct allocations currently exist;
+    /// `size_in_use` is their total bytes. Surfaced in the memprobe so
+    /// we can tell whether vmInt growth is many small allocations
+    /// leaking (block count climbs linearly) versus a single large
+    /// buffer growing (block count flat, size up). Passing `nil` to
+    /// malloc_zone_statistics asks libmalloc to sum across all zones
+    /// it manages — equivalent to iterating malloc_get_all_zones
+    /// without the pointer-cast gymnastics.
+    static func mallocZoneSummary() -> (blocksInUse: Int, sizeInUseMB: Int)? {
+        var stats = malloc_statistics_t()
+        malloc_zone_statistics(nil, &stats)
+        return (blocksInUse: Int(stats.blocks_in_use),
+                sizeInUseMB: Int(stats.size_in_use / 1024 / 1024))
     }
 
     // MARK: - Decoder identity helpers
