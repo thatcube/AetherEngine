@@ -510,14 +510,29 @@ final class AVIOReader: @unchecked Sendable {
     }
 
     private func syncRequest(_ request: URLRequest) throws -> (Data, URLResponse) {
-        // Per-request session: the session is created here, used for
-        // exactly one dataTask, then dismantled via finishTasksAndInvalidate
-        // in the defer block. This releases the completed task and its
-        // response Data immediately instead of parking it in a long-lived
-        // session's task pool. urlCache is nil so each per-request
-        // session has zero in-memory cache instance, sidestepping the
-        // multi-URLCache leak that reverted the previous per-request
-        // attempt (commit fef8ef4).
+        // Per-request session AND completion-handler force-copy. Either
+        // one alone is insufficient: Instruments (commit 8e47344) traced
+        // the long-form 4K HDR leak to URLSession's dispatch_data_t
+        // task-pool keeping response bodies alive past the completion
+        // handler. Per-request session releases the pool entry only when
+        // finishTasksAndInvalidate completes — which is async and can
+        // lag the next fetch by enough to keep the previous chunk's
+        // dispatch_data pinned. The force-copy makes the returned Data
+        // a brand-new contiguous heap allocation that holds no reference
+        // to URLSession's backing buffer at all, so the pool can drop
+        // the dispatch_data immediately without keeping our chunk alive.
+        //
+        // The malloc diagnostic shipped this session showed mallocMB
+        // growing ~8 MB/s with block count roughly flat — consistent
+        // with a small fixed set of buffers being realloc'd-and-kept
+        // by libmalloc instead of returned to the kernel. dispatch_data
+        // is exactly that pattern: libmalloc tracks each pool slot, the
+        // contents change but the slot count stays small.
+        //
+        // The chunkSize back to 8 MB stays. With force-copy in place
+        // the per-chunk overhead is one 8 MB memcpy per fetch, which is
+        // negligible at 4K HEVC bitrates (~3 chunks/s = 24 MB/s copy
+        // bandwidth, far under any L1/L2 ceiling).
         let session = URLSession(configuration: Self.makeSessionConfig())
         defer { session.finishTasksAndInvalidate() }
 
@@ -529,7 +544,13 @@ final class AVIOReader: @unchecked Sendable {
             if let e = e {
                 error = e
             } else if let d = d, let r = r {
-                result = (d, r)
+                // Force-copy: allocate a fresh contiguous Data on our
+                // heap and memcpy the bytes in. The returned Data has
+                // no reference to URLSession's dispatch_data_t, so the
+                // task pool can release the response body immediately
+                // when the completion handler returns.
+                let copied = Data(d)
+                result = (copied, r)
             } else {
                 error = AVIOReaderError.noResponse
             }
