@@ -309,11 +309,23 @@ final class HLSLocalServer: @unchecked Sendable {
 
     init() {
         self.bufferedProvider = BufferedSegmentProvider()
+        self.subResourceBaseURL = nil
     }
 
-    init(provider: HLSSegmentProvider) {
+    /// Base URL for sub-resource URLs (init.mp4 / segXX.mp4) in the
+    /// generated playlist. When set to e.g. `aether-engine://engine/`,
+    /// the playlist emits absolute custom-scheme URLs that AVPlayer
+    /// routes through the AVAssetResourceLoader delegate, bypassing
+    /// CFNetwork entirely for the heavy segment payloads. When nil,
+    /// the playlist emits relative URLs (`init.mp4`, `seg0.mp4`) which
+    /// AVPlayer resolves against the playlist's own URL — used by the
+    /// `aetherctl` CLI workflow where everything goes over HTTP.
+    private let subResourceBaseURL: URL?
+
+    init(provider: HLSSegmentProvider, subResourceBaseURL: URL? = nil) {
         self.externalProvider = provider
         self.bufferedProvider = nil
+        self.subResourceBaseURL = subResourceBaseURL
     }
 
     // MARK: - Lifecycle
@@ -847,19 +859,29 @@ final class HLSLocalServer: @unchecked Sendable {
 
     private func buildMasterPlaylist() -> String {
         guard let provider = provider else { return "#EXTM3U\n" }
-        return Self.buildMasterPlaylistText(provider: provider)
+        return Self.buildMasterPlaylistText(provider: provider,
+                                             subResourceBaseURL: subResourceBaseURL)
     }
 
     private func buildMediaPlaylist() -> String {
         guard let provider = provider else { return "#EXTM3U\n" }
-        return Self.buildMediaPlaylistText(provider: provider)
+        return Self.buildMediaPlaylistText(provider: provider,
+                                            subResourceBaseURL: subResourceBaseURL)
     }
 
     /// Public static playlist builders. Used by the
     /// `EngineResourceLoaderDelegate` to generate the same playlist
     /// text the HTTP server would have served, without needing a live
     /// `HLSLocalServer` instance. Pure functions of the provider state.
-    static func buildMasterPlaylistText(provider: HLSSegmentProvider) -> String {
+    ///
+    /// `subResourceBaseURL`: when set (e.g. `aether-engine://engine/`),
+    /// `EXT-X-MAP` and segment URIs are emitted as absolute URLs under
+    /// that base. AVPlayer routes them through the
+    /// AVAssetResourceLoaderDelegate instead of resolving as relative
+    /// (HTTP) URLs against the playlist URL. Bypasses CFNetwork for
+    /// the heavy segment payloads (the long-form memory leak source).
+    static func buildMasterPlaylistText(provider: HLSSegmentProvider,
+                                         subResourceBaseURL: URL? = nil) -> String {
         guard let codecs = provider.masterCodecs else {
             return "#EXTM3U\n"
         }
@@ -903,7 +925,8 @@ final class HLSLocalServer: @unchecked Sendable {
         return lines.joined(separator: "\n") + "\n"
     }
 
-    static func buildMediaPlaylistText(provider: HLSSegmentProvider) -> String {
+    static func buildMediaPlaylistText(provider: HLSSegmentProvider,
+                                        subResourceBaseURL: URL? = nil) -> String {
         // Atomic snapshot of visible-window state. The video provider
         // uses this hook to advance its sliding window; capturing the
         // snapshot once and reading from it prevents segmentCount /
@@ -942,11 +965,27 @@ final class HLSLocalServer: @unchecked Sendable {
             // the only reason our Mac AirPlay reference run stays flat).
             lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
         }
-        lines.append("#EXT-X-MAP:URI=\"init.mp4\"")
+        // URI emission: relative for HTTP-only playback (aetherctl
+        // workflow, AVPlayer-via-HTTP), absolute custom-scheme for the
+        // Sodalite resource-loader path. Absolute URLs in the playlist
+        // are how AVPlayer knows to route a sub-resource through the
+        // delegate instead of CFNetwork.
+        let initURI: String
+        let segURI: (Int) -> String
+        if let base = subResourceBaseURL {
+            let baseStr = base.absoluteString
+            let baseWithSlash = baseStr.hasSuffix("/") ? baseStr : baseStr + "/"
+            initURI = "\(baseWithSlash)init.mp4"
+            segURI = { idx in "\(baseWithSlash)seg\(idx).mp4" }
+        } else {
+            initURI = "init.mp4"
+            segURI = { idx in "seg\(idx).mp4" }
+        }
+        lines.append("#EXT-X-MAP:URI=\"\(initURI)\"")
         for i in 0..<count {
             let dur = provider.segmentDuration(at: i)
             lines.append("#EXTINF:\(String(format: "%.3f", dur)),")
-            lines.append("seg\(i).mp4")
+            lines.append(segURI(i))
         }
         if snapshot.endlistAdded || !typeIsEvent {
             lines.append("#EXT-X-ENDLIST")

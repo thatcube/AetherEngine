@@ -677,23 +677,20 @@ public final class AetherEngine: ObservableObject {
                 self.sourceTime = self.currentTime + seconds
             }
         }
-        _ = try session.start()
-        // Use the AVAssetResourceLoader bypass for AVPlayer's byte
-        // fetches. Eliminates CFNetwork's loopback path which was the
-        // root cause of the long-form memory leak (Instruments-pinpoint
-        // 2026-05-20: `VM: libnetwork` 66 MiB persistent + ~10 MiB heap
-        // blocks per segment served). The HTTP server stays available
-        // for aetherctl development workflow but AVPlayer goes through
-        // the delegate.
-        let playbackURL: URL
+        // Hybrid path: AVPlayer fetches the small HLS playlist via
+        // HTTP loopback (negligible CFNetwork traffic, ~60 KB once per
+        // session), then routes the heavy init.mp4 + segment fetches
+        // through our AVAssetResourceLoaderDelegate via absolute
+        // `aether-engine://` URIs the playlist generator emits. The
+        // delegate bypasses CFNetwork entirely for the bulk data,
+        // killing the `VM: libnetwork` leak Instruments pinpointed on
+        // 2026-05-20 while keeping AVPlayer's HLS engine happy (which
+        // requires an HTTP playlist as the asset entry point).
+        let playbackURL = try session.start()
         let resourceLoaderDelegate: AVAssetResourceLoaderDelegate?
         if let handle = session.resourceLoader() {
-            playbackURL = handle.url
             resourceLoaderDelegate = handle.delegate
         } else {
-            // Shouldn't happen — resourceLoader() only returns nil
-            // before start(), and we called start() above.
-            playbackURL = try session.start()
             resourceLoaderDelegate = nil
         }
         self.nativeVideoSession = session

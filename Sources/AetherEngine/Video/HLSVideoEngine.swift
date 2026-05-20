@@ -882,7 +882,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
             + "duration=\(String(format: "%.1f", durationSeconds))s"
         )
 
-        let srv = HLSLocalServer(provider: prov)
+        // Sub-resource base for the playlist's init.mp4 / segment URIs:
+        // `aether-engine://engine/`. AVPlayer routes these through the
+        // AVAssetResourceLoaderDelegate (bypassing CFNetwork) while the
+        // playlist itself is still served via HTTP loopback (tiny, no
+        // pool growth). Fixes the long-form `VM: libnetwork` leak that
+        // was driven by the heavy segment fetches through CFNetwork.
+        let subResourceBase = EngineResourceLoaderDelegate.playbackURL(useMasterPlaylist: false)
+            .deletingLastPathComponent()
+        let srv = HLSLocalServer(provider: prov, subResourceBaseURL: subResourceBase)
         try srv.start()
         self.server = srv
 
