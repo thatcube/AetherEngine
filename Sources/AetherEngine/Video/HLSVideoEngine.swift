@@ -1000,6 +1000,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
         /// actually taken vs. silently falling back to the
         /// Data-allocation path on every fetch.
         public let serverSendfileBytesSent: Int
+        /// `av_packet_alloc` count minus `av_packet_free` count from
+        /// the `PacketBalanceTracker` covering all engine packet-
+        /// handling paths (demuxer / bridge / producer / subtitle /
+        /// SW host). Steady low single digits = balanced. Linear
+        /// growth = a packet leak in one of our paths.
+        public let packetsAlive: Int
+        public let packetsTotalAllocs: Int
     }
 
     /// Read the current pipeline counters. Returns zeros for any
@@ -1019,7 +1026,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
             muxerFragmentCuts: producer?.muxerFragmentCuts ?? 0,
             serverConnectionCount: server?.activeConnectionCount ?? 0,
             serverLifetimeBytesSent: server?.lifetimeBytesSent ?? 0,
-            serverSendfileBytesSent: server?.lifetimeSendfileBytes ?? 0
+            serverSendfileBytesSent: server?.lifetimeSendfileBytes ?? 0,
+            packetsAlive: PacketBalanceTracker.alive,
+            packetsTotalAllocs: PacketBalanceTracker.totalAllocs
         )
     }
 

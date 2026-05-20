@@ -1254,7 +1254,7 @@ public final class AetherEngine: ObservableObject {
             let streamIdx = pkt.pointee.stream_index
             if streamIdx != streamIndex {
                 var p: UnsafeMutablePointer<AVPacket>? = pkt
-                av_packet_free(&p)
+                trackedPacketFree(&p)
                 continue
             }
             subtitlePacketsRead += 1
@@ -1264,7 +1264,7 @@ public final class AetherEngine: ObservableObject {
                 streamTimeBase: tb
             )
             var p: UnsafeMutablePointer<AVPacket>? = pkt
-            av_packet_free(&p)
+            trackedPacketFree(&p)
             if let event {
                 cuesEmitted += event.cues.count
                 if !firstCueLogged, let firstCue = event.cues.first {
@@ -1533,6 +1533,8 @@ public final class AetherEngine: ObservableObject {
                 let srvConns = stats?.serverConnectionCount ?? 0
                 let srvBytesMB = (stats?.serverLifetimeBytesSent ?? 0) / 1024 / 1024
                 let srvSfMB = (stats?.serverSendfileBytesSent ?? 0) / 1024 / 1024
+                let pktAlive = stats?.packetsAlive ?? 0
+                let pktTotal = stats?.packetsTotalAllocs ?? 0
 
                 // VM breakdown so the leak source is visible at probe
                 // time: internal (Swift / libavformat heap) vs external
@@ -1568,6 +1570,7 @@ public final class AetherEngine: ObservableObject {
                     + "abFifoKB=\(abFifoKB) abSwrKB=\(abSwrKB) abTotKB=\(abTotKB) "
                     + "muxBytesMB=\(muxBytesMB) muxCuts=\(muxCuts) "
                     + "srvConns=\(srvConns) srvBytesMB=\(srvBytesMB) srvSfMB=\(srvSfMB) "
+                    + "pktAlive=\(pktAlive) pktTotal=\(pktTotal) "
                     + "subCues=\(cueCount) "
                     + "audioTracks=\(self.audioTracks.count) "
                     + "subTracks=\(self.subtitleTracks.count) "

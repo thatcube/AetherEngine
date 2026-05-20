@@ -816,12 +816,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         // PTS may appear first.
                         if let prev = pendingVideoPkt {
                             var pkt: UnsafeMutablePointer<AVPacket>? = prev
-                            av_packet_free(&pkt)
+                            trackedPacketFree(&pkt)
                             pendingVideoPkt = nil
                         }
                         if let prev = pendingAudioPkt {
                             var pkt: UnsafeMutablePointer<AVPacket>? = prev
-                            av_packet_free(&pkt)
+                            trackedPacketFree(&pkt)
                             pendingAudioPkt = nil
                         }
 
@@ -870,7 +870,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 }
                 packetsRead += 1
                 var pktPtr: UnsafeMutablePointer<AVPacket>? = packet
-                defer { av_packet_free(&pktPtr) }
+                defer { trackedPacketFree(&pktPtr) }
 
                 // Recycle-dedup: drop packets the old demuxer already
                 // pumped. Video drops while pkt.pts < expectedRestartPts
@@ -1321,7 +1321,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             // packet ourselves since it wasn't transferred
                             // to the muxer.
                             var pkt: UnsafeMutablePointer<AVPacket>? = prev
-                            av_packet_free(&pkt)
+                            trackedPacketFree(&pkt)
                             pendingVideoPkt = nil
                             break readLoop
                         }
@@ -1360,14 +1360,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             let fpSeg = segmentIndex(forSourcePts: fpPtsInVideoTb)
                             guard let muxer = ensureMuxer(forSegmentIndex: fpSeg) else {
                                 var fpVar: UnsafeMutablePointer<AVPacket>? = fp
-                                av_packet_free(&fpVar)
+                                trackedPacketFree(&fpVar)
                                 continue
                             }
                             fp.pointee.stream_index = muxer.audioOutputStreamIndex
                             av_packet_rescale_ts(fp, audio.inputTimeBase, muxer.muxerAudioTimeBase)
                             _ = muxer.writePacket(fp)
                             var fpVar: UnsafeMutablePointer<AVPacket>? = fp
-                            av_packet_free(&fpVar)
+                            trackedPacketFree(&fpVar)
                         }
                         continue
                     }
@@ -1383,7 +1383,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             finalizeAndWriteAudio(prev, nextDts: packet.pointee.dts, audio: audio, muxer: muxer)
                         } else {
                             var pkt: UnsafeMutablePointer<AVPacket>? = prev
-                            av_packet_free(&pkt)
+                            trackedPacketFree(&pkt)
                             pendingAudioPkt = nil
                             break readLoop
                         }
@@ -1414,7 +1414,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 bumpPacketsWritten()
             } else {
                 var pkt: UnsafeMutablePointer<AVPacket>? = prev
-                av_packet_free(&pkt)
+                trackedPacketFree(&pkt)
             }
             pendingVideoPkt = nil
         }
@@ -1429,7 +1429,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 finalizeAndWriteAudio(prev, nextDts: nil, audio: audio, muxer: muxer)
             } else {
                 var pkt: UnsafeMutablePointer<AVPacket>? = prev
-                av_packet_free(&pkt)
+                trackedPacketFree(&pkt)
             }
             pendingAudioPkt = nil
         }
@@ -1495,7 +1495,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         _ = muxer.writePacket(packet)
 
         var pkt: UnsafeMutablePointer<AVPacket>? = packet
-        av_packet_free(&pkt)
+        trackedPacketFree(&pkt)
     }
 
     /// Same shape as `finalizeAndWriteVideo` but for stream-copy
@@ -1521,7 +1521,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         _ = muxer.writePacket(packet)
 
         var pkt: UnsafeMutablePointer<AVPacket>? = packet
-        av_packet_free(&pkt)
+        trackedPacketFree(&pkt)
     }
 
 }

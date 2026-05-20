@@ -375,11 +375,11 @@ final class Demuxer: @unchecked Sendable {
         accessLock.lock()
         defer { accessLock.unlock() }
         guard let ctx = formatContext else { return nil }
-        var packet: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
+        var packet: UnsafeMutablePointer<AVPacket>? = trackedPacketAlloc()
         guard packet != nil else { return nil }
         let ret = av_read_frame(ctx, packet)
         if ret < 0 {
-            av_packet_free(&packet)
+            trackedPacketFree(&packet)
             let isEOF = (ret == AVERROR_EOF_VALUE)
             if isEOF {
                 return nil

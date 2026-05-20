@@ -573,16 +573,16 @@ final class AudioBridge: @unchecked Sendable {
 
             // Drain encoder for any packets ready to emit.
             while true {
-                guard let outPkt = av_packet_alloc() else { break }
+                guard let outPkt = trackedPacketAlloc() else { break }
                 let recvRet = avcodec_receive_packet(enc, outPkt)
                 if recvRet == AVERROR_EAGAIN_VALUE || recvRet == AVERROR_EOF_VALUE {
                     var p: UnsafeMutablePointer<AVPacket>? = outPkt
-                    av_packet_free(&p)
+                    trackedPacketFree(&p)
                     break
                 }
                 if recvRet < 0 {
                     var p: UnsafeMutablePointer<AVPacket>? = outPkt
-                    av_packet_free(&p)
+                    trackedPacketFree(&p)
                     break
                 }
                 results.append(outPkt)

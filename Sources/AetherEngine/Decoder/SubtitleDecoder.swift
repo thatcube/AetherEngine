@@ -128,17 +128,17 @@ enum SubtitleDecoder {
         var nextID = 0
 
         while !Task.isCancelled {
-            var pktPtr: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
+            var pktPtr: UnsafeMutablePointer<AVPacket>? = trackedPacketAlloc()
             guard let pkt = pktPtr else { break }
             let readRet = av_read_frame(fmt, pkt)
             if readRet < 0 {
-                av_packet_free(&pktPtr)
+                trackedPacketFree(&pktPtr)
                 break
             }
 
             if Int(pkt.pointee.stream_index) != subStreamIndex {
                 av_packet_unref(pkt)
-                av_packet_free(&pktPtr)
+                trackedPacketFree(&pktPtr)
                 continue
             }
 
@@ -188,7 +188,7 @@ enum SubtitleDecoder {
             }
 
             av_packet_unref(pkt)
-            av_packet_free(&pktPtr)
+            trackedPacketFree(&pktPtr)
         }
 
         // Flush, ASS/SSA decoders sometimes buffer events.

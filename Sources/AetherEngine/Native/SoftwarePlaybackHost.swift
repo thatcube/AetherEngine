@@ -541,7 +541,7 @@ final class SoftwarePlaybackHost {
 /// helper; restored here so the SW demux loop can call it cleanly.
 func av_packet_free_safe(_ packet: UnsafeMutablePointer<AVPacket>) {
     var p: UnsafeMutablePointer<AVPacket>? = packet
-    av_packet_free(&p)
+    trackedPacketFree(&p)
 }
 
 // MARK: - Sendable wrapper
