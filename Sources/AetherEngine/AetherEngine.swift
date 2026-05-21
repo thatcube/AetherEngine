@@ -1495,22 +1495,6 @@ public final class AetherEngine: ObservableObject {
                 if Task.isCancelled { return }
                 guard let self = self else { return }
                 let elapsed = Int(Date().timeIntervalSince(sessionStart))
-
-                // Empirical workaround spike for the AVPlayer / CFNetwork
-                // libnetwork buffer-pool retention that drives the
-                // long-form playback OOM. Public-API call (malloc/malloc.h,
-                // App-Store-safe) that asks every malloc zone to release
-                // cached free pages back to the OS. If CFNetwork's
-                // nw_protocol receive buffers live in a zone that responds
-                // to pressure relief, this drains the pool every 30 s and
-                // bounds the leak. If `pressureReclaimedKB` stays at 0
-                // across long sessions OR vmInt growth rate matches the
-                // baseline (~1.5–1.7 MB/s on 4K HDR HEVC), the pool is not
-                // zone-resident and only Apple can fix it (FB radar).
-                // Called BEFORE measurements so the rest of this iteration
-                // captures the post-relief state.
-                let pressureReclaimedKB = malloc_zone_pressure_relief(nil, 0) / 1024
-
                 let rssMB = Self.residentMemoryMB()
                 let cueCount = self.subtitleCues.count
 
@@ -1595,8 +1579,7 @@ public final class AetherEngine: ObservableObject {
                     + "subTracks=\(self.subtitleTracks.count) "
                     + "subActive=\(self.isSubtitleActive) "
                     + "avBufAhead=\(String(format: "%.1f", bufferAheadSec))s "
-                    + "avBufBehind=\(String(format: "%.1f", bufferBehindSec))s "
-                    + "pressureReclaimedKB=\(pressureReclaimedKB)"
+                    + "avBufBehind=\(String(format: "%.1f", bufferBehindSec))s"
 
                 EngineLog.emit(line, category: .engine)
                 // Also write to stdout so the line shows up in Xcode's
