@@ -196,7 +196,15 @@ final class NativeAVPlayerHost {
                 }
                 Self.dumpAssetTracks(item.asset, sid: sid, reason: "item.failed")
             } else if item.status == .readyToPlay {
-                Self.dumpAssetTracks(item.asset, sid: sid, reason: "item.readyToPlay")
+                // For HLS sources `asset.tracks` returns empty
+                // synchronously — the tracks live on AVPlayerItem
+                // instead. Dump the player-item's audio tracks so we
+                // can see what AVPlayer parsed from the moov for
+                // diagnostic, plus the active audio route's channel
+                // count after the route renegotiates against the
+                // loaded asset.
+                Self.dumpPlayerItemTracks(item, sid: sid)
+                Self.dumpAudioRoute(sid: sid)
             }
 
             Task { @MainActor in
@@ -504,6 +512,71 @@ final class NativeAVPlayerHost {
             }
             EngineLog.emit("[NativeAVPlayerHost] #\(sid) asset.track type=\(track.mediaType.rawValue) codec='\(fourcc)' enabled=\(track.isEnabled) playable=\(track.isPlayable)\(extra) (\(reason))", category: .engine)
         }
+    }
+
+    /// AVPlayerItem.tracks-based audio track dump. For HLS sources
+    /// `asset.tracks` is empty synchronously, only AVPlayerItem.tracks
+    /// returns the resolved track list once the playlist + init.mp4
+    /// have been parsed. Logs one line per audio track with sample
+    /// rate, channel count, bit depth, format ID, and channel layout
+    /// tag (the multichannel-routing diagnostic).
+    private static func dumpPlayerItemTracks(_ item: AVPlayerItem, sid: Int) {
+        let tracks = item.tracks
+        if tracks.isEmpty {
+            EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.tracks empty (readyToPlay)", category: .engine)
+            return
+        }
+        for itemTrack in tracks {
+            guard let assetTrack = itemTrack.assetTrack else { continue }
+            guard assetTrack.mediaType == .audio else { continue }
+            let fourcc: String
+            var extra = ""
+            if let fmt = assetTrack.formatDescriptions.first {
+                let cm = fmt as! CMFormatDescription
+                fourcc = fourccString(CMFormatDescriptionGetMediaSubType(cm))
+                extra = " " + audioFormatDescription(cm)
+            } else {
+                fourcc = "?"
+            }
+            EngineLog.emit(
+                "[NativeAVPlayerHost] #\(sid) item.audioTrack codec='\(fourcc)' "
+                + "enabled=\(itemTrack.isEnabled)\(extra) (readyToPlay)",
+                category: .engine
+            )
+        }
+    }
+
+    /// Dump the active audio route's channel capability after the
+    /// AVPlayerItem reaches readyToPlay. The route renegotiates when
+    /// AVPlayer loads an asset, so the channel count we polled at
+    /// AVAudioSession setup (engine init, before any asset existed)
+    /// can differ from the post-load capability.
+    ///
+    /// `outputNumberOfChannels` is the actual channel count the route
+    /// will carry — if the asset is 8-channel FLAC but the soundbar /
+    /// AVR doesn't accept 7.1 LPCM via HDMI, the route stays at 2 and
+    /// AVPlayer's PCM decoder downmixes upstream. EAC3 / Atmos avoids
+    /// this because the bitstream tunnels through as encoded data
+    /// without an LPCM intermediate.
+    private static func dumpAudioRoute(sid: Int) {
+        #if os(iOS) || os(tvOS)
+        let session = AVAudioSession.sharedInstance()
+        let out = session.outputNumberOfChannels
+        let pref = session.preferredOutputNumberOfChannels
+        let maxCh = session.maximumOutputNumberOfChannels
+        let route = session.currentRoute
+        let outputDescs = route.outputs.map { port in
+            let portName = port.portName
+            let portType = port.portType.rawValue
+            let nChannels = port.channels?.count ?? -1
+            return "\(portName)[\(portType), ch=\(nChannels)]"
+        }.joined(separator: ", ")
+        EngineLog.emit(
+            "[NativeAVPlayerHost] #\(sid) audioRoute output=\(out) preferred=\(pref) max=\(maxCh) "
+            + "ports=[\(outputDescs)] (readyToPlay)",
+            category: .engine
+        )
+        #endif
     }
 
     /// Read sample rate, channel count, and channel layout tag from
