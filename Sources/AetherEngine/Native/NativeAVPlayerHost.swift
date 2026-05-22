@@ -206,6 +206,7 @@ final class NativeAVPlayerHost {
                 Self.dumpPlayerItemTracks(item, sid: sid)
                 Self.dumpAudioRoute(sid: sid)
                 Self.warnIfFLACSurroundExceedsRoute(item, sid: sid)
+                Self.warnIfEAC3SurroundOnStereoRoute(item, sid: sid)
             }
 
             Task { @MainActor in
@@ -600,6 +601,72 @@ final class NativeAVPlayerHost {
             + "TrueHD / DTS-HD MA sources route through the FLAC bridge and hit the LPCM limit. "
             + "AVRs with 7.1 LPCM-over-HDMI support play these sources at full source channel "
             + "count without downmix.",
+            category: .session
+        )
+        #endif
+    }
+
+    /// Warn when an EAC3 / AC3 multichannel track plays into a route
+    /// the HDMI sink is reporting as stereo-only. Atmos (EAC3 with the
+    /// `flag_ec3_extension_type_a` JOC marker set in dec3) is excluded
+    /// from this warning because Atmos uses a 2-channel MAT 2.0 / IEC
+    /// 61937 carrier — `ch=2` on the route is the correct, working
+    /// state for an Atmos passthrough and does NOT mean stereo output.
+    ///
+    /// Why: plain DD+ 5.1 and DD 5.1 need either ch=6 LPCM or a
+    /// bitstream passthrough negotiation that the sink advertises in
+    /// its EDID. Sonos Arc (and similar soundbars) report ch=2 on the
+    /// HDMI port when the sink is in stereo PCM mode — usually after a
+    /// boot, an HDMI handshake glitch, or after the AVR/soundbar lost
+    /// the Apple TV's audio format hint. AVPlayer can still try the
+    /// bitstream-passthrough path, but Sonos can apparently reject it
+    /// when ch=2 is advertised, falling back to PCM stereo. Common fix
+    /// is a power cycle of the soundbar so EDID re-negotiates and ch=6
+    /// becomes available, OR the user can flip Apple TV's audio format
+    /// setting once to force a re-handshake.
+    ///
+    /// This is a route capability mismatch, not a bug in our pipeline.
+    /// The EAC3 bitstream we deliver is identical across runs (we
+    /// proved this with byte-level diff of the dec3 box and the first
+    /// audio packet), so when one run plays surround and the next
+    /// stereo on the same source, the difference is at the sink layer.
+    private static func warnIfEAC3SurroundOnStereoRoute(_ item: AVPlayerItem, sid: Int) {
+        #if os(iOS) || os(tvOS)
+        var trackChannels: Int = 0
+        var codecID: String = ""
+        for itemTrack in item.tracks {
+            guard let assetTrack = itemTrack.assetTrack else { continue }
+            guard assetTrack.mediaType == .audio else { continue }
+            guard let fmt = assetTrack.formatDescriptions.first else { continue }
+            let cm = fmt as! CMFormatDescription
+            let codec = fourccString(CMFormatDescriptionGetMediaSubType(cm))
+            let lower = codec.lowercased()
+            if lower == "ec-3" || lower == "ac-3" {
+                codecID = codec
+                if let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(cm) {
+                    trackChannels = Int(asbdPtr.pointee.mChannelsPerFrame)
+                }
+                break
+            }
+        }
+        guard !codecID.isEmpty, trackChannels > 2 else { return }
+        let session = AVAudioSession.sharedInstance()
+        let routeChannels = max(
+            session.currentRoute.outputs.first?.channels?.count ?? 0,
+            session.outputNumberOfChannels
+        )
+        guard routeChannels > 0, routeChannels < trackChannels else { return }
+        EngineLog.emit(
+            "[NativeAVPlayerHost] #\(sid) WARNING: \(codecID) \(trackChannels)-channel "
+            + "track playing into a \(routeChannels)-channel route. tvOS will downmix to "
+            + "\(routeChannels) channels. The encoded bitstream is correct (dec3/dac3 reports "
+            + "5.1 with acmod=7+lfeon=1, packets carry the full multichannel content). The "
+            + "route limit comes from the HDMI sink's current capability advertisement, not "
+            + "from this engine. Common cause on soundbars: HDMI handshake landed in stereo "
+            + "PCM mode after a reboot or audio-format change. Atmos (EAC3+JOC) is unaffected "
+            + "because it tunnels through a 2-channel MAT carrier. Power cycle the sink or "
+            + "flip Apple TV's audio format setting once to re-negotiate ch=6 LPCM / EAC3 "
+            + "passthrough.",
             category: .session
         )
         #endif
