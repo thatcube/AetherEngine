@@ -11,7 +11,7 @@ import Libswresample
 /// in the same fMP4 fragments.
 ///
 /// Modes (see `AudioBridge.Mode`):
-///   - `.surroundCompat` (default): EAC3 5.1 at 384 kbps. AVPlayer
+///   - `.surroundCompat` (default): EAC3 5.1 at 640 kbps. AVPlayer
 ///     hands the encoded bitstream to HDMI; the sink decodes its own
 ///     5.1. Works on essentially every modern AVR + soundbar
 ///     including LPCM-stereo-only routes (Sonos Arc, Samsung HW-Q,
@@ -44,7 +44,7 @@ import Libswresample
 /// the soundbar / LPCM-stereo-only install base is the majority of
 /// the consumer market.
 ///
-/// - `.surroundCompat`: EAC3 5.1 at 384 kbps, AVPlayer → HDMI
+/// - `.surroundCompat`: EAC3 5.1 at 640 kbps, AVPlayer → HDMI
 ///   bitstream tunnel. Lossy but surround works on essentially every
 ///   modern AVR + soundbar.
 /// - `.lossless`: FLAC up to 7.1, AVPlayer → LPCM HDMI route. Needs
@@ -155,7 +155,7 @@ final class AudioBridge: @unchecked Sendable {
 
     /// Opens the source decoder + bridge encoder. The encoder choice
     /// is picked by `mode`:
-    ///   - `.surroundCompat`: EAC3 5.1 at 384 kbps via FFmpeg's eac3
+    ///   - `.surroundCompat`: EAC3 5.1 at 640 kbps via FFmpeg's eac3
     ///     encoder. Caps channels at 6, sample format FLTP.
     ///   - `.lossless`: FLAC at source channel count via FFmpeg's flac
     ///     encoder. Caps at 8 channels (FLAC max), sample format S16
@@ -230,7 +230,7 @@ final class AudioBridge: @unchecked Sendable {
         }
 
         // 2. Bridge encoder. Selected by mode:
-        //   - .surroundCompat → AV_CODEC_ID_EAC3, 384 kbps, max 6 ch
+        //   - .surroundCompat → AV_CODEC_ID_EAC3, 640 kbps, max 6 ch
         //   - .lossless       → AV_CODEC_ID_FLAC, VBR, max 8 ch
         let encoderCodecID: AVCodecID
         let maxEncodedChannels: Int32
@@ -239,7 +239,14 @@ final class AudioBridge: @unchecked Sendable {
         case .surroundCompat:
             encoderCodecID = AV_CODEC_ID_EAC3
             maxEncodedChannels = 6
-            encoderBitRate = 384_000
+            // 640 kbps = 5 x 128 kbps per channel pair, the EAC3
+            // "transparent" bitrate per Dolby's reference profiles —
+            // perceptually indistinguishable from the lossless source
+            // for 5.1 content. Lower rates (384 kbps was tested but
+            // never shipped) save ~40% bandwidth at the cost of
+            // audible artefacts on demanding passages. DrHurt's
+            // suggestion on AetherEngine#4, sound logic.
+            encoderBitRate = 640_000
         case .lossless:
             encoderCodecID = AV_CODEC_ID_FLAC
             maxEncodedChannels = 8

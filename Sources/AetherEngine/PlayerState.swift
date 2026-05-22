@@ -134,7 +134,7 @@ public struct LoadOptions: Sendable, Equatable {
     /// stream-copy into fMP4 (TrueHD, DTS, DTS-HD MA, MP3, Opus, and
     /// EAC3-from-MKV-without-dec3-extradata).
     ///
-    /// - `.surroundCompat` (default): EAC3 5.1 at 384 kbps. AVPlayer
+    /// - `.surroundCompat` (default): EAC3 5.1 at 640 kbps. AVPlayer
     ///   hands the encoded bitstream to HDMI; the sink decodes its
     ///   own 5.1 mix. Works on soundbars (Sonos Arc, Samsung HW-Q,
     ///   Bose) and AVRs that don't accept multichannel LPCM via HDMI.
