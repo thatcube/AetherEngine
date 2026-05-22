@@ -180,12 +180,23 @@ final class NativeAVPlayerHost {
             // chain which often has the precise CoreMedia /
             // VideoToolbox cause behind the AVFoundationErrorDomain
             // wrapper.
+            //
+            // On .readyToPlay we also dump now (besides failures)
+            // because the audio-track row carries the parsed
+            // CMAudioFormatDescription: sample rate, channel count,
+            // channel layout tag. Critical for diagnosing the FLAC
+            // bridge surround-to-stereo downmix path — if the layout
+            // tag comes back <missing> or kAudioChannelLayoutTag_Stereo
+            // for an 8-channel source, the downmix is happening at
+            // AVPlayer's moov parse rather than at the route / soundbar.
             if item.status == .failed {
                 if let nsErr = nsErr,
                    let underlying = nsErr.userInfo[NSUnderlyingErrorKey] as? NSError {
                     EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.error.underlying=\(underlying.domain)/\(underlying.code) '\(underlying.localizedDescription)'", category: .engine)
                 }
                 Self.dumpAssetTracks(item.asset, sid: sid, reason: "item.failed")
+            } else if item.status == .readyToPlay {
+                Self.dumpAssetTracks(item.asset, sid: sid, reason: "item.readyToPlay")
             }
 
             Task { @MainActor in
@@ -481,14 +492,50 @@ final class NativeAVPlayerHost {
         }
         for track in tracks {
             let fourcc: String
+            var extra = ""
             if let fmt = track.formatDescriptions.first {
                 let cm = fmt as! CMFormatDescription
                 fourcc = fourccString(CMFormatDescriptionGetMediaSubType(cm))
+                if track.mediaType == .audio {
+                    extra = " " + audioFormatDescription(cm)
+                }
             } else {
                 fourcc = "?"
             }
-            EngineLog.emit("[NativeAVPlayerHost] #\(sid) asset.track type=\(track.mediaType.rawValue) codec='\(fourcc)' enabled=\(track.isEnabled) playable=\(track.isPlayable) (\(reason))", category: .engine)
+            EngineLog.emit("[NativeAVPlayerHost] #\(sid) asset.track type=\(track.mediaType.rawValue) codec='\(fourcc)' enabled=\(track.isEnabled) playable=\(track.isPlayable)\(extra) (\(reason))", category: .engine)
         }
+    }
+
+    /// Read sample rate, channel count, and channel layout tag from
+    /// a CMAudioFormatDescription. Used by `dumpAssetTracks` to expose
+    /// what AVPlayer actually parsed for the audio track. Critical for
+    /// multichannel sources: if libavformat's mov muxer wrote the
+    /// codec / dfLa / chnl / chan boxes correctly, the channel layout
+    /// tag here matches the source's spatial layout (kAudio...7_1_A for
+    /// MPEG-style 7.1). If the tag comes back unknown or stereo, the
+    /// downmix is happening at the AVPlayer parse layer rather than at
+    /// the soundbar / route layer.
+    private static func audioFormatDescription(_ fmt: CMFormatDescription) -> String {
+        var parts: [String] = []
+        if let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(fmt) {
+            let asbd = asbdPtr.pointee
+            parts.append("sr=\(Int(asbd.mSampleRate))")
+            parts.append("ch=\(asbd.mChannelsPerFrame)")
+            parts.append(String(format: "bits=%d", asbd.mBitsPerChannel))
+            parts.append("fmt=\(fourccString(asbd.mFormatID))")
+        }
+        var layoutSize = 0
+        if let layoutPtr = CMAudioFormatDescriptionGetChannelLayout(fmt, sizeOut: &layoutSize),
+           layoutSize >= MemoryLayout<AudioChannelLayout>.size {
+            let layout = layoutPtr.pointee
+            parts.append("layoutTag=0x\(String(layout.mChannelLayoutTag, radix: 16))")
+            if layout.mChannelLayoutTag == kAudioChannelLayoutTag_UseChannelDescriptions {
+                parts.append("descs=\(layout.mNumberChannelDescriptions)")
+            }
+        } else {
+            parts.append("layoutTag=<missing>")
+        }
+        return parts.joined(separator: " ")
     }
 
     /// Render a 4-byte CoreMedia FourCC subtype (e.g. 'hvc1', 'hev1',
