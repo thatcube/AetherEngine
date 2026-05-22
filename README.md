@@ -230,7 +230,7 @@ Sources/AetherEngine/
 │   ├── MP4SegmentMuxer.swift                Native path: session-long fragmented-MP4 muxer (+empty_moov+default_base_moof+frag_custom+delay_moov)
 │   ├── FragmentSplitter.swift               Native path: routes mp4 muxer's avio output stream into init.mp4 (ftyp+moov) vs per-segment moof+mdat files
 │   ├── SegmentCache.swift                   Native path: producer/consumer segment store with backpressure + scrub-aware eviction
-│   └── VTCapabilityProbe.swift              VP9 / AV1 system-decode probe (gates codec routing)
+│   └── VTCapabilityProbe.swift              AV1 system-decode probe (gates codec routing; VP9 always routes SW)
 └── View/
     └── AetherPlayerView.swift               Polymorphic surface: hosts either AVPlayerLayer (native) or AVSampleBufferDisplayLayer (SW)
 ```
