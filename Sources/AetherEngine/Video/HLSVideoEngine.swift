@@ -1248,45 +1248,54 @@ public final class HLSVideoEngine: @unchecked Sendable {
             return "audio"
         }()
 
-        // Pre-cascade: for AC3 / EAC3 sources whose codecpar lacks the
-        // dec3 / dac3 extradata the mov muxer needs at write_header
-        // time (the typical matroska-direct-play case), reconstruct
-        // the extradata from the first audio packet's syncframe and
-        // hand the cascade a patched codecpar pointer. Without this
-        // the probe below fails for these sources and they all route
-        // through the FLAC bridge, losing Atmos JOC on EAC3+JOC and
-        // wasting decode→encode CPU on plain AC3 / EAC3.
+        // Pre-cascade: for AC3 / EAC3 sources from matroska direct-play,
+        // unconditionally reconstruct the dec3 / dac3 box content + the
+        // frame_size from the first audio packet's syncframe. The mov
+        // muxer needs both at write_header time, matroska CodecPrivate
+        // typically supplies neither (or supplies extradata in some
+        // non-dec3 shape the muxer still rejects), and our parser is
+        // cheap + canonical. Don't gate on `extradata_size == 0`: empirical
+        // observation on Kapriolen showed matroska sometimes provides
+        // a few bytes of AC3 codecpar.extradata that aren't in the
+        // shape mov wants, and the missing frame_size alone causes
+        // the muxer to reject ("track 1: codec frame size is not set").
         if !preferBridge,
            let cfg = streamCopyAudio,
            let dem = demuxer,
            sourceAudioStreamIndex >= 0,
            let stream = sourceAudioStream {
             let codecID = stream.pointee.codecpar.pointee.codec_id
-            let needsExtradata = (codecID == AV_CODEC_ID_AC3 || codecID == AV_CODEC_ID_EAC3)
-                              && cfg.codecpar.pointee.extradata_size == 0
-            if needsExtradata,
-               let patched = reconstructAC3Extradata(
-                   demuxer: dem,
-                   audioStreamIndex: sourceAudioStreamIndex,
-                   sourceCodecpar: cfg.codecpar,
-                   codecID: codecID,
-                   jocPresent: sourceIsAtmos
-               ) {
-                patchedAudioCodecpar = patched
-                streamCopyAudio = HLSSegmentProducer.AudioConfig(
-                    codecpar: UnsafePointer(patched),
-                    timeBase: cfg.timeBase,
-                    sourceStreamIndex: cfg.sourceStreamIndex,
-                    inputTimeBase: cfg.inputTimeBase,
-                    sourceTimeBase: cfg.sourceTimeBase,
-                    bridge: cfg.bridge
-                )
-                EngineLog.emit(
-                    "[HLSVideoEngine] reconstructed \(codecID == AV_CODEC_ID_EAC3 ? "dec3" : "dac3") extradata "
-                    + "(\(patched.pointee.extradata_size) B) from first syncframe — stream-copy probe will now succeed for "
-                    + "\(sourceIsAtmos ? "EAC3+JOC Atmos" : sourceCodecLabel)",
-                    category: .session
-                )
+            if codecID == AV_CODEC_ID_AC3 || codecID == AV_CODEC_ID_EAC3 {
+                if let patched = reconstructAC3Extradata(
+                       demuxer: dem,
+                       audioStreamIndex: sourceAudioStreamIndex,
+                       sourceCodecpar: cfg.codecpar,
+                       codecID: codecID,
+                       jocPresent: sourceIsAtmos
+                   ) {
+                    patchedAudioCodecpar = patched
+                    streamCopyAudio = HLSSegmentProducer.AudioConfig(
+                        codecpar: UnsafePointer(patched),
+                        timeBase: cfg.timeBase,
+                        sourceStreamIndex: cfg.sourceStreamIndex,
+                        inputTimeBase: cfg.inputTimeBase,
+                        sourceTimeBase: cfg.sourceTimeBase,
+                        bridge: cfg.bridge
+                    )
+                    EngineLog.emit(
+                        "[HLSVideoEngine] reconstructed \(codecID == AV_CODEC_ID_EAC3 ? "dec3" : "dac3") extradata "
+                        + "(\(patched.pointee.extradata_size) B, frame_size=\(patched.pointee.frame_size)) from first syncframe — "
+                        + "stream-copy probe will now succeed for \(sourceIsAtmos ? "EAC3+JOC Atmos" : sourceCodecLabel)",
+                        category: .session
+                    )
+                } else {
+                    EngineLog.emit(
+                        "[HLSVideoEngine] WARNING: \(codecID == AV_CODEC_ID_EAC3 ? "dec3" : "dac3") reconstruction returned nil "
+                        + "(no syncword in first audio packet within 100-packet scan, or allocation failed). "
+                        + "Cascade will probe with the source's original codecpar and fall back to FLAC bridge on failure.",
+                        category: .session
+                    )
+                }
             }
         }
 
