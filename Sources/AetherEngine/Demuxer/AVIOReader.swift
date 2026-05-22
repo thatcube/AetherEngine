@@ -76,21 +76,28 @@ final class AVIOReader: @unchecked Sendable {
 
     /// Settled chunk size: 64 MB.
     ///
-    /// A/B history:
+    /// A/B history during the long-form leak investigation:
     ///   8 MB chunks  → 3.20 MB/s leak (URLSession-call-count dominated)
     ///   64 MB chunks → 0.64 MB/s leak (5x reduction; sweet spot)
     ///   256 MB chunks → 4.85 MB/s leak + memory warnings (worse than 8 MB)
     ///
-    /// The 256 MB attempt failed because at 50 Mbps source bitrate each
-    /// chunk fetch takes ~40 s, which is comparable to the 120 s
-    /// demuxer-recycle cadence. Every recycle now catches a prefetch
-    /// closure in flight on `prefetchQueue`, and the closure's
-    /// `prefetchBuffer = data` assignment writes a fresh 256 MB Data
-    /// after `close()` has already nil'd the field. Plus the underlying
-    /// URLSession stays alive (async `finishTasksAndInvalidate`) with
-    /// the response body pinned. 64 MB is short enough that the fetch
-    /// usually completes well before the recycle window, so the race
-    /// happens rarely.
+    /// The 256 MB attempt was worst-of-both: each chunk fetch takes
+    /// ~40s at 50 Mbps source bitrate, which gave the prefetch closure
+    /// a long window to be in flight when the demuxer was torn down
+    /// and recreated by the (now-removed) periodic recycle. The
+    /// underlying URLSession's async `finishTasksAndInvalidate` then
+    /// stayed alive with the 256 MB response body pinned. At 64 MB
+    /// the fetch completes in ~10s and the close-vs-prefetch race
+    /// from the historic recycle pattern would be rare.
+    ///
+    /// The periodic recycle is gone now (commit 1ee963d, which was
+    /// the real leak source — the recycle's swap was leaking the
+    /// previous AVIOReader's buffers via a Swift refcount path), so
+    /// the prefetch race no longer happens in normal operation. The
+    /// chunk size + close-cleanup + race-guard fixes from the
+    /// investigation are kept anyway: cheap to retain, defensive
+    /// against any future code path that would teardown an AVIOReader
+    /// with a prefetch in flight.
     private static let chunkSize = 64 * 1024 * 1024  // 64 MB per chunk
     private static let avioBufferSize: Int32 = 256 * 1024  // 256 KB
     private static let streamTrimThreshold = 1024 * 1024  // 1 MB, keep for small backward seeks
@@ -198,11 +205,10 @@ final class AVIOReader: @unchecked Sendable {
     /// 2. `close` (free resources) — invoked once the demuxer's
     ///    access lock is released. Must NOT short-circuit when
     ///    `isClosed` is already true (the previous `guard !isClosed`
-    ///    did exactly that, which leaked the 64 MB current + 64 MB
-    ///    prefetch chunk Data buffers on every demuxer recycle —
-    ///    observed as the residual ~0.64 MB/s growth after the
-    ///    URLSession chunk-size A/B). `isFullyClosed` is a separate
-    ///    latch for actual idempotency.
+    ///    did exactly that, which silently leaked the 64 MB current
+    ///    + 64 MB prefetch chunk Data buffers any time a demuxer
+    ///    teardown ran). `isFullyClosed` is a separate latch for
+    ///    actual idempotency.
     func close() {
         guard !isFullyClosed else { return }
         isFullyClosed = true
@@ -432,12 +438,11 @@ final class AVIOReader: @unchecked Sendable {
 
             // Bail before issuing the fetch if close already ran.
             // Without this the closure would still spend up to one
-            // chunk-size worth of network time downloading data that
-            // we're about to throw away — and at high source bitrates
-            // that download window is comparable to the periodic
-            // demuxer-recycle cadence, so the closure was reliably
-            // completing AFTER close() had cleared the buffers and
-            // writing its fresh chunk-size Data back into
+            // chunk-size worth of network time downloading data
+            // we're about to throw away, and a teardown that races
+            // with an in-flight prefetch can complete the fetch
+            // AFTER `close()` has cleared the buffers — the closure
+            // would then write its fresh chunk-size Data back into
             // `prefetchBuffer`, undoing the cleanup.
             if self.isFullyClosed {
                 self.bufferLock.lock()
