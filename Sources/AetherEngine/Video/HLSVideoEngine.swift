@@ -1796,11 +1796,18 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
     private let restartHandler: ((Int) -> Void)?
 
     /// Forward-distance threshold beyond which a fetch triggers a
-    /// restart instead of waiting for the producer to catch up. At
-    /// 6 s segments, 8 segments ≈ 48 s of source content; further
-    /// than that and waiting is slower than tearing down and
-    /// resuming at the target.
-    private static let forwardWaitWindow = 8
+    /// restart instead of waiting for the producer to catch up.
+    /// Tightened from 8 to 3 after a Vincent repro on Sodalite where
+    /// AVPlayer requested seg-13 while cache.max was at seg-5 (gap=8,
+    /// inside the old window) and the request waited 26 s for the
+    /// producer to sequentially write seg-6..13. With the smaller
+    /// window, gaps that big trigger a restart at the requested
+    /// index instead, which writes the target segment in ~1 s rather
+    /// than blocking AVPlayer in waitingToPlay for tens of seconds.
+    /// Normal forward playback (request within 1-2 ahead of cache
+    /// max) stays in the wait branch so a transient producer
+    /// slowdown doesn't cause a spurious restart.
+    private static let forwardWaitWindow = 3
 
     // MARK: - Sliding-window EVENT playlist state
 
