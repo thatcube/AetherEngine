@@ -344,6 +344,35 @@ public final class AetherEngine: ObservableObject {
     /// demuxer probe. Reset to `AV_CODEC_ID_NONE` in `stopInternal`.
     private var lastDetectedVideoCodec: AVCodecID = AV_CODEC_ID_NONE
 
+    /// Snapshot of the display-criteria parameters from the most recent
+    /// `load(url:)`. Captured because the audio-track-switch reload
+    /// path's `stopInternal()` calls `displayCriteria.reset()`, which
+    /// releases the panel back to SDR (EDR headroom drops 1.20 → 1.00).
+    /// If `loadNative()` then builds a new AVPlayer asset against an
+    /// SDR panel and the asset's master playlist carries `VIDEO-RANGE=
+    /// PQ` (or any HDR-flagged variant), tvOS 26's master-level codec
+    /// filter rejects item open with `AVFoundationErrorDomain -11868 /
+    /// CoreMediaErrorDomain -17223` (errorLog stays empty, init.mp4
+    /// never fetched). The reload mirrors the initial-load contract by
+    /// re-applying this snapshot and awaiting the handshake BEFORE
+    /// `loadNative()` so the panel is back in HDR mode when AVPlayer
+    /// evaluates the new asset.
+    ///
+    /// Captured at `load(url:)` instead of re-derived at reload time
+    /// so we don't have to re-probe the source for `effectiveFormat`,
+    /// `detectedDVProfile`, and `snappedRate` (the reload already
+    /// reopens the demuxer; this just saves the criteria work).
+    /// Nil only when `load()` ran with `suppressDisplayCriteria` (host-
+    /// driven criteria) or hasn't run yet — in either case the reload
+    /// skips criteria too, matching the initial-load behavior.
+    private struct DisplayCriteriaSnapshot: Sendable {
+        let format: VideoFormat
+        let frameRate: Double?
+        let codecTag: FourCharCode?
+        let omitColorExtensions: Bool
+    }
+    private var lastDisplayCriteriaSnapshot: DisplayCriteriaSnapshot?
+
     /// Cap the per-session subtitle event diagnostic logs so the in-
     /// app overlay stays readable. Reset on `load()` so each new
     /// session gets a fresh budget.
@@ -763,8 +792,18 @@ public final class AetherEngine: ObservableObject {
 
         // 2. Display-criteria handshake. Drive from the effective format so
         //    a non-DV panel doesn't get asked to switch into dvh1 mode.
+        //    Snapshot the params so `reloadWithAudioOverride` can re-apply
+        //    them after its `stopInternal()` drops the panel back to SDR;
+        //    without that the reload's new AVPlayer asset evaluates a PQ
+        //    variant against an SDR panel and fails item open with -11868.
         if !options.suppressDisplayCriteria {
             let codecTag: FourCharCode? = detectedDVProfile ? 0x64766831 : nil
+            lastDisplayCriteriaSnapshot = DisplayCriteriaSnapshot(
+                format: effectiveFormat,
+                frameRate: snappedRate,
+                codecTag: codecTag,
+                omitColorExtensions: options.omitCriteriaColorExtensions
+            )
             let willSwitch = displayCriteria.apply(
                 format: effectiveFormat,
                 frameRate: snappedRate,
@@ -774,6 +813,11 @@ public final class AetherEngine: ObservableObject {
             if willSwitch {
                 await displayCriteria.waitForSwitch()
             }
+        } else {
+            // Host opted out of criteria management for this load.
+            // Clear any stale snapshot so a subsequent reload doesn't
+            // re-apply criteria the host explicitly suppressed.
+            lastDisplayCriteriaSnapshot = nil
         }
 
         // 3. Dispatch by codec. The native AVPlayer path carries Atmos
@@ -1325,6 +1369,29 @@ public final class AetherEngine: ObservableObject {
         EngineLog.emit("[AetherEngine] reload: stopInternal done (\(elapsedMs(since: reloadStart))ms)", category: .engine)
         loadedURL = url
         lastDetectedVideoCodec = preservedVideoCodec
+
+        // Re-apply the criteria snapshot from the initial load before
+        // building the new AVPlayer asset. `stopInternal()` above called
+        // `displayCriteria.reset()` which drops the panel back to SDR
+        // (EDR headroom 1.00). If `loadNative()` then runs `AVPlayer.
+        // load()` on a PQ asset against an SDR panel, tvOS 26's master-
+        // level codec filter rejects item open with `AVFoundation
+        // ErrorDomain -11868 / CoreMediaErrorDomain -17223` at variant
+        // selection (errorLog stays empty, init.mp4 never fetched).
+        // The initial-load path runs this exact apply+waitForSwitch
+        // BEFORE `loadNative`; the reload mirrors that contract here.
+        // No-op when the host suppressed criteria on the initial load.
+        if let snapshot = lastDisplayCriteriaSnapshot {
+            let willSwitch = displayCriteria.apply(
+                format: snapshot.format,
+                frameRate: snapshot.frameRate,
+                codecTag: snapshot.codecTag,
+                omitColorExtensions: snapshot.omitColorExtensions
+            )
+            if willSwitch {
+                await displayCriteria.waitForSwitch()
+            }
+        }
 
         do {
             let loadStart = DispatchTime.now()
