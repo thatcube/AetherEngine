@@ -1038,6 +1038,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             videoRange: videoRange,
             frameRate: frameRate,
             hdcpLevel: hdcpLevel,
+            sourceBitrate: sourceBitrate,
             initialIndex: initialIndex,
             restartHandler: { [weak self] idx in
                 self?.restartProducer(at: idx)
@@ -1960,6 +1961,7 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
     private let videoRange: HLSVideoRange
     private let frameRate: Double?
     private let hdcpLevel: String?
+    private let sourceBitrate: Int64
 
     /// Closure into the engine that tears down the current producer
     /// and brings up a fresh one rooted at the given absolute segment
@@ -2053,6 +2055,7 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
         videoRange: HLSVideoRange,
         frameRate: Double?,
         hdcpLevel: String?,
+        sourceBitrate: Int64,
         initialIndex: Int = 0,
         restartHandler: ((Int) -> Void)? = nil
     ) {
@@ -2064,6 +2067,7 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
         self.videoRange = videoRange
         self.frameRate = frameRate
         self.hdcpLevel = hdcpLevel
+        self.sourceBitrate = sourceBitrate
         self.restartHandler = restartHandler
 
         let safeInitial = max(0, min(initialIndex, segments.count - 1))
