@@ -344,35 +344,6 @@ public final class AetherEngine: ObservableObject {
     /// demuxer probe. Reset to `AV_CODEC_ID_NONE` in `stopInternal`.
     private var lastDetectedVideoCodec: AVCodecID = AV_CODEC_ID_NONE
 
-    /// Snapshot of the display-criteria parameters from the most recent
-    /// `load(url:)`. Captured because the audio-track-switch reload
-    /// path's `stopInternal()` calls `displayCriteria.reset()`, which
-    /// releases the panel back to SDR (EDR headroom drops 1.20 → 1.00).
-    /// If `loadNative()` then builds a new AVPlayer asset against an
-    /// SDR panel and the asset's master playlist carries `VIDEO-RANGE=
-    /// PQ` (or any HDR-flagged variant), tvOS 26's master-level codec
-    /// filter rejects item open with `AVFoundationErrorDomain -11868 /
-    /// CoreMediaErrorDomain -17223` (errorLog stays empty, init.mp4
-    /// never fetched). The reload mirrors the initial-load contract by
-    /// re-applying this snapshot and awaiting the handshake BEFORE
-    /// `loadNative()` so the panel is back in HDR mode when AVPlayer
-    /// evaluates the new asset.
-    ///
-    /// Captured at `load(url:)` instead of re-derived at reload time
-    /// so we don't have to re-probe the source for `effectiveFormat`,
-    /// `detectedDVProfile`, and `snappedRate` (the reload already
-    /// reopens the demuxer; this just saves the criteria work).
-    /// Nil only when `load()` ran with `suppressDisplayCriteria` (host-
-    /// driven criteria) or hasn't run yet — in either case the reload
-    /// skips criteria too, matching the initial-load behavior.
-    private struct DisplayCriteriaSnapshot: Sendable {
-        let format: VideoFormat
-        let frameRate: Double?
-        let codecTag: FourCharCode?
-        let omitColorExtensions: Bool
-    }
-    private var lastDisplayCriteriaSnapshot: DisplayCriteriaSnapshot?
-
     /// Cap the per-session subtitle event diagnostic logs so the in-
     /// app overlay stays readable. Reset on `load()` so each new
     /// session gets a fresh budget.
@@ -792,18 +763,8 @@ public final class AetherEngine: ObservableObject {
 
         // 2. Display-criteria handshake. Drive from the effective format so
         //    a non-DV panel doesn't get asked to switch into dvh1 mode.
-        //    Snapshot the params so `reloadWithAudioOverride` can re-apply
-        //    them after its `stopInternal()` drops the panel back to SDR;
-        //    without that the reload's new AVPlayer asset evaluates a PQ
-        //    variant against an SDR panel and fails item open with -11868.
         if !options.suppressDisplayCriteria {
             let codecTag: FourCharCode? = detectedDVProfile ? 0x64766831 : nil
-            lastDisplayCriteriaSnapshot = DisplayCriteriaSnapshot(
-                format: effectiveFormat,
-                frameRate: snappedRate,
-                codecTag: codecTag,
-                omitColorExtensions: options.omitCriteriaColorExtensions
-            )
             let willSwitch = displayCriteria.apply(
                 format: effectiveFormat,
                 frameRate: snappedRate,
@@ -813,11 +774,6 @@ public final class AetherEngine: ObservableObject {
             if willSwitch {
                 await displayCriteria.waitForSwitch()
             }
-        } else {
-            // Host opted out of criteria management for this load.
-            // Clear any stale snapshot so a subsequent reload doesn't
-            // re-apply criteria the host explicitly suppressed.
-            lastDisplayCriteriaSnapshot = nil
         }
 
         // 3. Dispatch by codec. The native AVPlayer path carries Atmos
@@ -1365,33 +1321,24 @@ public final class AetherEngine: ObservableObject {
         let preservedVideoCodec = lastDetectedVideoCodec
         let reloadStart = DispatchTime.now()
         EngineLog.emit("[AetherEngine] reload: stopInternal start", category: .engine)
-        stopInternal()
+        // Keep the active display criteria intact across the audio-track
+        // switch. The video format isn't changing — `reloadWithAudioOverride`
+        // only swaps the audio source stream inside the same HLS engine —
+        // so a `displayCriteria.reset()` here is at best a no-op and at
+        // worst triggers a 5 s `waitForSwitch` Stage 2 timeout on every
+        // reload (Vincent test 2026-05-26, Bose SLIII A2DP route + 4K
+        // HDR10 PQ source: each audio switch added ~12 s of black-screen
+        // latency because the post-RESET handshake never re-settled,
+        // even though the panel never actually left HDR mode). Preserving
+        // the criteria also fixes a separate failure mode on the same
+        // route: when the panel briefly dropped to SDR during the RESET
+        // window, the new AVPlayer asset's PQ variant failed item open
+        // with `AVFoundationErrorDomain -11868 / CoreMediaErrorDomain
+        // -17223` at variant selection.
+        stopInternal(resetDisplayCriteria: false)
         EngineLog.emit("[AetherEngine] reload: stopInternal done (\(elapsedMs(since: reloadStart))ms)", category: .engine)
         loadedURL = url
         lastDetectedVideoCodec = preservedVideoCodec
-
-        // Re-apply the criteria snapshot from the initial load before
-        // building the new AVPlayer asset. `stopInternal()` above called
-        // `displayCriteria.reset()` which drops the panel back to SDR
-        // (EDR headroom 1.00). If `loadNative()` then runs `AVPlayer.
-        // load()` on a PQ asset against an SDR panel, tvOS 26's master-
-        // level codec filter rejects item open with `AVFoundation
-        // ErrorDomain -11868 / CoreMediaErrorDomain -17223` at variant
-        // selection (errorLog stays empty, init.mp4 never fetched).
-        // The initial-load path runs this exact apply+waitForSwitch
-        // BEFORE `loadNative`; the reload mirrors that contract here.
-        // No-op when the host suppressed criteria on the initial load.
-        if let snapshot = lastDisplayCriteriaSnapshot {
-            let willSwitch = displayCriteria.apply(
-                format: snapshot.format,
-                frameRate: snapshot.frameRate,
-                codecTag: snapshot.codecTag,
-                omitColorExtensions: snapshot.omitColorExtensions
-            )
-            if willSwitch {
-                await displayCriteria.waitForSwitch()
-            }
-        }
 
         do {
             let loadStart = DispatchTime.now()
@@ -1825,12 +1772,23 @@ public final class AetherEngine: ObservableObject {
         Int(Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000)
     }
 
-    private func stopInternal() {
+    /// - Parameter resetDisplayCriteria: When `true` (default), release
+    ///   the `AVDisplayManager.preferredDisplayCriteria` so the panel
+    ///   returns to its default mode. Used by `load()` and the public
+    ///   `stop()` API where the next session may target a different
+    ///   format. The audio-track-switch reload path passes `false`
+    ///   because the same source is being re-prepared with only the
+    ///   audio stream changing — keeping the criteria in place avoids
+    ///   a redundant `apply` + `waitForSwitch` cycle that on some
+    ///   panels (notably when paired with a Bluetooth A2DP audio route)
+    ///   never settles and times out at 5 s, adding ~12 s of black-
+    ///   screen latency per audio switch.
+    private func stopInternal(resetDisplayCriteria: Bool = true) {
         // Stop AVPlayer fetching before tearing down the loopback HLS
         // server, otherwise AVPlayer's segment requests race the
-        // server shutdown and produce noisy errors in the log. Always
-        // reset display criteria so a previous DV/HDR session doesn't
-        // leak the panel mode into the next playback.
+        // server shutdown and produce noisy errors in the log. Display
+        // criteria reset is gated by the parameter so audio-only reloads
+        // preserve the panel mode (see method doc).
         memoryProbeTask?.cancel()
         memoryProbeTask = nil
         liveTelemetrySampler?.stop()
@@ -1852,7 +1810,9 @@ public final class AetherEngine: ObservableObject {
         softwareHost?.stop()
         softwareHost = nil
 
-        displayCriteria.reset()
+        if resetDisplayCriteria {
+            displayCriteria.reset()
+        }
         playbackBackend = .none
         activeVideoDecoder = nil
         activeAudioDecoder = nil
