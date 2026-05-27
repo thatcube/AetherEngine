@@ -369,18 +369,35 @@ final class SegmentCache {
         return (keys.min()!, keys.max()!)
     }
 
-    /// Highest absolute segment index ever stored by the producer
-    /// during this session, monotonic across pruning. Returns -1
-    /// before the producer's first store. `indexRange()` reports
-    /// only currently-resident entries and loses this signal once
-    /// `pruneOutsideWindow` evicts the high end of the window; the
-    /// restart-decision logic needs the "did the producer ever write
-    /// past `index`?" question answered to detect prune-created gaps
-    /// that no amount of waiting will backfill.
+    /// Highest segment index the *current* producer has stored,
+    /// monotonic across pruning but reset on every producer restart
+    /// via `resetHighWaterForRestart()`. Returns -1 before the
+    /// current producer's first store. `indexRange()` reports only
+    /// currently-resident entries and loses the "producer wrote past
+    /// here" signal once `pruneOutsideWindow` evicts the high end of
+    /// the window; the restart-decision logic needs that signal to
+    /// detect prune-created gaps no amount of waiting will backfill.
+    /// Reset on restart so the previous producer's high-water doesn't
+    /// keep the gate hot on every subsequent fetch (which cascades
+    /// into a restart-per-segment storm that drains AVPlayer's
+    /// buffer and stalls playback).
     var highestStoredIndex: Int {
         condition.lock()
         defer { condition.unlock() }
         return _highestStoredIndex
+    }
+
+    /// Reset the high-water mark. Called by `VideoSegmentProvider`
+    /// immediately before triggering a producer restart so the new
+    /// producer's writes seed a fresh counter. Without this, the
+    /// previous producer's write head (often well above the new
+    /// launch index) keeps `producerPassedAndPruned` hot on every
+    /// subsequent fetch and a single legitimate restart cascades
+    /// into a restart-per-segment storm.
+    func resetHighWaterForRestart() {
+        condition.lock()
+        defer { condition.unlock() }
+        _highestStoredIndex = -1
     }
 
     var count: Int {

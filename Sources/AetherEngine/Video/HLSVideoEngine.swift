@@ -2362,10 +2362,25 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
 
         if needsRestart, let restart = restartHandler {
             EngineLog.emit(
-                "[HLSVideoEngine] seg\(index): out-of-range fetch (cache.range=\(range.map { "\($0.0)..\($0.1)" } ?? "empty")), restarting producer",
+                "[HLSVideoEngine] seg\(index): out-of-range fetch (cache.range=\(range.map { "\($0.0)..\($0.1)" } ?? "empty") highWater=\(highWater)), restarting producer",
                 category: .session
             )
             lastRestartIndex = index
+            // Reset the cache's high-water before the new producer
+            // takes over so `producerPassedAndPruned` only reflects
+            // what the *new* producer has written. Without this, the
+            // previous producer's high-water stays hot and every
+            // subsequent peek-miss above `index` re-triggers
+            // `producerPassedAndPruned` → restart cascade. Seen in
+            // the wild: a back-scrub at ~80s evicted seg-11..seg-19,
+            // the first seg-11 fetch correctly restarted at 11, but
+            // then seg-12..seg-19 each restarted again (highWater
+            // still 21 from the killed producer) instead of waiting
+            // 2 s for the now-forward-writing new producer to reach
+            // them. Each restart cost 100-200 ms, drained AVPlayer's
+            // buffer, and produced the user-visible "stalls for 10 s
+            // then fast-forwards to catch up" symptom.
+            cache.resetHighWaterForRestart()
             restart(index)
         }
 
