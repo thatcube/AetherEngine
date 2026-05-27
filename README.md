@@ -111,8 +111,10 @@ Subtitle cues land in raw source PTS. On the native path, AVPlayer's HLS clock s
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", branch: "main")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "1.5.0")
 ```
+
+See [`Examples/MinimalPlayer/`](Examples/MinimalPlayer/MinimalPlayerApp.swift) for a complete drop-in SwiftUI app that loads, plays, and reports state for a single source URL. About 90 lines of host code — copy the file into a new Xcode tvOS / iOS / macOS app, point at a real URL, run.
 
 ## Host setup on tvOS
 
