@@ -1,6 +1,9 @@
 # Examples
 
-Drop-in samples that show the smallest viable AetherEngine integration.
+Two complementary samples covering different audiences:
+
+- **MinimalPlayer** — source-only SwiftUI drop-in for **developers** integrating AetherEngine into their own apps. Read the file, paste it into your Xcode project, change the URL.
+- **DemoPlayerMac** — standalone macOS SwiftPM app for **testers** wanting to exercise the engine against their own media without writing host code. `swift run` opens a window; drop a file on it to play.
 
 ## MinimalPlayer
 
@@ -38,3 +41,16 @@ To stay readable the sample omits things real apps care about:
 - **Now Playing / lock-screen integration.** Subscribe to `engine.$currentAVPlayer` and feed it to `MPNowPlayingSession`. See `Sodalite` for a reference implementation.
 
 For all of these, read the inline docstrings on `AetherEngine`, `LoadOptions`, and `TrackInfo` in `Sources/AetherEngine/`. They're the canonical contract.
+
+## DemoPlayerMac
+
+[`DemoPlayerMac/`](DemoPlayerMac/README.md) is a runnable macOS SwiftPM app. Built against AetherEngine via a local path so it stays in lock-step with the engine source it ships alongside. The point is to play any media file end-to-end in under a minute:
+
+```bash
+cd Examples/DemoPlayerMac
+swift run
+```
+
+A *AetherEngine Demo* window opens. Drag a video file onto it; playback starts. Click or press space to toggle play / pause; escape to stop. A corner badge shows `native` or `sw` so bug reporters can attribute the source to the right backend in repro posts.
+
+No transport bar, no subtitle picker, no settings — by design. The demonstrator's job is to prove playback; anything past that belongs in a real host app like [Sodalite](https://github.com/superuser404notfound/Sodalite). A distributable `.dmg` build is on the roadmap (see [issue #18](https://github.com/superuser404notfound/AetherEngine/issues/18)).

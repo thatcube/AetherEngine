@@ -1,9 +1,12 @@
 .DS_Store
-/.build
-/Packages
+# Match .build / Packages / .swiftpm at any depth so nested SwiftPM
+# sub-packages (e.g. Examples/DemoPlayerMac) don't accidentally commit
+# their build artifacts + checkout mirrors.
+.build/
+Packages/
+.swiftpm/
 xcuserdata/
 DerivedData/
-.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 .netrc
 build/
 
