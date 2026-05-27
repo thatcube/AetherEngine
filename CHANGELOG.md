@@ -10,12 +10,34 @@ the public-API contract.
 
 ## [Unreleased]
 
-- `resolveCodecRoute` extracted out of `HLSVideoEngine.start()` (pure
-  refactor, no behaviour change). `start()` drops from ~830 to ~520 lines;
-  codec dispatch becomes a private function returning a `CodecRoute` struct.
-- Test target (`Tests/AetherEngineTests/`) and GitHub Actions CI covering
-  `swift build` + `swift test` on macOS plus `xcodebuild` smoke builds for
-  tvOS and iOS Simulators.
+_Nothing yet._
+
+## [2.0.0] — 2026-05-27
+
+Stability milestone: the HDR / Dolby Vision routing path is now considered done after the DrHurt #4 sweep across multiple panel modes settled, and the adoption-readiness package (tests, CI, CHANGELOG, examples, Swift Package Index listing) makes the project safe to depend on. **No breaking changes to the public API surface** — existing 1.5.0 callers compile and run unchanged. The major version bump is a stability signal, not an API redesign.
+
+Key user-visible changes since 1.5.0:
+
+- **Match Dynamic Range OFF correctly detected.** tvOS exposes only one combined `isDisplayCriteriaMatchingEnabled` flag for Match Content (rate + range). Users with Match Frame Rate ON and Match Dynamic Range OFF previously had the engine route HDR sources through master playlists with `VIDEO-RANGE=PQ`, which AVPlayer rejected with -11848 / -11868 since the panel stayed in SDR. The engine now reads `UIScreen.currentEDRHeadroom` after the criteria handshake settles and uses that empirical reading for the master-vs-media routing decision.
+- **`sourceVideoFormat` published.** Stats / debug overlays can now show "what's in the file" alongside "what the panel is presenting". A DV source on an HDR10-only TV now reads `sourceVideoFormat = .dolbyVision`, `videoFormat = .hdr10`.
+- **LiveTelemetry + memory probe restart after audio-track switch.** Diagnostic samplers no longer go silent after the user picks a different audio track mid-session.
+- **HLS producer reliability hardening.** Forward-scrub + back-scrub combinations no longer leave AVPlayer stuck waiting for evicted segments. The cache high-water reset moved AFTER the restart returns (was BEFORE, creating restart cascades). Proactive backward-jump restart applied to both `mediaSegmentURL` and `mediaSegment` (data) code paths.
+
+Adoption-readiness additions:
+
+- `Tests/AetherEngineTests/` with 12 unit tests covering pure-function surfaces.
+- GitHub Actions CI runs `swift test` on macOS plus `xcodebuild` smoke builds for tvOS and iOS Simulators on every push and PR.
+- `CHANGELOG.md` (this file) as an in-repo release index.
+- README › Stability and versioning documents the SemVer contract for adopters.
+- README › Known limitations spells out the deferred / accepted-loss items so adopters can size them before integration.
+- `Examples/MinimalPlayer/MinimalPlayerApp.swift` — a 90-line SwiftUI drop-in app demonstrating the smallest viable AetherEngine integration.
+- `.spi.yml` for Swift Package Index multi-platform build matrix.
+
+Internal:
+
+- `resolveCodecRoute` extracted out of `HLSVideoEngine.start()`. The 300-line codec / DV dispatch switch is now a private function returning a `CodecRoute` struct. `start()` drops from ~830 to ~520 lines. Pure refactor, no behaviour change.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/2.0.0))
 
 ## [1.5.0] — 2026-05-26
 
