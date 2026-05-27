@@ -47,5 +47,10 @@ let package = Package(
             dependencies: ["AetherEngine"],
             path: "Sources/aetherctl"
         ),
+        .testTarget(
+            name: "AetherEngineTests",
+            dependencies: ["AetherEngine"],
+            path: "Tests/AetherEngineTests"
+        ),
     ]
 )
