@@ -1432,6 +1432,15 @@ public final class AetherEngine: ObservableObject {
                 nativeHost?.play()
             }
             state = .playing
+            // Re-arm the diagnostic samplers. stopInternal nilled the
+            // sampler instance + the published liveTelemetry value, and
+            // the reload path bypasses the public load() that would
+            // otherwise restart them — so without this, the host's
+            // stats overlay sees @Published liveTelemetry stuck at nil
+            // and renders "-" for every field after the first audio
+            // track switch in a session.
+            startMemoryProbe()
+            startLiveTelemetrySampler()
             EngineLog.emit("[AetherEngine] reload: state=.playing total=\(elapsedMs(since: reloadStart))ms", category: .engine)
         } catch {
             EngineLog.emit(
