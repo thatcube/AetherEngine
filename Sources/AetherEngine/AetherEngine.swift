@@ -737,31 +737,13 @@ public final class AetherEngine: ObservableObject {
             EngineLog.emit("[AetherEngine] probe failed (\(error)); proceeding without criteria", category: .engine)
         }
 
-        // Publish the format the panel will actually present, not the
-        // source's claimed format. Three clamping passes feed into this:
-        //
-        //   1. `effectiveVideoFormat` collapses DV on a non-DV panel to
-        //      its base layer (HDR10 for P8.1, HLG for P8.4, SDR for
-        //      P8.2 even though the engine refuses to serve it).
-        //   2. The HDR-capability check below: if the connected panel
-        //      can't show HDR at all (`supportsHDR == false`), or if
-        //      the panel is currently in SDR with tvOS Match Content
-        //      OFF, the HLSVideoEngine routes through the media
-        //      playlist for AVPlayer's auto-tonemap path. The display
-        //      then renders SDR, so the badge / Stats overlay should
-        //      read SDR too.
-        //
-        // Mirrors the master-vs-media routing in HLSVideoEngine.start()
-        // so the published format and the actual on-screen rendering
-        // stay in step.
-        let panelWillPresentHDR = options.panelIsInHDRMode
-            || (Self.displayCapabilities.supportsHDR && options.matchContentEnabled)
-        videoFormat = (effectiveFormat != .sdr && panelWillPresentHDR)
-            ? effectiveFormat
-            : .sdr
         // Source format is what the probe found in the file, before any
         // panel clamping. Stats overlays use this to label "what the file
         // is" vs `videoFormat` labelling "what the panel is showing".
+        // (`videoFormat` itself is published lower in this method, after
+        // the criteria handshake has settled and we know which dynamic-
+        // range mode the panel actually adopted — see comment on the
+        // `panelHDRAfterHandshake` snapshot below.)
         sourceVideoFormat = detectedFormat
         audioTracks = probedAudioTracks
         subtitleTracks = probedSubtitleTracks
@@ -796,6 +778,42 @@ public final class AetherEngine: ObservableObject {
                 await displayCriteria.waitForSwitch()
             }
         }
+
+        // 2.5. Post-handshake panel-mode snapshot. tvOS exposes only one
+        //      combined `isDisplayCriteriaMatchingEnabled` toggle — there's
+        //      no API to tell whether Match Dynamic Range is on or only
+        //      Match Frame Rate. A user with rate matching on and range
+        //      matching off (DrHurt #4 2026-05-27 residual) reports the
+        //      combined flag as `true`, the host passes
+        //      `matchContentEnabled=true` in LoadOptions, but the panel
+        //      stays SDR when we ask for HDR. The old gates
+        //      (`supportsHDR && matchContentEnabled`) treated that as "will
+        //      switch", routed via master playlist with `VIDEO-RANGE=PQ`,
+        //      and AVPlayer rejected with -11848 / -11868 because the
+        //      strict variant filter saw HDR variants on an SDR-locked
+        //      panel.
+        //
+        //      Reading `currentEDRHeadroom` after `waitForSwitch` is the
+        //      only authoritative way to know which sub-toggle is active:
+        //      headroom > 1.0 means the panel accepted the HDR mode
+        //      (match-range was on), headroom == 1.0 means it refused
+        //      (match-range off). Pass that empirical reading to both the
+        //      published `videoFormat` and HLSVideoEngine's master-vs-
+        //      media routing so the two stay in step.
+        //
+        //      Suppressed-criteria hosts (AVKit-sole-writer path) fall
+        //      back to the caller's pre-load snapshot — their criteria
+        //      fires later from AVKit and we can't probe the outcome
+        //      from here.
+        let panelHDRAfterHandshake: Bool
+        if options.suppressDisplayCriteria {
+            panelHDRAfterHandshake = options.panelIsInHDRMode
+        } else {
+            panelHDRAfterHandshake = displayCriteria.currentPanelIsHDR()
+        }
+        videoFormat = (effectiveFormat != .sdr && panelHDRAfterHandshake)
+            ? effectiveFormat
+            : .sdr
 
         // 3. Dispatch by codec. The native AVPlayer path carries Atmos
         //    passthrough, Dolby Vision HDMI handshake, and the system
@@ -885,7 +903,7 @@ public final class AetherEngine: ObservableObject {
                     audioSourceStreamIndex: audioSourceStreamIndex,
                     keepDvh1TagWithoutDV: options.keepDvh1TagWithoutDV,
                     matchContentEnabled: options.matchContentEnabled,
-                    panelIsInHDRMode: options.panelIsInHDRMode,
+                    panelIsInHDRMode: panelHDRAfterHandshake,
                     audioBridgeMode: options.audioBridgeMode,
                     preopenedDemuxer: probeOpened ? probe : nil
                 )

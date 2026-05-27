@@ -264,6 +264,30 @@ final class DisplayCriteriaController {
         #endif
     }
 
+    /// Snapshot the panel's current dynamic-range mode after the
+    /// criteria handshake has settled. Reads `UIScreen.currentEDRHeadroom`
+    /// (> 1.0 means HDR mode is active, accepting extended-range pixels).
+    ///
+    /// Called by the engine after `apply` + `waitForSwitch` so the
+    /// rest of the load path can use the panel's *actual* mode instead
+    /// of the host's pre-load snapshot. This matters because tvOS
+    /// exposes only one combined `isDisplayCriteriaMatchingEnabled`
+    /// toggle — there's no API to tell whether Match Dynamic Range
+    /// specifically is on or only Match Frame Rate. A user with rate
+    /// matching on and range matching off shows up as
+    /// `isDisplayCriteriaMatchingEnabled == true`, but the panel stays
+    /// SDR when we ask for HDR. Reading the headroom after the
+    /// handshake settles is the only authoritative way to know which
+    /// of the two sub-toggles is active.
+    func currentPanelIsHDR() -> Bool {
+        #if os(tvOS)
+        guard let window = resolveWindow() else { return false }
+        return window.screen.currentEDRHeadroom > 1.001
+        #else
+        return false
+        #endif
+    }
+
     /// Clear the preferred display criteria so the panel returns to
     /// its default mode after playback. Idempotent. No-op when the
     /// controller never wrote criteria during the current session

@@ -1210,8 +1210,22 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // and the standard `sourceIsHDR && panelReadyForHDR` check
         // below routes them correctly.
         let sourceIsHDR = videoRange != .sdr || effectiveDvMode
+        // `panelIsInHDRMode` is authoritative here. AetherEngine.load reads
+        // `UIScreen.currentEDRHeadroom` AFTER `DisplayCriteriaController.
+        // waitForSwitch` settles and passes the empirical result down, so a
+        // panel that's about to switch to HDR via match-range already reads
+        // as HDR by the time we route here.
+        //
+        // Previously this OR-fell-through via `(displaySupportsHDR &&
+        // matchContentEnabled)`, but tvOS's match-content API exposes only
+        // one combined `isDisplayCriteriaMatchingEnabled` flag — there's no
+        // way to tell whether Match Dynamic Range specifically is on or
+        // only Match Frame Rate. Trusting the combined flag as a panel-
+        // will-switch proxy broke playback for users with rate-match ON +
+        // range-match OFF: we routed master with `VIDEO-RANGE=PQ`, the
+        // panel stayed SDR, AVPlayer rejected with -11848 / -11868 (DrHurt
+        // #4 2026-05-27).
         let panelReadyForHDR = panelIsInHDRMode
-            || (displaySupportsHDR && matchContentEnabled)
         let dv5OnNonDVPanel = dvVariant == .profile5 && !effectiveDvMode
         let useMasterPlaylist: Bool
         if dv5OnNonDVPanel {
