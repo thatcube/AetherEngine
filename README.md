@@ -7,6 +7,8 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/superuser404notfound/AetherEngine/releases/latest"><img src="https://img.shields.io/github/v/release/superuser404notfound/AetherEngine?label=release&color=blue"></a>
+  <a href="https://github.com/superuser404notfound/AetherEngine/actions/workflows/ci.yml"><img src="https://github.com/superuser404notfound/AetherEngine/actions/workflows/ci.yml/badge.svg"></a>
   <img src="https://img.shields.io/badge/iOS-16%2B-black?logo=apple">
   <img src="https://img.shields.io/badge/tvOS-16%2B-black?logo=apple">
   <img src="https://img.shields.io/badge/macOS-14%2B-black?logo=apple">
@@ -379,9 +381,9 @@ Things that work today but have a documented edge case, or are deferred behind a
 
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface — every `public` declaration in `Sources/AetherEngine/` — is the stability contract:
 
-- **Major (`x.0.0`)**: removes or renames public symbols, changes method signatures, changes default behaviour in a way that breaks adopters.
-- **Minor (`1.x.0`)**: adds public API, adds codec / format support, fixes behaviour that adopters could not reasonably have depended on.
-- **Patch (`1.0.x`)**: fixes bugs and reliability issues. No public API changes.
+- **Major (`X.0.0`)**: removes or renames public symbols, changes method signatures, changes default behaviour in a way that breaks adopters.
+- **Minor (`X.Y.0`)**: adds public API, adds codec / format support, fixes behaviour that adopters could not reasonably have depended on.
+- **Patch (`X.Y.Z`)**: fixes bugs and reliability issues. No public API changes.
 
 `internal` types and properties are not part of the contract and may change in any release. `@testable import AetherEngine` reaches them for the package's own tests, not for production use.
 
