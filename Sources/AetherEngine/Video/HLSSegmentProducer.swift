@@ -59,17 +59,22 @@ final class HLSSegmentProducer: @unchecked Sendable {
         /// HEVC HDR10 (P7 today). See
         /// `MP4SegmentMuxer.VideoConfig.stripDolbyVisionMetadata`.
         let stripDolbyVisionMetadata: Bool
+        /// Optional color-signaling override forwarded to the muxer.
+        /// See `MP4SegmentMuxer.ColorOverride`.
+        let colorOverride: MP4SegmentMuxer.ColorOverride?
 
         init(
             codecpar: UnsafePointer<AVCodecParameters>,
             timeBase: AVRational,
             codecTagOverride: String?,
-            stripDolbyVisionMetadata: Bool = false
+            stripDolbyVisionMetadata: Bool = false,
+            colorOverride: MP4SegmentMuxer.ColorOverride? = nil
         ) {
             self.codecpar = codecpar
             self.timeBase = timeBase
             self.codecTagOverride = codecTagOverride
             self.stripDolbyVisionMetadata = stripDolbyVisionMetadata
+            self.colorOverride = colorOverride
         }
     }
 
@@ -560,7 +565,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
             codecpar: videoConfig.codecpar,
             timeBase: videoConfig.timeBase,
             codecTagOverride: videoConfig.codecTagOverride,
-            stripDolbyVisionMetadata: videoConfig.stripDolbyVisionMetadata
+            stripDolbyVisionMetadata: videoConfig.stripDolbyVisionMetadata,
+            colorOverride: videoConfig.colorOverride
         )
         let muxerAudio: MP4SegmentMuxer.AudioConfig? = audioConfig.map { a in
             MP4SegmentMuxer.AudioConfig(codecpar: a.codecpar, timeBase: a.inputTimeBase)

@@ -575,11 +575,37 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let segmentCache = SegmentCache()
         self.cache = segmentCache
 
+        // DV Profile 5 is defined as IPT-PQ-c2 (BT.2020 primaries, PQ
+        // transfer, BT.2020-NCL matrix, limited range). The `dvcC`
+        // record implies that signaling, but some P5 MP4 encoders
+        // omit the HEVC SPS VUI fields and the container `colr` atom
+        // (Wandering Earth 2 WEB-DL 2026-05-28 issue #19: dvh1
+        // sample entry + dvcC P5 L6 present, but color_trc /
+        // color_primaries / color_space all unspecified, no nclx).
+        // Without an explicit transfer signal on the output fMP4,
+        // AVPlayer's DV decoder won't engage on the dvh1 sample
+        // entry (item.status .failed) even though the elementary
+        // stream is well-formed P5. The matroska demuxer reads the
+        // Colour element directly into codecpar.color_* so the same
+        // content as MKV plays cleanly; the mp4 demuxer has no
+        // equivalent fallback. Forcing the canonical P5 color tuple
+        // here makes the muxer write a `colr nclx 9/16/9` atom that
+        // AVPlayer reads as the missing PQ signal. Safe to overwrite:
+        // P5 has no legal alternate color signaling.
+        let p5ColorOverride: MP4SegmentMuxer.ColorOverride? = (dvVariant == .profile5)
+            ? MP4SegmentMuxer.ColorOverride(
+                primaries: AVCOL_PRI_BT2020,
+                trc: AVCOL_TRC_SMPTE2084,
+                space: AVCOL_SPC_BT2020_NCL,
+                range: AVCOL_RANGE_MPEG
+            )
+            : nil
         let videoConfig = HLSSegmentProducer.StreamConfig(
             codecpar: codecpar,
             timeBase: videoTimeBase,
             codecTagOverride: codecTagOverride,
-            stripDolbyVisionMetadata: stripDolbyVisionMetadata
+            stripDolbyVisionMetadata: stripDolbyVisionMetadata,
+            colorOverride: p5ColorOverride
         )
         self.videoStreamIndex = videoIndex
         self.savedVideoConfig = videoConfig
@@ -1324,7 +1350,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 codecpar: vcfg.codecpar,
                 timeBase: vcfg.timeBase,
                 codecTagOverride: vcfg.codecTagOverride,
-                stripDolbyVisionMetadata: vcfg.stripDolbyVisionMetadata
+                stripDolbyVisionMetadata: vcfg.stripDolbyVisionMetadata,
+                colorOverride: vcfg.colorOverride
             )
             let probeAudio = MP4SegmentMuxer.AudioConfig(
                 codecpar: cfg.codecpar,

@@ -107,6 +107,24 @@ final class MP4SegmentMuxer {
 
     // MARK: - Types
 
+    /// Force color signaling fields on the output stream's codecpar
+    /// after `avcodec_parameters_copy` and before `avformat_write_header`.
+    /// Used for Dolby Vision Profile 5 sources whose SPS VUI omits the
+    /// transfer characteristic and whose MP4 container has no `colr`
+    /// atom: P5 is defined as IPT-PQ-c2 (BT.2020 / PQ / BT.2020-NCL,
+    /// limited range), and the `dvcC` record alone implies that, but
+    /// AVPlayer's DV decoder won't engage on a `dvh1` sample entry
+    /// without an explicit `colr nclx` atom or PQ VUI. Setting these
+    /// on the muxer's stream codecpar causes the mp4 muxer to write a
+    /// `colr nclx 9/16/9` atom that AVPlayer reads as the canonical
+    /// PQ signal.
+    struct ColorOverride {
+        let primaries: AVColorPrimaries
+        let trc: AVColorTransferCharacteristic
+        let space: AVColorSpace
+        let range: AVColorRange
+    }
+
     struct VideoConfig {
         let codecpar: UnsafePointer<AVCodecParameters>
         let timeBase: AVRational
@@ -124,17 +142,21 @@ final class MP4SegmentMuxer {
         /// because the dvcC advertises a DV profile the dvh1-less
         /// sample entry contradicts.
         let stripDolbyVisionMetadata: Bool
+        /// Optional color-signaling override. See `ColorOverride`.
+        let colorOverride: ColorOverride?
 
         init(
             codecpar: UnsafePointer<AVCodecParameters>,
             timeBase: AVRational,
             codecTagOverride: String?,
-            stripDolbyVisionMetadata: Bool = false
+            stripDolbyVisionMetadata: Bool = false,
+            colorOverride: ColorOverride? = nil
         ) {
             self.codecpar = codecpar
             self.timeBase = timeBase
             self.codecTagOverride = codecTagOverride
             self.stripDolbyVisionMetadata = stripDolbyVisionMetadata
+            self.colorOverride = colorOverride
         }
     }
 
@@ -349,6 +371,12 @@ final class MP4SegmentMuxer {
         if video.stripDolbyVisionMetadata {
             Self.stripDolbyVisionSideData(videoStream.pointee.codecpar)
         }
+        if let co = video.colorOverride {
+            videoStream.pointee.codecpar.pointee.color_primaries = co.primaries
+            videoStream.pointee.codecpar.pointee.color_trc = co.trc
+            videoStream.pointee.codecpar.pointee.color_space = co.space
+            videoStream.pointee.codecpar.pointee.color_range = co.range
+        }
 
         // Audio stream (optional).
         if let audio = audio {
@@ -486,6 +514,12 @@ final class MP4SegmentMuxer {
         }
         if video.stripDolbyVisionMetadata {
             Self.stripDolbyVisionSideData(videoStream.pointee.codecpar)
+        }
+        if let co = video.colorOverride {
+            videoStream.pointee.codecpar.pointee.color_primaries = co.primaries
+            videoStream.pointee.codecpar.pointee.color_trc = co.trc
+            videoStream.pointee.codecpar.pointee.color_space = co.space
+            videoStream.pointee.codecpar.pointee.color_range = co.range
         }
 
         // Audio stream (optional).
