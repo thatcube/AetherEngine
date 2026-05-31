@@ -14,3 +14,7 @@ build/
 # samples in Fixtures/user/. Both are local-only by design; the script
 # regenerates the synthetic clips on demand.
 Fixtures/
+
+# Internal design specs + implementation plans (superpowers flow).
+# Local-only by design; never published to the public repo.
+docs/superpowers/
