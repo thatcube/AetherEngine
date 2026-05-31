@@ -387,7 +387,8 @@ private func runExtract(url: URL, at seconds: Double, mode: FrameMode, loops: In
 
     var produced = 0
     let start = Date()
-    for i in 0..<max(1, loops) {
+    let effectiveLoops = max(1, loops)
+    for i in 0..<effectiveLoops {
         // Cycle positions within a bounded in-range window so every
         // iteration really decodes (and short clips do not run past
         // EOF). 8 distinct 1 s buckets is enough to defeat trivial
@@ -406,10 +407,12 @@ private func runExtract(url: URL, at seconds: Double, mode: FrameMode, loops: In
                 let out = "/tmp/aetherctl-extract-\(mode).png"
                 if writePNG(image, to: out) {
                     print("Wrote \(image.width)x\(image.height) -> \(out)")
+                } else {
+                    print("ERROR: could not write \(out)")
                 }
             }
         } else {
-            print("Frame \(i) at \(pos)s: (nil)")
+            print("Frame \(i) [\(mode)] at \(pos)s: (nil)")
         }
     }
     let elapsed = Date().timeIntervalSince(start)
@@ -420,9 +423,9 @@ private func runExtract(url: URL, at seconds: Double, mode: FrameMode, loops: In
 
     print("")
     print("=== EXTRACT RESULT ===")
-    print("Frames produced:  \(produced)/\(max(1, loops))")
+    print("Frames produced:  \(produced)/\(effectiveLoops)")
     print("Elapsed:          \(String(format: "%.2f", elapsed))s")
-    print("Avg per frame:    \(String(format: "%.1f", elapsed / Double(max(1, loops)) * 1000))ms")
+    print("Avg per frame:    \(String(format: "%.1f", elapsed / Double(effectiveLoops) * 1000))ms")
     print("======================")
     return produced > 0 ? 0 : 1
 }
@@ -461,12 +464,22 @@ private func takeIntFlag(_ name: String, from rest: inout [String]) -> Int? {
     return value
 }
 
+/// Pluck a `--key value` pair out of the rest-args list, returning
+/// the value as Double. Returns nil if absent or unparseable.
+private func takeDoubleFlag(_ name: String, from rest: inout [String]) -> Double? {
+    guard let idx = rest.firstIndex(of: name),
+          idx + 1 < rest.count,
+          let value = Double(rest[idx + 1]) else { return nil }
+    rest.removeSubrange(idx...(idx + 1))
+    return value
+}
+
 // Subcommand path: explicit subcommand + flags + url.
 if ["probe", "serve", "validate", "swdecode", "extract"].contains(first) {
     var rest = Array(args.dropFirst(2))
     let noDV = takeFlag("--no-dv", from: &rest)
     let framesOverride = takeIntFlag("--frames", from: &rest)
-    let atSeconds = takeIntFlag("--at", from: &rest).map(Double.init) ?? 60.0
+    let atSeconds = takeDoubleFlag("--at", from: &rest) ?? 60.0
     let extractLoops = takeIntFlag("--loops", from: &rest) ?? 1
     let extractWidth = takeIntFlag("--width", from: &rest) ?? 320
     let snapshotMode = takeFlag("--snapshot", from: &rest)
