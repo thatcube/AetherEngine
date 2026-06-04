@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import Combine
+import MediaPlayer
 
 /// Native audio-only playback host: hands the source URL directly to an
 /// AVPlayer (no HLS, no loopback, no display layer). Used for audio whose
@@ -33,6 +34,21 @@ final class AudioAVPlayerHost {
     /// `replaceCurrentItem` swaps for the lifetime of this host.
     let avPlayer = AVPlayer()
 
+    #if os(tvOS) || os(iOS)
+    /// Ties the AVPlayer to the system Now-Playing session. The system then
+    /// reads the play/pause state DIRECTLY from the player, which is what
+    /// makes the Siri Remote play/pause button route correctly. Without a
+    /// session a third-party app cannot tell the system it is paused
+    /// (MPNowPlayingInfoCenter.playbackState needs a private entitlement
+    /// the system silently drops), so the remote button only ever sends
+    /// pauseCommand and never playCommand. The host writes now-playing
+    /// metadata and registers transport commands on this session's
+    /// `nowPlayingInfoCenter` / `remoteCommandCenter` (driven from the
+    /// Sodalite coordinator, which owns the metadata + queue).
+    /// MPNowPlayingSession is unavailable on macOS, so this is gated.
+    let nowPlayingSession: MPNowPlayingSession
+    #endif
+
     // MARK: - Private state
 
     private var playerItem: AVPlayerItem?
@@ -52,7 +68,12 @@ final class AudioAVPlayerHost {
 
     // MARK: - Init
 
-    init() {}
+    init() {
+        #if os(tvOS) || os(iOS)
+        nowPlayingSession = MPNowPlayingSession(players: [avPlayer])
+        nowPlayingSession.becomeActiveIfPossible(completion: { _ in })
+        #endif
+    }
 
     // MARK: - Load
 
