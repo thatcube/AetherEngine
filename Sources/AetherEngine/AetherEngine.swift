@@ -1996,6 +1996,35 @@ public final class AetherEngine: ObservableObject {
         audioOnlyRequested || !hasVideoStream
     }
 
+    /// Whether AVPlayer/AVFoundation can natively decode this audio codec
+    /// on Apple platforms, so the engine can hand the source straight to a
+    /// lean AVPlayer (hardware-accelerated, energy-efficient, native system
+    /// integration) instead of the FFmpeg software path. Whitelist, not
+    /// blacklist: anything not known-native (Opus, Vorbis, APE, WavPack,
+    /// Musepack, ...) falls back to `AudioPlaybackHost`, which decodes
+    /// everything via FFmpeg. AAC, MP3, MP2, ALAC, AC-3/E-AC-3, LPCM, and
+    /// FLAC (AVFoundation has decoded FLAC since iOS/tvOS 11) are native.
+    nonisolated static func avPlayerCanDecodeAudio(_ codecID: AVCodecID) -> Bool {
+        switch codecID {
+        case AV_CODEC_ID_AAC,
+             AV_CODEC_ID_MP3,
+             AV_CODEC_ID_MP2,
+             AV_CODEC_ID_MP1,
+             AV_CODEC_ID_ALAC,
+             AV_CODEC_ID_FLAC,
+             AV_CODEC_ID_AC3,
+             AV_CODEC_ID_EAC3,
+             AV_CODEC_ID_PCM_S16LE,
+             AV_CODEC_ID_PCM_S16BE,
+             AV_CODEC_ID_PCM_S24LE,
+             AV_CODEC_ID_PCM_S24BE,
+             AV_CODEC_ID_PCM_F32LE:
+            return true
+        default:
+            return false
+        }
+    }
+
     /// - Parameter resetDisplayCriteria: When `true` (default), release
     ///   the `AVDisplayManager.preferredDisplayCriteria` so the panel
     ///   returns to its default mode. Used by `load()` and the public
