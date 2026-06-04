@@ -19,6 +19,7 @@ struct LoadOptionsTests {
         #expect(opts.panelIsInHDRMode == false)
         #expect(opts.audioBridgeMode == .surroundCompat)
         #expect(opts.isLive == false)
+        #expect(opts.audioOnly == false)
     }
 
     @Test("Equatable holds for identical inputs")
@@ -46,5 +47,18 @@ struct LoadOptionsTests {
         #expect(surround.audioBridgeMode == .surroundCompat)
         #expect(lossless.audioBridgeMode == .lossless)
         #expect(surround != lossless)
+    }
+
+    @Test("audioOnly defaults to false")
+    func audioOnlyDefaultsFalse() {
+        #expect(LoadOptions().audioOnly == false)
+    }
+
+    @Test("audioOnly is preserved and affects equality")
+    func audioOnlyPreservedAndEquatable() {
+        let video = LoadOptions(audioOnly: false)
+        let audio = LoadOptions(audioOnly: true)
+        #expect(audio.audioOnly == true)
+        #expect(video != audio)
     }
 }

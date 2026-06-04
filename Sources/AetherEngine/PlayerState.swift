@@ -172,6 +172,18 @@ public struct LoadOptions: Sendable, Equatable {
     /// Default `false`.
     public var isLive: Bool
 
+    /// Route the source through the lean audio-only path: FFmpeg decodes
+    /// directly into `AVSampleBufferAudioRenderer`, skipping the video
+    /// probe, the display-criteria handshake, and the entire HLS /
+    /// segment-producer / muxer / loopback stack. Set this for music
+    /// playback. The engine also falls into the audio path automatically
+    /// when the probe finds no video stream, so a host that doesn't set
+    /// the flag still gets audio playback for audio-only sources; the
+    /// flag lets the host skip the (cheap) video probe entirely and
+    /// guarantees the audio path even for malformed containers that
+    /// advertise a phantom video stream. Default `false`.
+    public var audioOnly: Bool
+
     public init(
         omitCriteriaColorExtensions: Bool = false,
         suppressDisplayCriteria: Bool = false,
@@ -180,7 +192,8 @@ public struct LoadOptions: Sendable, Equatable {
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
-        isLive: Bool = false
+        isLive: Bool = false,
+        audioOnly: Bool = false
     ) {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
         self.suppressDisplayCriteria = suppressDisplayCriteria
@@ -190,6 +203,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.panelIsInHDRMode = panelIsInHDRMode
         self.audioBridgeMode = audioBridgeMode
         self.isLive = isLive
+        self.audioOnly = audioOnly
     }
 }
 
