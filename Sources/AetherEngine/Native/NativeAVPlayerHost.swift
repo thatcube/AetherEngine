@@ -280,12 +280,6 @@ final class NativeAVPlayerHost {
                 // count after the route renegotiates against the
                 // loaded asset.
                 Self.dumpPlayerItemTracks(item, sid: sid)
-                // Re-assert the multichannel audio session against the
-                // now-live route BEFORE dumping it, so the dump reflects
-                // the post-reassert capability. Fixes 5.1 EAC3 / AC3
-                // downmix-to-stereo when tvOS "Continuous Audio
-                // Connection" is off (issue #24).
-                Self.reassertMultichannelAudioSession(item, sid: sid)
                 Self.dumpAudioRoute(sid: sid)
                 Self.warnIfFLACSurroundExceedsRoute(item, sid: sid)
                 Self.warnIfEAC3SurroundOnStereoRoute(item, sid: sid)
@@ -799,96 +793,6 @@ final class NativeAVPlayerHost {
             + "passthrough.",
             category: .session
         )
-        #endif
-    }
-
-    /// Force the active HDMI output route to renegotiate to the source's
-    /// channel count when an asset with a > 2-channel audio track reaches
-    /// readyToPlay but the active route is stuck at fewer channels.
-    ///
-    /// Device evidence (issue #24, Sonos, continuous-audio off): at launch
-    /// the session reports `maxChannels=32` (the sink CAN do multichannel)
-    /// but `output=2` — the active route idles in stereo PCM. The engine
-    /// activates the shared session once at process init against that
-    /// stereo route and pins it: a 5.1 EAC3 asset then plays into a
-    /// 2-channel route and tvOS downmixes. Re-applying the session knobs
-    /// (`setSupportsMultichannelContent`, `setActive(true)`, preferred
-    /// channels) at readyToPlay does NOT lift `output` off 2 — proven on
-    /// device, the route stayed at ch=2.
-    ///
-    /// Direct-play AVPlayer apps avoid this because they activate their
-    /// session per playback, so CoreAudio rebuilds the route fresh against
-    /// the live multichannel asset. We replicate that with a
-    /// deactivate / reactivate cycle: tearing the session down and back up
-    /// forces CoreAudio to renegotiate the HDMI output format. The
-    /// preferred-channels hint is set to the source channel count (NOT
-    /// `maximumOutputNumberOfChannels`, which is 32 and returns
-    /// NSOSStatusErrorDomain -50 / paramErr — the accepted ceiling is the
-    /// sink's real LPCM count, e.g. 8).
-    ///
-    /// Gated on a > 2-channel audio track so the stereo path and the
-    /// Atmos path (EAC3 + JOC reports 2 channels over its MAT carrier,
-    /// `ch=2` is the correct passthrough state) are left untouched. This
-    /// is instrumented per step (`out=` logged after each call) so a
-    /// device run pinpoints exactly which call lifts the route.
-    private static func reassertMultichannelAudioSession(_ item: AVPlayerItem, sid: Int) {
-        #if os(iOS) || os(tvOS)
-        var trackChannels: Int = 0
-        for itemTrack in item.tracks {
-            guard let assetTrack = itemTrack.assetTrack else { continue }
-            guard assetTrack.mediaType == .audio else { continue }
-            guard let fmt = assetTrack.formatDescriptions.first else { continue }
-            let cm = fmt as! CMFormatDescription
-            if let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(cm) {
-                trackChannels = max(trackChannels, Int(asbdPtr.pointee.mChannelsPerFrame))
-            }
-        }
-        guard trackChannels > 2 else { return }
-
-        let session = AVAudioSession.sharedInstance()
-        func step(_ label: String, _ body: () throws -> Void) {
-            do { try body() }
-            catch {
-                EngineLog.emit(
-                    "[NativeAVPlayerHost] #\(sid) audioReassert \(label) err=\(error)",
-                    category: .engine)
-            }
-            EngineLog.emit(
-                "[NativeAVPlayerHost] #\(sid) audioReassert after \(label): "
-                + "out=\(session.outputNumberOfChannels) pref=\(session.preferredOutputNumberOfChannels) "
-                + "max=\(session.maximumOutputNumberOfChannels)",
-                category: .engine)
-        }
-
-        EngineLog.emit(
-            "[NativeAVPlayerHost] #\(sid) audioReassert BEFORE track=\(trackChannels)ch "
-            + "max=\(session.maximumOutputNumberOfChannels) out=\(session.outputNumberOfChannels) "
-            + "pref=\(session.preferredOutputNumberOfChannels)",
-            category: .engine)
-
-        // Tear the session down so CoreAudio drops the pinned stereo
-        // route, set the multichannel preferences while inactive, then
-        // reactivate so the route rebuilds against the source's channel
-        // count. Preferred is the source count (<= the sink's real LPCM
-        // ceiling), not maximumOutputNumberOfChannels (=32 -> -50).
-        step("deactivate") {
-            try session.setActive(false, options: .notifyOthersOnDeactivation)
-        }
-        step("setSupportsMultichannelContent") {
-            try session.setSupportsMultichannelContent(true)
-        }
-        step("setPreferred(\(trackChannels))") {
-            try session.setPreferredOutputNumberOfChannels(trackChannels)
-        }
-        step("reactivate") {
-            try session.setActive(true)
-        }
-
-        EngineLog.emit(
-            "[NativeAVPlayerHost] #\(sid) audioReassert AFTER "
-            + "max=\(session.maximumOutputNumberOfChannels) out=\(session.outputNumberOfChannels) "
-            + "pref=\(session.preferredOutputNumberOfChannels)",
-            category: .engine)
         #endif
     }
 
