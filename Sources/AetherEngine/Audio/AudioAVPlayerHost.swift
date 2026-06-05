@@ -2,9 +2,6 @@ import Foundation
 import AVFoundation
 import Combine
 import MediaPlayer
-#if canImport(AVKit)
-import AVKit
-#endif
 
 /// Native audio-only playback host: hands the source URL directly to an
 /// AVPlayer (no HLS, no loopback, no display layer). Used for audio whose
