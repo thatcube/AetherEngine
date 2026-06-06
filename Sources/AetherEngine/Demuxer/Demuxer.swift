@@ -291,6 +291,40 @@ public final class Demuxer: @unchecked Sendable {
         return tracks
     }
 
+    /// Container-level metadata (title/artist/album + embedded cover).
+    /// Reads the format-context metadata dictionary; cover art comes from
+    /// the stream flagged AV_DISPOSITION_ATTACHED_PIC (its `attached_pic`
+    /// packet holds the encoded image bytes). Returns an all-nil value
+    /// when nothing is present.
+    func mediaMetadata() -> MediaMetadata {
+        guard let ctx = formatContext else {
+            return MediaMetadata(title: nil, artist: nil, album: nil, artworkData: nil)
+        }
+        let dict = ctx.pointee.metadata
+        return MediaMetadata.from(
+            title: metadataValue(dict, key: "title"),
+            artist: metadataValue(dict, key: "artist"),
+            album: metadataValue(dict, key: "album"),
+            albumArtist: metadataValue(dict, key: "album_artist"),
+            artworkData: attachedPictureData()
+        )
+    }
+
+    /// Encoded bytes of the first attached-picture stream's cover art, or
+    /// nil when the container has no embedded artwork.
+    private func attachedPictureData() -> Data? {
+        guard let ctx = formatContext else { return nil }
+        for i in 0..<Int(ctx.pointee.nb_streams) {
+            guard let stream = ctx.pointee.streams[i],
+                  (stream.pointee.disposition & AV_DISPOSITION_ATTACHED_PIC) != 0
+            else { continue }
+            let pkt = stream.pointee.attached_pic
+            guard pkt.size > 0, let dataPtr = pkt.data else { return nil }
+            return Data(bytes: dataPtr, count: Int(pkt.size))
+        }
+        return nil
+    }
+
     /// Build TrackInfo from an AVStream's metadata.
     private func trackInfo(from stream: UnsafeMutablePointer<AVStream>, index: Int) -> TrackInfo {
         let codecpar = stream.pointee.codecpar!
