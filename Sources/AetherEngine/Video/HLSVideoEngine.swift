@@ -2629,7 +2629,27 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
         let range = cache.indexRange()
         let highWater = cache.highestStoredIndex
         let staleBelowProducer = index < lastRestartIndex - 2
-        let producerPassedAndPruned = highWater > index
+        // Prune-created gap the producer already advanced past: `highWater`
+        // says the current producer wrote beyond `index`, but that alone is
+        // NOT a pruned gap. During normal forward-march the producer races
+        // ahead of AVPlayer (highWater well above the requested index) while
+        // the low segments are still resident and unpruned. Restarting on a
+        // resident in-window index was a false positive that threw away the
+        // producer's forward progress and forced an AVIO reconnect mid-
+        // playback, eroding AVPlayer's forward buffer and stuttering (repro:
+        // `cache.range=0..24 highWater=24`, request seg15 -> needless restart).
+        // Only treat it as a real gap when `index` falls OUTSIDE the resident
+        // window: above `r.1` means the high end was pruned after a window
+        // slide (the documented seg-11 repro), below `r.0` means the low end
+        // was pruned. When `index` is inside `[r.0, r.1]` the range branch
+        // below serves it from cache (or waits briefly, then restarts only on
+        // a genuine internal gap). Empty cache keeps the bare highWater test.
+        let producerPassedAndPruned: Bool
+        if highWater > index, let r = range {
+            producerPassedAndPruned = index < r.0 || index > r.1
+        } else {
+            producerPassedAndPruned = highWater > index
+        }
         let needsRestart: Bool
         if staleBelowProducer || producerPassedAndPruned {
             needsRestart = true
