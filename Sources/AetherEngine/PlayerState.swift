@@ -385,6 +385,52 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
     }
 }
 
+/// Container-level media metadata (tags + embedded cover art) for the
+/// loaded source. Every field is optional: audio files frequently ship
+/// with partial or no tags, and video files usually have none. Built
+/// from the FFmpeg AVFormatContext via `MediaMetadata.from(...)`, which
+/// applies the album-artist fallback and drops empty strings.
+public struct MediaMetadata: Sendable, Equatable {
+    public let title: String?
+    public let artist: String?
+    public let album: String?
+    /// Embedded cover art bytes exactly as stored in the container
+    /// (JPEG or PNG), or nil when the source has no attached picture.
+    public let artworkData: Data?
+
+    public init(title: String?, artist: String?, album: String?, artworkData: Data?) {
+        self.title = title
+        self.artist = artist
+        self.album = album
+        self.artworkData = artworkData
+    }
+
+    /// True when at least one human-readable text field is present, so
+    /// hosts can decide between a metadata layout and a filename fallback.
+    public var hasDisplayMetadata: Bool {
+        title != nil || artist != nil || album != nil
+    }
+
+    /// Normalize raw demuxer values: trim whitespace, map empty to nil,
+    /// and fall back to `albumArtist` when `artist` is absent.
+    public static func from(
+        title: String?, artist: String?, album: String?,
+        albumArtist: String?, artworkData: Data?
+    ) -> MediaMetadata {
+        func clean(_ s: String?) -> String? {
+            guard let t = s?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !t.isEmpty else { return nil }
+            return t
+        }
+        return MediaMetadata(
+            title: clean(title),
+            artist: clean(artist) ?? clean(albumArtist),
+            album: clean(album),
+            artworkData: artworkData
+        )
+    }
+}
+
 /// A single decoded subtitle cue, start/end in container seconds plus a
 /// payload. The payload is either plain text (SubRip / ASS / SSA / WebVTT
 /// / mov_text after override-stripping) or a rendered bitmap (PGS / DVB
