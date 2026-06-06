@@ -264,6 +264,8 @@ public struct SourceProbe: Sendable {
     /// Subtitle tracks in source order, both embedded text and
     /// bitmap (PGS / DVB) variants.
     public let subtitleTracks: [TrackInfo]
+    /// Container metadata (tags + embedded cover art), normalized.
+    public let metadata: MediaMetadata
     /// Best-effort live-stream hint: `true` when the source advertises
     /// no duration AND the URL scheme suggests a network feed
     /// (http / https / udp / rtp / rtsp). False positives are possible
@@ -284,6 +286,7 @@ public struct SourceProbe: Sendable {
         isDolbyVision: Bool,
         audioTracks: [TrackInfo],
         subtitleTracks: [TrackInfo],
+        metadata: MediaMetadata = MediaMetadata(title: nil, artist: nil, album: nil, artworkData: nil),
         isLive: Bool = false
     ) {
         self.url = url
@@ -297,6 +300,7 @@ public struct SourceProbe: Sendable {
         self.isDolbyVision = isDolbyVision
         self.audioTracks = audioTracks
         self.subtitleTracks = subtitleTracks
+        self.metadata = metadata
         self.isLive = isLive
     }
 }

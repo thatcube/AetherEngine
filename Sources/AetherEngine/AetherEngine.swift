@@ -60,6 +60,11 @@ public final class AetherEngine: ObservableObject {
     @Published public private(set) var progress: Float = 0
     @Published public private(set) var audioTracks: [TrackInfo] = []
     @Published public private(set) var subtitleTracks: [TrackInfo] = []
+    /// Container metadata (tags + embedded cover) for the loaded source.
+    /// nil while idle or when the source carries no metadata. Populated
+    /// during `load(url:)` from the probe demuxer, before backend dispatch,
+    /// so it is available for both audio and video sources.
+    @Published public private(set) var metadata: MediaMetadata?
     /// Active audio track's container stream index (matches `TrackInfo.id`),
     /// or `nil` while no audio is wired (audio-less source or before the
     /// first `load(url:)` resolves). Updated synchronously when
@@ -522,6 +527,7 @@ public final class AetherEngine: ObservableObject {
             isDolbyVision: detectedFormat == .dolbyVision,
             audioTracks: demuxer.audioTrackInfos(),
             subtitleTracks: demuxer.subtitleTrackInfos(),
+            metadata: demuxer.mediaMetadata(),
             isLive: isLive
         )
     }
@@ -719,6 +725,7 @@ public final class AetherEngine: ObservableObject {
         progress = 0
         audioTracks = []
         subtitleTracks = []
+        metadata = nil
         subtitleCueDiagnosticCount = 0
 
         // 1. Brief demuxer probe to grab format + frame rate + track
@@ -794,6 +801,7 @@ public final class AetherEngine: ObservableObject {
         sourceVideoFormat = detectedFormat
         audioTracks = probedAudioTracks
         subtitleTracks = probedSubtitleTracks
+        metadata = probeOpened ? probe.mediaMetadata() : nil
         // Mirror the audio stream HLSVideoEngine will actually pick.
         // When the host passed an override, that takes precedence; if
         // the override is invalid we fall back to the auto pick to
