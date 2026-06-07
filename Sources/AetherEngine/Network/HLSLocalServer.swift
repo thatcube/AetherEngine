@@ -50,6 +50,17 @@ protocol HLSSegmentProvider: AnyObject {
     /// `.vod` for the fully-known video case.
     var playlistType: HLSPlaylistType { get }
 
+    /// Target segment duration in seconds as configured for the live
+    /// producer (e.g. 4-6 s). Non-nil only for `.live` providers. The
+    /// playlist builder uses this as a stable floor for
+    /// `#EXT-X-TARGETDURATION` so the very first manifest (before any
+    /// segment is finalized) already declares a generous value instead of
+    /// falling back to `max(1, 0) == 1`, which gives AVPlayer only 1.5 s
+    /// to receive segment 0 and triggers CoreMediaErrorDomain -12888 for
+    /// high-bitrate sources. VOD and EVENT providers return nil and keep
+    /// the existing `ceil(maxProducedDuration)` computation unchanged.
+    var liveTargetSegmentDuration: Double? { get }
+
     /// Optional master-playlist metadata. When `masterCodecs` is
     /// non-nil, the server publishes a `master.m3u8` containing one
     /// variant referencing `media.m3u8` plus these attributes; when
@@ -104,6 +115,14 @@ protocol HLSSegmentProvider: AnyObject {
     /// fall off the back. Used by `buildMediaPlaylistText` to emit
     /// `#EXT-X-MEDIA-SEQUENCE` and to list only [firstVisible, visibleCount).
     var firstVisibleSegmentIndex: Int { get }
+
+    /// Blocks the calling thread until this provider has at least one
+    /// segment ready, or until `timeout` seconds elapse, whichever
+    /// comes first. Returns `true` if at least one segment is available,
+    /// `false` on timeout. Used by the server's manifest handler to hold
+    /// the first live response until there is meaningful content, preventing
+    /// CoreMediaErrorDomain -12888 on empty live playlists.
+    func waitForFirstLiveSegment(timeout: TimeInterval) -> Bool
 }
 
 extension HLSSegmentProvider {
@@ -128,6 +147,22 @@ extension HLSSegmentProvider {
     var masterAverageBandwidth: Int? { nil }
     var masterHDCPLevel: String? { nil }
     var masterClosedCaptions: String? { nil }
+    /// Default: not a live provider; playlist builder uses the
+    /// computed-from-segments path.
+    var liveTargetSegmentDuration: Double? { nil }
+
+    /// Blocks the calling thread until this provider has at least one
+    /// segment ready, or until `timeout` seconds elapse, whichever
+    /// comes first. Returns `true` if at least one segment is available,
+    /// `false` on timeout. Non-live providers return `true` immediately
+    /// (their segment list is fully known at init time). Used by the
+    /// server's manifest handler to hold the first live response until
+    /// there is meaningful content to give AVPlayer: an empty live
+    /// manifest with zero `#EXTINF` entries causes AVPlayer to fire
+    /// CoreMediaErrorDomain -12888 immediately, regardless of
+    /// `#EXT-X-TARGETDURATION`, because the playlist "hasn't changed"
+    /// by the time the first poll interval fires.
+    func waitForFirstLiveSegment(timeout: TimeInterval) -> Bool { true }
 
     /// Default implementation for providers that don't run a
     /// sliding-window playlist. Reports the current segmentCount,
@@ -652,6 +687,22 @@ final class HLSLocalServer: @unchecked Sendable {
             return send404(fd: fd, path: normalizedPath, reason: "no masterCodecs")
 
         case "/media.m3u8":
+            // For a live provider with no segments yet, hold this response
+            // until the first segment is available. An empty live playlist
+            // (no `#EXTINF` entries) causes AVPlayer to fire
+            // CoreMediaErrorDomain -12888 immediately on macOS/tvOS 26,
+            // regardless of `#EXT-X-TARGETDURATION`, because AVFoundation's
+            // HLS client treats a live playlist with zero segments as
+            // permanently stalled (it never polls again). Once we have at
+            // least one segment the playlist is genuinely playable and
+            // subsequent polls see incrementing content (MEDIA-SEQUENCE /
+            // new segments), so -12888 never fires during normal playback.
+            // The 30 s ceiling is a safety net; a real segment always
+            // arrives well within it (the first ~5 s segment at 22 Mbps
+            // takes at most a few seconds to demux + remux over loopback).
+            if let p = provider, p.playlistType == .live {
+                _ = p.waitForFirstLiveSegment(timeout: 30.0)
+            }
             let body = buildMediaPlaylist()
             stateLock.lock()
             let firstTime = !loggedMediaPlaylist
@@ -988,13 +1039,33 @@ final class HLSLocalServer: @unchecked Sendable {
         // carries no PLAYLIST-TYPE tag and no ENDLIST.
         let typeIsLive = (provider.playlistType == .live && !snapshot.endlistAdded)
 
-        // Compute target duration as ceil of the longest segment.
+        // Compute target duration as ceil of the longest produced segment.
         // Spec requires this be >= every EXTINF in the playlist.
         var maxDuration: Double = 0
         for i in firstVisible..<count {
             maxDuration = max(maxDuration, provider.segmentDuration(at: i))
         }
-        let targetDuration = Int(ceil(max(1.0, maxDuration)))
+        var targetDuration = Int(ceil(max(1.0, maxDuration)))
+
+        // For live playlists, apply a stable floor equal to the producer's
+        // configured cut target. Before segment 0 is finalized, maxDuration
+        // is 0 and the plain computation yields 1, giving AVPlayer only
+        // 1.5 s to receive the first segment (1.5 * TARGETDURATION per spec).
+        // High-bitrate sources (20+ Mbps, 5+ s segments, many MB) cannot be
+        // demuxed, remuxed, and published over the loopback path in that
+        // window, so AVPlayer fires CoreMediaErrorDomain -12888
+        // "Playlist File unchanged for longer than 1.5 * target duration".
+        // Using ceil(producerTarget) as the minimum makes TARGETDURATION
+        // stable and generous from the very first (empty) manifest, giving
+        // AVPlayer ~6-9 s to receive segment 0. Per HLS spec TARGETDURATION
+        // must be >= every EXTINF; since the producer cuts at targetSeconds,
+        // ceil(target) satisfies that for normal segments. If a produced
+        // segment ever exceeds it, max() keeps us compliant. VOD and EVENT
+        // paths are unchanged.
+        if typeIsLive, let liveTarget = provider.liveTargetSegmentDuration {
+            let liveFloor = Int(ceil(liveTarget))
+            targetDuration = max(targetDuration, liveFloor)
+        }
 
         var lines: [String] = []
         lines.append("#EXTM3U")

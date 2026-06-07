@@ -2631,6 +2631,12 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
     /// (target-duration / 2 cadence, ≈ 2 s for our 4 s segments).
     /// Adding ≥ 1 segment per build keeps that check happy.
     private let stateLock = NSLock()
+    /// Condition variable used to signal `waitForFirstLiveSegment` when
+    /// the first live segment is appended. A separate NSCondition (not
+    /// the NSLock above) so the manifest handler can block without
+    /// holding the segment-list lock. Signaled once from
+    /// `appendLiveSegment` when `segments.count` transitions from 0 to 1.
+    private let firstSegmentCondition = NSCondition()
     private var visibleHighWater: Int
     private var refreshCounter: Int = 0
     private var endlistAdded: Bool = false
@@ -2702,8 +2708,9 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
     func appendLiveSegment(index: Int, startSeconds: Double, durationSeconds: Double,
                            discontinuous: Bool = false) {
         stateLock.lock()
-        defer { stateLock.unlock() }
+        let wasEmpty = segments.isEmpty
         guard index == segments.count else {
+            stateLock.unlock()
             EngineLog.emit(
                 "[HLSVideoEngine] live segment append out of order: got index=\(index), "
                 + "expected \(segments.count); ignoring",
@@ -2724,6 +2731,15 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
             durationSeconds: durationSeconds,
             discontinuous: discontinuous
         ))
+        stateLock.unlock()
+        // Signal `waitForFirstLiveSegment` if this is the first segment
+        // so the server's manifest handler can unblock and serve a playlist
+        // that already contains playable content.
+        if wasEmpty {
+            firstSegmentCondition.lock()
+            firstSegmentCondition.broadcast()
+            firstSegmentCondition.unlock()
+        }
     }
 
     // MARK: - Sliding-window operations
@@ -3112,6 +3128,32 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
     /// rationale below applies only to finite files); the audio-append
     /// path keeps `.event` available.
     var playlistType: HLSPlaylistType { isLive ? .live : .vod }
+    /// Expose the producer's cut target so the playlist builder can anchor
+    /// `#EXT-X-TARGETDURATION` to a stable, generous value from the first
+    /// manifest, avoiding the -12888 startup race for high-bitrate live
+    /// sources. Returns nil for VOD (the default extension nil suffices).
+    var liveTargetSegmentDuration: Double? {
+        isLive ? liveWindowSizing.targetSegmentDurationSeconds : nil
+    }
+    /// Block the calling thread until the first live segment is appended,
+    /// or until `timeout` seconds elapse. Returns true if a segment is
+    /// available, false on timeout. Non-live sessions return immediately.
+    /// Used by the manifest handler to avoid serving an empty live playlist
+    /// that causes AVPlayer to fire CoreMediaErrorDomain -12888 on the
+    /// very first poll (before any `#EXTINF` entries exist).
+    func waitForFirstLiveSegment(timeout: TimeInterval) -> Bool {
+        guard isLive else { return true }
+        let deadline = Date().addingTimeInterval(timeout)
+        firstSegmentCondition.lock()
+        defer { firstSegmentCondition.unlock() }
+        while true {
+            stateLock.lock()
+            let count = segments.count
+            stateLock.unlock()
+            if count > 0 { return true }
+            if !firstSegmentCondition.wait(until: deadline) { return false }
+        }
+    }
     var masterCodecs: String? { codecsString }
     var masterSupplementalCodecs: String? { supplementalCodecsString }
     var masterResolution: (width: Int, height: Int)? {
