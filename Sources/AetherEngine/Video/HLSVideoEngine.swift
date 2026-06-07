@@ -978,8 +978,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             ? 0
             : Self.segmentIndex(forSeconds: initialPositionSeconds, plan: plan)
         // Live: no precomputed plan, no restart machinery (the feed is
-        // forward-only and the EVENT playlist grows append-only as the
-        // producer cuts segments). VOD keeps the restart handler so
+        // forward-only and the live playlist grows as the producer cuts
+        // segments). VOD keeps the restart handler so
         // scrubs relocate the producer.
         let prov = VideoSegmentProvider(
             cache: segmentCache,
@@ -1003,7 +1003,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         )
         self.provider = prov
         // Live producer appends each finalized segment to the provider's
-        // growing list so the EVENT playlist exposes it on the next poll.
+        // growing list so the live playlist exposes it on the next poll.
         if isLiveSession {
             prod.onLiveSegmentFinalized = { [weak prov] index, durationSeconds, startPtsSeconds in
                 prov?.appendLiveSegment(index: index,
@@ -2607,13 +2607,13 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
     ///     the segment-server side.
     private static let forwardWaitWindow = 8
 
-    // MARK: - Sliding-window EVENT playlist state
+    // MARK: - Sliding-window live/VOD playlist state
 
     /// Segments visible in /media.m3u8 are `[0, visibleHighWater]`.
-    /// EVENT playlists are append-only per RFC 8216 §6.2.1, so this
-    /// counter is monotonic over a session. Grows by `growthPerRefresh`
-    /// on each playlist build, plus explicit jumps from
-    /// `extendVisibleWindow(toCover:)` on seek.
+    /// The visible window is monotonically increasing over a session
+    /// (live sliding window never retracts; VOD seek only extends).
+    /// Grows by `growthPerRefresh` on each playlist build, plus explicit
+    /// jumps from `extendVisibleWindow(toCover:)` on seek.
     ///
     /// Initial value covers the resume position so AVPlayer's first
     /// playlist read already contains the seg AVPlayer is about to

@@ -87,12 +87,12 @@ protocol HLSSegmentProvider: AnyObject {
     /// counter (for the byte-level "playlist changed" signal), and
     /// whether the playlist should declare itself complete with
     /// `#EXT-X-ENDLIST`. Used by the video provider to advance a
-    /// sliding-window EVENT playlist.
+    /// sliding-window live playlist.
     func notePlaylistBuild() -> (visibleCount: Int, refreshCounter: Int, endlistAdded: Bool)
 
     /// First segment index visible in the current playlist window.
-    /// For append-only (EVENT) and VOD playlists this is always 0.
-    /// For the sliding-window prototype this advances as old segments
+    /// For append-only and VOD playlists this is always 0.
+    /// For a live session this advances as old segments
     /// fall off the back. Used by `buildMediaPlaylistText` to emit
     /// `#EXT-X-MEDIA-SEQUENCE` and to list only [firstVisible, visibleCount).
     var firstVisibleSegmentIndex: Int { get }
@@ -645,7 +645,7 @@ final class HLSLocalServer: @unchecked Sendable {
             let firstTime = !loggedMediaPlaylist
             if firstTime { loggedMediaPlaylist = true }
             mediaPlaylistBuildCount += 1
-            // For a live (sliding) playlist, re-log the head/tail every 30
+            // For a live (sliding) playlist, re-log the head/tail every 10
             // rebuilds so the advancing #EXT-X-MEDIA-SEQUENCE is observable
             // over a run (the firstTime-only log can't show advancement).
             // VOD logs once and never re-logs (no advancement to show).
