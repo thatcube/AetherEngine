@@ -76,7 +76,10 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
         }
         context = nil
         buffer = nil
-        reader.close()
+        // The bridge does NOT own the reader. The engine (primary reader) or
+        // the side path (clone reader) closes it. This decoupling lets the
+        // engine reuse one reader across an internal reload and run clones
+        // concurrently without a bridge teardown killing the source.
     }
 
     fileprivate func performRead(into buf: UnsafeMutablePointer<UInt8>, size: Int32) -> Int32 {

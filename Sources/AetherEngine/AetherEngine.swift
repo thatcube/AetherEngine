@@ -332,6 +332,21 @@ public final class AetherEngine: ObservableObject {
     /// Internal getter (read by the same-module FrameExtractor extension).
     private(set) var isCustomSource = false
 
+    /// The active custom source's reader, retained so internal reloads can
+    /// reuse it (seek + rebuild) and so concurrent features can clone it.
+    /// Owned by the engine: closed in stopInternal on final teardown, nil for
+    /// URL sources.
+    private(set) var customReader: IOReader?
+
+    /// The format hint passed with the active custom source, reused when the
+    /// engine reopens the source (reload) or opens a clone (subtitles/scrub).
+    private(set) var customFormatHint: String?
+
+    /// Whether the active custom source is seekable (set at load from the
+    /// probe demuxer's isSourceSeekable). Forward-only custom sources cannot
+    /// be reopened/rewound, so reload features stay no-op for them.
+    private(set) var customSourceIsSeekable = false
+
     /// Seconds the producer shifted AVPlayer's HLS clock away from
     /// source PTS on the native path: it subtracts `videoShiftPts` from
     /// every packet's pts/dts so seg-0's fragment tfdt aligns with the
@@ -764,9 +779,13 @@ public final class AetherEngine: ObservableObject {
         case .url(let u):
             url = u
             isCustomSource = false
-        case .custom:
+            customReader = nil
+            customFormatHint = nil
+        case .custom(let reader, let hint):
             url = URL(string: "aether-custom://source")!
             isCustomSource = true
+            customReader = reader
+            customFormatHint = hint
         }
         loadedURL = url
         loadedOptions = options
@@ -853,6 +872,10 @@ public final class AetherEngine: ObservableObject {
             state = .error("Failed to load: custom source probe failed")
             throw DemuxerError.openFailed(code: -1)
         }
+
+        // Record seekability for reload gating (forward-only custom sources
+        // cannot rewind, so audio-switch / background-reload stay no-op).
+        customSourceIsSeekable = isCustomSource ? probe.isSourceSeekable : false
 
         // Source format is what the probe found in the file, before any
         // panel clamping. Stats overlays use this to label "what the file
@@ -2374,7 +2397,7 @@ public final class AetherEngine: ObservableObject {
     ///   panels (notably when paired with a Bluetooth A2DP audio route)
     ///   never settles and times out at 5 s, adding ~12 s of black-
     ///   screen latency per audio switch.
-    private func stopInternal(resetDisplayCriteria: Bool = true, keepNativeHost: Bool = false) {
+    private func stopInternal(resetDisplayCriteria: Bool = true, keepNativeHost: Bool = false, keepCustomReader: Bool = false) {
         // Stop AVPlayer fetching before tearing down the loopback HLS
         // server, otherwise AVPlayer's segment requests race the
         // server shutdown and produce noisy errors in the log. Display
@@ -2435,6 +2458,16 @@ public final class AetherEngine: ObservableObject {
         audioNativeCancellables.removeAll()
         audioAVPlayerActive = false
         audioAVPlayerHost?.stop()
+
+        // Close the custom source reader on final teardown (a real stop or a
+        // new load). Internal reloads pass keepCustomReader: true so the
+        // retained reader survives the intermediate teardown for reuse.
+        if !keepCustomReader {
+            customReader?.close()
+            customReader = nil
+            customFormatHint = nil
+            customSourceIsSeekable = false
+        }
 
         if resetDisplayCriteria {
             displayCriteria.reset()
