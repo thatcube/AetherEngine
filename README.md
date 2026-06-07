@@ -51,7 +51,7 @@ You provide the transport bar. You provide the dropdowns. You provide the pretty
 | Metadata    | `MediaMetadata` parsed from the container on `load`: normalised title / artist / album / albumArtist tags plus embedded cover art. Published on the engine and carried in `SourceProbe`, so a host gets track info without its own tag parser. `aetherctl probe` prints it |
 | Seek        | Producer teardown + restart for backward / far-forward scrubs; short-range forward scrubs ride the cached segment window    |
 | Streaming   | Playback reads the source over one long-lived forward-streaming `URLSession` connection (VLC-style): bytes stream into a sliding window, a new request is issued only on a seek outside that window. Still extraction uses discrete Range chunks for random access; live transcode uses a single sequential GET |
-| Live        | Scaffold-level: `LoadOptions.isLive` opts the session in; engine publishes `@Published var isLive` for hosts, ignores `seek()`. H.264 / HEVC inside MPEG-TS routes through the native AVPlayer pipeline; MPEG-2 / MPEG-4 / VC-1 / VP8 / VP9 inside MPEG-TS routes through the SW pipeline. Sliding-window segment eviction for unbounded sessions is not yet implemented (long native-path sessions will accumulate cached segments) |
+| Live / DVR  | Unbounded live playback with optional in-session timeshift (DVR). `LoadOptions.isLive` opts the session in; `dvrWindowSeconds` (e.g. `1800`) enables rewind. Native path (H.264 / HEVC / AV1-with-HW): a forward-only live producer cuts segments into a sliding HLS playlist served to AVPlayer; timeshift uses AVPlayer's native seekable range. Software path (AV1-without-HW / VP9 / MPEG-2 / VC-1): unbounded live with a disk-spooled `PacketRingBuffer` for rewind. Both paths share a session-relative timeline (seconds since first frame) so a host draws one scrubber regardless of backend. Engine publishes `liveEdgeTime`, `seekableLiveRange`, `isAtLiveEdge`, and `behindLiveSeconds`; `seekToLiveEdge()` snaps to the edge |
 | Resilience  | Direct-URL playback survives CDN stutters: a dropped connection, socket stall, or early close reconnects at the last byte delivered instead of ending playback (only the real end of file reports EOF). `429` / `503` honour `Retry-After`, expired signed URLs re-resolve against the source, and a progress-aware cap stops a dead or flapping origin from hammering the CDN. Plus background pause and a display-link aware lifecycle |
 | Custom input | Play from any byte source via the `IOReader` protocol, passed as `MediaSource.custom` to `load(source:)`: memory buffers, encrypted-at-rest archives, proprietary containers. Seekable readers work on both the native and software playback paths (forward-only readers on the software path only), with audio-track switching, background reload, embedded subtitles, and scrub preview for readers that vend a second cursor |
 
@@ -153,6 +153,40 @@ try await engine.load(source: .custom(MyArchiveReader(), formatHint: "mp4"))
 > and scrub-preview thumbnails require the reader to implement
 > `makeIndependentReader()` (a second independent cursor); they are skipped when
 > it returns nil. Forward-only readers support plain playback and seeking only.
+
+### Live TV / DVR
+
+```swift
+// Live-only: seek() is a no-op; no rewind.
+try await player.load(
+    url: streamURL,
+    options: LoadOptions(isLive: true)
+)
+
+// Live + timeshift (DVR): 30-minute rewind window.
+try await player.load(
+    url: streamURL,
+    options: LoadOptions(isLive: true, dvrWindowSeconds: 1800)
+)
+
+// Drive a scrubber from the DVR range and lag indicator.
+player.$seekableLiveRange     // ClosedRange<Double>?, session-relative seconds; nil when DVR off
+player.$behindLiveSeconds     // seconds behind the live edge; 0 when at the edge
+player.$liveEdgeTime          // current live edge in session-relative seconds
+
+// Snap back to live.
+await player.seekToLiveEdge()
+
+// Rewind within the window (same seek API as VOD, clamped to seekableLiveRange).
+await player.seek(to: player.liveEdgeTime - 300)    // 5 minutes back
+
+// isAtLiveEdge is anchored on the buffered edge and is generally false during
+// normal playback. Use seekToLiveEdge() to snap rather than waiting for this
+// flag to flip true.
+player.$isAtLiveEdge
+```
+
+Format coverage follows the engine's native-first / software-fallback split. H.264 / HEVC / AV1-with-HW route through the native AVPlayer pipeline; AV1-without-HW / VP9 / MPEG-2 / VC-1 route through the software pipeline with a disk-spooled `PacketRingBuffer` backing the rewind. Both paths present the same session-relative timeline to the host.
 
 Install via Swift Package Manager:
 
@@ -485,7 +519,7 @@ Things that work today but have a documented edge case, or are deferred behind a
 - **`.surroundCompat` audio bridge caps 7.1 sources to 5.1.** FFmpeg's EAC3 encoder currently caps at 6 channels. Once [FFmpeg PR 21668](https://github.com/FFmpeg/FFmpeg/pull/21668) lands the cap and the dynamic bitrate auto-scale to 1024 kbps engage without a code change here. Use `.lossless` (FLAC) today if 7.1 matters.
 - **Manual `MPNowPlayingInfoCenter` writes race the HLS-loopback path on tvOS 26.** The combination produces a `libdispatch` race. Only `AVPlayerViewController` with its standard transport bar safely surfaces Now Playing. Hosts that need a custom transport should use `MPNowPlayingSession` against the engine's `currentAVPlayer` publisher instead of `MPNowPlayingInfoCenter.default().nowPlayingInfo`.
 - **Audio session is activated per playback, not at process launch.** The engine declares the `AVAudioSession` category (`.playback` / `.moviePlayback` / `.longFormAudio`) and multichannel support at init, but does NOT activate the session there. Activating once at launch used to pin the route to whatever the HDMI link reported at that instant: with tvOS Continuous Audio Connection off the link idles at stereo, so the launch-time activation negotiated the route to 2 channels and pinned it, downmixing non-Atmos multichannel for the whole session (AetherEngine #24). The native video path now lets the host's `AVPlayerViewController` activate the session per playback, so tvOS negotiates the route against the live sink once playback actually starts; the renderer paths (software decode, audio-only) activate it themselves. Hosts that mount the engine's bare `AVPlayerLayer` instead of an `AVPlayerViewController` should ensure the session is active at playback. A genuine sink-side ch=2 (an AVR caching its HDMI EDID incorrectly after standby) can still force a downmix; power-cycling the sink restores it. Atmos passthrough is unaffected either way because EAC3+JOC ships as MAT 2.0 over a 2-channel carrier.
-- **Live MPEG-TS sliding-window segment eviction is not yet implemented.** `LoadOptions.isLive` enables the scaffold (no-op seek, `@Published isLive`), but long-running live sessions on the native AVPlayer path accumulate cached segments. Live VOD playback works; multi-hour IPTV / broadcaster feeds will grow memory until the source ends.
+- **Live MPEG-TS sliding-window eviction and DVR rewind are implemented but pending on-device verification.** RSS bound stability and `behindLiveSeconds` accuracy under prolonged IPTV / broadcaster feeds have not yet been confirmed on physical hardware.
 - **AV1 on Apple TV is software-decoded.** No current Apple TV chip ships HW AV1. The `SoftwarePlaybackHost` + dav1d path handles it, but CPU use is meaningfully higher than HW HEVC. On iOS 17+ / macOS 14+ AV1 routes through Apple's HW pipeline transparently. Future Apple TV chips with HW AV1 will be picked up automatically by `VTCapabilityProbe`.
 - **AV1 Dolby Vision Profile 10.0 has wrong colours when software-decoded.** dav1d / libavcodec cannot decode the proprietary DV colour space, so a Profile 10.0 source (DV-only, no fallback base layer) renders with incorrect colours on the SW path. Profiles 10.1 and 10.4 are unaffected because they carry an HDR10 / HLG base layer that the decoder reads correctly. Profile 10.0 only renders correctly through the native AVPlayer path on hosts with HW AV1 decode (M3+ Mac, iPhone 15 Pro+, future Apple TV chips); on software-decode hosts (all current Apple TVs) it is a known colour limitation.
 - **Dolby Vision Profile 5 thumbnails (FrameExtractor) have wrong colours.** `FrameExtractor` tone-maps HDR10 / HLG / DV P8.x stills correctly via its zscale + tonemap path, but DV Profile 5 is IPT-PQ with no HDR10 base layer, so the software decode the extractor uses cannot resolve its colour space (same root cause as the AV1 Profile 10.0 limitation above). Full playback of P5 is unaffected: it routes through the native AVPlayer path, which engages the display's DV pipeline.
