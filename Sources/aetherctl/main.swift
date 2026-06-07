@@ -48,7 +48,7 @@ private func printUsage() {
       aetherctl swdecode [--frames N] <url>
       aetherctl extract [--at <sec>] [--snapshot] [--width <px>] [--loops <n>] <url>
       aetherctl audio <url>
-      aetherctl customio [--memory] [--forward-only] <file>
+      aetherctl customio [--memory] [--forward-only] [--audio-only] <file>
       aetherctl <url>             (alias for `serve`)
 
     Flags (serve / validate only):
@@ -448,18 +448,19 @@ final class FileHandleIOReader: IOReader, @unchecked Sendable {
 /// it, printing the engine state once a second. Confirms load(source:)
 /// end-to-end on both the native path (seekable reader) and the software
 /// path (seekable or forward-only).
-private func runCustomIO(path: String, inMemory: Bool, forwardOnly: Bool) -> Int32 {
-    let modeDesc: String
+private func runCustomIO(path: String, inMemory: Bool, forwardOnly: Bool, audioOnly: Bool) -> Int32 {
+    var modeDesc: String
     switch (inMemory, forwardOnly) {
     case (true, true):   modeDesc = "in-memory + forward-only"
     case (true, false):  modeDesc = "in-memory"
     case (false, true):  modeDesc = "forward-only streaming file"
     case (false, false): modeDesc = "seekable file"
     }
+    if audioOnly { modeDesc += " + audio-only" }
     print("aetherctl customio: \(path) (\(modeDesc))")
     let box = UncheckedBox<Int32?>(nil)
     Task { @MainActor in
-        box.value = await customIOSmokeTest(path: path, inMemory: inMemory, forwardOnly: forwardOnly)
+        box.value = await customIOSmokeTest(path: path, inMemory: inMemory, forwardOnly: forwardOnly, audioOnly: audioOnly)
         CFRunLoopStop(CFRunLoopGetMain())
     }
     CFRunLoopRun()
@@ -467,7 +468,7 @@ private func runCustomIO(path: String, inMemory: Bool, forwardOnly: Bool) -> Int
 }
 
 @MainActor
-private func customIOSmokeTest(path: String, inMemory: Bool, forwardOnly: Bool) async -> Int32 {
+private func customIOSmokeTest(path: String, inMemory: Bool, forwardOnly: Bool, audioOnly: Bool) async -> Int32 {
     let reader: FileHandleIOReader
     do {
         reader = try FileHandleIOReader(path: path, inMemory: inMemory, forwardOnly: forwardOnly)
@@ -486,6 +487,7 @@ private func customIOSmokeTest(path: String, inMemory: Bool, forwardOnly: Bool) 
 
     var options = LoadOptions()
     options.suppressDisplayCriteria = true
+    options.audioOnly = audioOnly
 
     do {
         try await engine.load(source: .custom(reader), options: options)
@@ -751,6 +753,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     let snapshotMode = takeFlag("--snapshot", from: &rest)
     let inMemory = takeFlag("--memory", from: &rest)
     let forwardOnly = takeFlag("--forward-only", from: &rest)
+    let audioOnlyFlag = takeFlag("--audio-only", from: &rest)
     guard let urlArg = rest.first else {
         print("ERROR: \(first) requires a <url> argument")
         print("")
@@ -780,7 +783,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
         exit(runAudio(url: url, seconds: 10))
     case "customio":
         // urlArg is a filesystem path, not a URL; use rest.first directly.
-        exit(runCustomIO(path: urlArg, inMemory: inMemory, forwardOnly: forwardOnly))
+        exit(runCustomIO(path: urlArg, inMemory: inMemory, forwardOnly: forwardOnly, audioOnly: audioOnlyFlag))
     default:
         printUsage()
         exit(64)
