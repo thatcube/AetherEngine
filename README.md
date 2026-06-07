@@ -53,7 +53,7 @@ You provide the transport bar. You provide the dropdowns. You provide the pretty
 | Streaming   | Playback reads the source over one long-lived forward-streaming `URLSession` connection (VLC-style): bytes stream into a sliding window, a new request is issued only on a seek outside that window. Still extraction uses discrete Range chunks for random access; live transcode uses a single sequential GET |
 | Live        | Scaffold-level: `LoadOptions.isLive` opts the session in; engine publishes `@Published var isLive` for hosts, ignores `seek()`. H.264 / HEVC inside MPEG-TS routes through the native AVPlayer pipeline; MPEG-2 / MPEG-4 / VC-1 / VP8 / VP9 inside MPEG-TS routes through the SW pipeline. Sliding-window segment eviction for unbounded sessions is not yet implemented (long native-path sessions will accumulate cached segments) |
 | Resilience  | Direct-URL playback survives CDN stutters: a dropped connection, socket stall, or early close reconnects at the last byte delivered instead of ending playback (only the real end of file reports EOF). `429` / `503` honour `Retry-After`, expired signed URLs re-resolve against the source, and a progress-aware cap stops a dead or flapping origin from hammering the CDN. Plus background pause and a display-link aware lifecycle |
-| Custom input | Play from any byte source via the `IOReader` protocol, passed as `MediaSource.custom` to `load(source:)`: memory buffers, encrypted-at-rest archives, proprietary containers. Seekable readers work on both the native and software playback paths; forward-only readers (seek returns negative) work on the software path only |
+| Custom input | Play from any byte source via the `IOReader` protocol, passed as `MediaSource.custom` to `load(source:)`: memory buffers, encrypted-at-rest archives, proprietary containers. Seekable readers work on both the native and software playback paths (forward-only readers on the software path only), with audio-track switching, background reload, embedded subtitles, and scrub preview for readers that vend a second cursor |
 
 ## Quick start
 
@@ -134,8 +134,12 @@ Subtitle cues land in raw source PTS. On the native path, AVPlayer's HLS clock s
 ```swift
 final class MyArchiveReader: IOReader {
     func read(_ buffer: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32 { /* ... */ }
-    func seek(offset: Int64, whence: Int32) -> Int64 { /* ... */ }
+    func seek(offset: Int64, whence: Int32) -> Int64 { /* ... */ }  // AVSEEK_SIZE (65536) returns total size
     func close() { /* ... */ }
+
+    // Optional (both have defaults). Override to unlock extra features:
+    func cancel() { /* unblock a blocked read at teardown, do NOT invalidate the reader */ }
+    func makeIndependentReader() -> IOReader? { /* a fresh cursor over the same source, or nil */ }
 }
 
 try await engine.load(source: .custom(MyArchiveReader(), formatHint: "mp4"))
@@ -143,11 +147,12 @@ try await engine.load(source: .custom(MyArchiveReader(), formatHint: "mp4"))
 
 > **Security.** On the native path, bytes supplied by a custom `IOReader` are re-muxed to cleartext fMP4 and served via the loopback HLS cache (disk + `127.0.0.1`) to AVPlayer. This is fine for encrypted-at-rest archives (the source is decrypted in memory, never written to disk in original form), but is a cleartext exposure if the source is encrypted for content protection.
 >
-> **Capability:** seekable readers support audio-track switching and background
-> reload. Embedded subtitles and scrub-preview thumbnails require the reader to
-> implement `makeIndependentReader()` (a second independent cursor); they are
-> skipped when it is not implemented. Forward-only readers support plain
-> playback and seeking only.
+> **Capability.** Seekable readers support audio-track switching and background
+> reload (the pipeline rebuilds on the same reader, so `cancel()` must only
+> unblock the in-flight read, never invalidate the reader). Embedded subtitles
+> and scrub-preview thumbnails require the reader to implement
+> `makeIndependentReader()` (a second independent cursor); they are skipped when
+> it returns nil. Forward-only readers support plain playback and seeking only.
 
 Install via Swift Package Manager:
 
