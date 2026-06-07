@@ -521,6 +521,15 @@ final class NativeAVPlayerHost {
     /// the async `timeControlStatus` mirror before it has caught up.
     var isEffectivelyPlaying: Bool { avPlayer.timeControlStatus != .paused }
 
+    /// End (seconds) of the AVPlayer item's last seekable time range, or 0 when
+    /// no seekable range is available. For a live HLS playlist this tracks the
+    /// live edge in the AVPlayer clock.
+    var seekableEnd: Double {
+        guard let r = avPlayer.currentItem?.seekableTimeRanges.last?.timeRangeValue else { return 0 }
+        let end = CMTimeGetSeconds(r.start + r.duration)
+        return end.isFinite ? end : 0
+    }
+
     func play() {
         // AVPlayer with `automaticallyWaitsToMinimizeStalling=true`
         // (the default) handles "play before ready" correctly: it

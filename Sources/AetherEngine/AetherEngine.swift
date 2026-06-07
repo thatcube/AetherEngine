@@ -806,6 +806,7 @@ public final class AetherEngine: ObservableObject {
         loadedURL = url
         loadedOptions = options
         isLive = options.isLive
+        liveWindow = options.isLive ? LiveWindow(windowSeconds: options.dvrWindowSeconds) : nil
         state = .loading
         currentTime = 0
         nativeClockSeconds = 0
@@ -1280,6 +1281,16 @@ public final class AetherEngine: ObservableObject {
                 self.nativeClockSeconds = value
                 self.currentTime = value + self.playlistShiftSeconds
                 self.sourceTime = self.currentTime
+                // Live: publish the DVR window surfaces on every tick. The
+                // edge must sit on the SAME session axis as the playhead. The
+                // playhead is folded as host.currentTime + playlistShiftSeconds
+                // above, so the edge (host.seekableEnd in the AVPlayer clock)
+                // folds the same way: seekableEnd + playlistShiftSeconds. Using
+                // the opposite sign would put edge and playhead on different
+                // axes and behindLiveSeconds would be meaningless.
+                if self.isLive {
+                    self.publishLiveWindow(edgeSessionTime: host.seekableEnd + self.playlistShiftSeconds)
+                }
             }
             .store(in: &nativeCancellables)
         host.$duration
@@ -1682,21 +1693,50 @@ public final class AetherEngine: ObservableObject {
     }
 
     public func seek(to seconds: Double) async {
-        // Live streams have no random-access guarantee; AVPlayer would
-        // either stall indefinitely or land on a segment that the
-        // playlist hasn't materialised. Hosts can hide the scrubber by
-        // observing `$isLive` so this guard is a defence-in-depth.
-        guard !isLive else {
-            EngineLog.emit("[AetherEngine] seek(to:\(seconds)) ignored: source is live", category: .engine)
+        // Live-only sources (no DVR window) have no rewind range; AVPlayer
+        // would either stall indefinitely or land on a segment the playlist
+        // hasn't materialised. DVR sources expose a bounded seekable range
+        // and fall through. Hosts can hide the scrubber by observing
+        // `$seekableLiveRange == nil` so this guard is defence-in-depth.
+        if isLive {
+            guard let w = liveWindow, w.windowSeconds != nil else {
+                EngineLog.emit("[AetherEngine] seek(to:\(seconds)) ignored: live, DVR disabled", category: .engine)
+                return
+            }
+        }
+        // VOD: clamp to [0, duration] in source PTS. Live/DVR: clamp to the
+        // window's session-relative seekable range.
+        let target: Double = isLive ? (liveWindow?.clamp(seconds) ?? seconds) : max(0, min(seconds, duration))
+        state = .seeking
+        if isLive {
+            // Live/DVR native path: translate the session-time target into the
+            // AVPlayer live clock. Measure how far behind the live edge the
+            // (clamped) target sits, then apply that same delta backward from
+            // AVPlayer's current seekable-range end. Because the published edge
+            // is seekableEnd + playlistShiftSeconds (the same fold as the
+            // playhead), this collapses to clockTarget = target - shift, which
+            // is consistent with the engine's source-PTS axis. We compute it via
+            // the behind-delta to stay robust if the edge advances between the
+            // publish tick and this seek.
+            let behind = (liveWindow?.edgeTime ?? target) - target   // >= 0; 0 == "to the edge"
+            let clockTarget = max(0, (nativeHost?.seekableEnd ?? 0) - behind)
+            EngineLog.emit("[AetherEngine] live seek target=\(target) behind=\(behind) seekableEnd=\(nativeHost?.seekableEnd ?? 0) clockTarget=\(clockTarget)", category: .engine)
+            // Skip extendVisibleWindow: that is the VOD sliding-window mechanism.
+            // The live playlist already exposes its window of segments.
+            nativeHost?.seek(to: clockTarget)
+            nativeClockSeconds = clockTarget
+            currentTime = target
+            sourceTime = target
+            // publishLiveWindow on the next tick recomputes behindLiveSeconds
+            // against the new playhead.
+            state = .playing
             return
         }
-        let target = max(0, min(seconds, duration))
         // seek(to:) speaks source PTS (the unified engine clock). On the
         // native path AVPlayer's HLS clock sits at source - playlistShiftSeconds,
         // so convert before driving the host. The SW / audio hosts already
         // run on source time (shift 0), making this a no-op there.
         let clockTarget = target - playlistShiftSeconds
-        state = .seeking
         if audioAVPlayerActive, let host = audioAVPlayerHost {
             await host.seek(to: clockTarget)
         } else if let host = audioHost {
@@ -1751,8 +1791,25 @@ public final class AetherEngine: ObservableObject {
         await seek(to: seconds)
     }
 
-    /// Seek to the current live edge. No-op when not live. (Full effect once the
-    /// live producer + DVR seek land later; harmless stub until then.)
+    /// Update the live DVR window from a path's reported edge and publish the
+    /// four live surfaces (`liveEdgeTime`, `seekableLiveRange`, `isAtLiveEdge`,
+    /// `behindLiveSeconds`). Path-agnostic: the native tick and (later) the SW
+    /// tick both call this with their session-relative edge time. No-op when
+    /// no live window is active.
+    @MainActor
+    private func publishLiveWindow(edgeSessionTime: Double) {
+        guard var w = liveWindow else { return }
+        w.noteEdge(edgeSessionTime)
+        w.notePlayhead(currentTime)
+        liveWindow = w
+        liveEdgeTime = w.edgeTime
+        seekableLiveRange = w.seekableRange
+        isAtLiveEdge = w.isAtEdge
+        behindLiveSeconds = w.behindLiveSeconds
+    }
+
+    /// Seek to the current live edge. No-op when not live. With DVR enabled this
+    /// resolves to `behind = 0` -> `clockTarget = seekableEnd`, i.e. the edge.
     public func seekToLiveEdge() async {
         guard isLive, let w = liveWindow else { return }
         await seek(to: w.edgeTime)
@@ -2584,6 +2641,11 @@ public final class AetherEngine: ObservableObject {
         // `audioTracks`.
         activeAudioTrackIndex = nil
         isLive = false
+        liveWindow = nil
+        liveEdgeTime = 0
+        seekableLiveRange = nil
+        isAtLiveEdge = false
+        behindLiveSeconds = 0
     }
 
     // MARK: - Memory diagnostic

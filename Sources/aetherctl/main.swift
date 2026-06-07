@@ -84,7 +84,7 @@ private func printUsage() {
       aetherctl extract [--at <sec>] [--snapshot] [--width <px>] [--loops <n>] <url>
       aetherctl audio <url>
       aetherctl customio [--memory] [--forward-only] [--audio-only] [--reload] [--switch-audio] [--select-subs] [--extract] <file>
-      aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--measure-rss] [--report-cache-bytes]
+      aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--measure-rss] [--report-cache-bytes] [--rewind-test]
       aetherctl <url>             (alias for `serve`)
 
     Flags (serve / validate only):
@@ -762,7 +762,8 @@ private func runLive(
     dvrWindow: Double?,
     serveOnly: Bool,
     measureRSS: Bool,
-    reportCacheBytes: Bool
+    reportCacheBytes: Bool,
+    rewindTest: Bool = false
 ) -> Int32 {
     EngineLog.handler = { print($0) }
 
@@ -813,6 +814,13 @@ private func runLive(
 
     let box = UncheckedBox<Int32?>(nil)
     Task { @MainActor in
+        if rewindTest {
+            box.value = await liveRewindTest(url: liveURL, seconds: playSeconds,
+                                             dvrWindow: dvrWindow ?? 60)
+            fixture.stop()
+            CFRunLoopStop(CFRunLoopGetMain())
+            return
+        }
         box.value = await liveSmokeTest(url: liveURL, seconds: playSeconds,
                                         dvrWindow: dvrWindow, measureRSS: measureRSS,
                                         reportCacheBytes: reportCacheBytes)
@@ -921,6 +929,96 @@ private func liveSmokeTest(url: URL, seconds playSeconds: Double,
     }
     print(String(format: "VERDICT: live FAIL (isLive=%@, state=%@, t=%.2fs, needed t>=%.2fs)",
                  "\(finalIsLive)", "\(finalState)", finalTime, advanceTarget))
+    return 1
+}
+
+/// DVR rewind test: play ~40s with a DVR window, rewind 20s off the live edge,
+/// assert the playhead moved back and `behindLiveSeconds` is roughly 20, then
+/// return to the live edge and assert `isAtLiveEdge`. Prints PASS/FAIL per
+/// step and `VERDICT: native DVR rewind+return OK` only when both pass.
+@MainActor
+private func liveRewindTest(url: URL, seconds playSeconds: Double,
+                            dvrWindow: Double) async -> Int32 {
+    let engine: AetherEngine
+    do {
+        engine = try AetherEngine()
+    } catch {
+        print("VERDICT: live FAIL: engine init error: \(error.localizedDescription)")
+        return 1
+    }
+
+    var options = LoadOptions(isLive: true)
+    options.suppressDisplayCriteria = true
+    options.dvrWindowSeconds = dvrWindow
+
+    do {
+        try await engine.load(url: url, options: options)
+    } catch {
+        print("VERDICT: live FAIL: load error: \(error.localizedDescription)")
+        engine.stop()
+        return 1
+    }
+    print(String(format: "  post-load state=%@ isLive=%@ dvrWindow=%.0fs t=%.2fs",
+                 "\(engine.state)", "\(engine.isLive)", dvrWindow, engine.currentTime))
+
+    // Warm up for ~40s so the DVR window has enough history to rewind into.
+    let warmup = max(playSeconds, 40.0)
+    for _ in 0..<Int(warmup) {
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+    }
+    print(String(format: "  pre-rewind edge=%.2fs t=%.2fs behind=%.2fs range=%@",
+                 engine.liveEdgeTime, engine.currentTime, engine.behindLiveSeconds,
+                 engine.seekableLiveRange.map { "\($0.lowerBound)...\($0.upperBound)" } ?? "nil"))
+
+    // --- Rewind 20s off the live edge ---
+    // Note: comparing absolute currentTime before vs after the seek is the
+    // wrong invariant for a live stream (the playhead keeps advancing and the
+    // edge lurches forward in discrete steps as new segments publish). The
+    // correct post-seek invariant is: the playhead sits ~20s behind the edge,
+    // i.e. behindLiveSeconds settles near 20, and the playhead is below where
+    // it would be at the edge. Sample on each of the next ~5s and take the
+    // settled minimum behind, which is robust against an edge lurch landing on
+    // the final sample.
+    let edgeBefore = engine.liveEdgeTime
+    let timeBefore = engine.currentTime
+    await engine.seek(to: edgeBefore - 20)
+    var behindSamples: [Double] = []
+    var timeAfter = engine.currentTime
+    for i in 0..<5 {
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        timeAfter = engine.currentTime
+        let b = engine.behindLiveSeconds
+        behindSamples.append(b)
+        print(String(format: "    +%ds t=%.2f edge=%.2f behind=%.2f", i + 1,
+                     timeAfter, engine.liveEdgeTime, b))
+    }
+    // The settled behind right after the seek (before any edge lurch) is the
+    // minimum of the early samples; that is the true rewind depth.
+    let behindAfter = behindSamples.min() ?? engine.behindLiveSeconds
+    // Playhead moved back relative to the live edge it was rewound from.
+    let movedBack = timeAfter < edgeBefore
+    let behindOK = abs(behindAfter - 20) <= 5
+    let rewindPass = movedBack && behindOK
+    print(String(format: "  REWIND: edgeBefore=%.2f tBefore=%.2f -> tAfter=%.2f settledBehind=%.2f (belowEdge=%@, behind~20=%@)",
+                 edgeBefore, timeBefore, timeAfter, behindAfter,
+                 "\(movedBack)", "\(behindOK)"))
+    print("  REWIND: \(rewindPass ? "PASS" : "FAIL")")
+
+    // --- Return to the live edge ---
+    await engine.seekToLiveEdge()
+    try? await Task.sleep(nanoseconds: 3_000_000_000)
+    let atEdge = engine.isAtLiveEdge
+    print(String(format: "  RETURN: behind=%.2fs isAtLiveEdge=%@",
+                 engine.behindLiveSeconds, "\(atEdge)"))
+    print("  RETURN: \(atEdge ? "PASS" : "FAIL")")
+
+    engine.stop()
+
+    if rewindPass && atEdge {
+        print("VERDICT: native DVR rewind+return OK")
+        return 0
+    }
+    print("VERDICT: native DVR rewind+return FAIL")
     return 1
 }
 
@@ -1067,12 +1165,13 @@ if first == "live" {
     let serveOnly = takeFlag("--serve-only", from: &rest)
     let measureRSS = takeFlag("--measure-rss", from: &rest)
     let reportCacheBytes = takeFlag("--report-cache-bytes", from: &rest)
+    let rewindTest = takeFlag("--rewind-test", from: &rest)
     // --sliding is accepted-and-ignored for backward compat: sliding is now
     // the unconditional behaviour for a live session, so the flag is a no-op.
     _ = takeFlag("--sliding", from: &rest)
     exit(runLive(seconds: seconds, seed: seed, dvrWindow: dvrWindow,
                  serveOnly: serveOnly, measureRSS: measureRSS,
-                 reportCacheBytes: reportCacheBytes))
+                 reportCacheBytes: reportCacheBytes, rewindTest: rewindTest))
 }
 
 // Subcommand path: explicit subcommand + flags + url.
