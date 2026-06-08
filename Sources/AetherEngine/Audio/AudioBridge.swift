@@ -568,6 +568,14 @@ final class AudioBridge: @unchecked Sendable {
         let packetPts = packet.pointee.pts
 
         let sendRet = avcodec_send_packet(dec, packet)
+        if sendRet == AVERROR_INVALIDDATA_VALUE {
+            // Corrupt source packet (glitchy live MPEG-TS, broken mp2
+            // header). The decoder stays usable for the next valid packet,
+            // so skip this one rather than throwing. Throwing per-packet on
+            // a persistently corrupt stream floods the caller with caught
+            // errors (hundreds per second on a bad feed) for no benefit.
+            return results
+        }
         if sendRet < 0 && sendRet != AVERROR_EOF_VALUE {
             throw AudioBridgeError.sendPacketFailed(code: sendRet)
         }
@@ -620,6 +628,17 @@ final class AudioBridge: @unchecked Sendable {
     ) throws {
         let outNbSamples = swr_get_out_samples(swr, sf.pointee.nb_samples)
         guard outNbSamples > 0 else { return }
+
+        // Corrupt source audio (a glitchy live MPEG-TS feed, an mp2 stream
+        // with missing frame headers) can decode into a frame that reports
+        // nb_samples > 0 but carries no allocated sample buffer:
+        // extended_data points at a channel-pointer array whose entries are
+        // NULL. swr_convert then dereferences that NULL channel pointer and
+        // crashes with EXC_BAD_ACCESS at 0x0. Skip such frames; the video
+        // path already tolerates the same corruption, audio must too.
+        guard sf.pointee.nb_samples > 0,
+              let ext = sf.pointee.extended_data,
+              ext.pointee != nil else { return }
 
         let nChannels = enc.pointee.ch_layout.nb_channels
         let isPlanar = av_sample_fmt_is_planar(pcmSampleFmt) != 0
@@ -757,3 +776,8 @@ final class AudioBridge: @unchecked Sendable {
 /// for EAGAIN and a tagged sentinel for EOF.
 private let AVERROR_EAGAIN_VALUE: Int32 = -35
 private let AVERROR_EOF_VALUE: Int32 = -0x20464F45  // FFERRTAG('E','O','F',' ')
+/// `AVERROR_INVALIDDATA` = `FFERRTAG('I','N','D','A')`. Returned by a
+/// decoder fed a corrupt elementary-stream packet (e.g. a broken MPEG
+/// audio frame with a missing header, common on a glitchy live MPEG-TS
+/// source). Treated as "skip this packet", not fatal.
+private let AVERROR_INVALIDDATA_VALUE: Int32 = -0x41444E49
