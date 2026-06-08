@@ -361,15 +361,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// larger playlist footprint is negligible.
     private static let targetSegmentDuration: Double = 4.0
 
-    /// Steady-state live-edge hold-back in segments (see
-    /// `LiveWindowSizing.liveEdgeHoldBackSegments`). 3 segments at the 4 s
-    /// target is ~12 s of standing latency behind true-live, which buys
-    /// AVPlayer a forward cushion big enough to ride out a high-bitrate
-    /// server transcode's burst gaps without hitting the end of the playlist
-    /// (-16832 / playbackStalled). Latency behind live, not startup latency:
-    /// the cushion ramps in (the first segment is still served immediately).
-    private static let liveEdgeHoldBackSegments: Int = 3
-
     // MARK: - Measurement spike: sliding-window prototype (superseded)
     //
     // PRODUCTIZED (Task B3): the throwaway `_liveSlidingPrototype` flag and
@@ -1004,8 +995,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             isLive: isLiveSession,
             liveWindowSizing: LiveWindowSizing(
                 targetSegmentDurationSeconds: Self.targetSegmentDuration,
-                dvrWindowSeconds: dvrWindowSeconds,
-                liveEdgeHoldBackSegments: Self.liveEdgeHoldBackSegments
+                dvrWindowSeconds: dvrWindowSeconds
             ),
             restartHandler: isLiveSession ? nil : { [weak self] idx in
                 self?.restartProducer(at: idx)
@@ -2529,32 +2519,6 @@ struct LiveWindowSizing {
     let targetSegmentDurationSeconds: Double
     let dvrWindowSeconds: Double?
 
-    /// Steady-state live-edge hold-back: how many already-produced segments
-    /// the playlist keeps HIDDEN behind the production edge, so the advertised
-    /// live edge trails real production by this many segments. This guarantees
-    /// AVPlayer a constant forward cushion of finished segments even when it
-    /// sits at the advertised edge, absorbing the real-time-transcode jitter
-    /// that otherwise starves the bleeding edge: on high-bitrate channels the
-    /// server transcode produces segments in bursts, AVPlayer reaches the end
-    /// of the playlist between bursts, and fires CoreMediaErrorDomain -16832
-    /// ("restarting from end of live playlist") + playbackStalled. A few
-    /// segments of hold-back keep finished media ahead of the edge across a
-    /// burst gap. Costs `holdBack * targetSegmentDurationSeconds` of standing
-    /// latency behind true-live (fine for TV) but does NOT delay
-    /// time-to-first-frame: the cushion ramps in as segments are produced (see
-    /// `notePlaylistBuild`), so the first segment is still exposed immediately
-    /// and the advertised edge index never regresses. 0 disables (VOD path,
-    /// and live-only callers that opt out).
-    let liveEdgeHoldBackSegments: Int
-
-    init(targetSegmentDurationSeconds: Double,
-         dvrWindowSeconds: Double?,
-         liveEdgeHoldBackSegments: Int = 0) {
-        self.targetSegmentDurationSeconds = targetSegmentDurationSeconds
-        self.dvrWindowSeconds = dvrWindowSeconds
-        self.liveEdgeHoldBackSegments = liveEdgeHoldBackSegments
-    }
-
     /// Number of segments the playlist keeps visible (and the cache keeps
     /// resident). Clamped up to `minSafeSegments`.
     var windowSegmentCount: Int {
@@ -2700,15 +2664,6 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
     /// playlist and stalling.
     private static let initialFillSegments = 30
 
-    /// Minimum number of segments the live playlist exposes before the
-    /// live-edge hold-back starts trailing the production edge (see
-    /// `notePlaylistBuild` and `LiveWindowSizing.liveEdgeHoldBackSegments`).
-    /// Keeping this small means the first segment is exposed immediately and
-    /// AVPlayer can start at once; the hold-back cushion then ramps in as
-    /// further segments are produced, so the advertised edge index never
-    /// regresses.
-    private static let minVisibleBeforeHoldBack = 2
-
     /// Segments appended per playlist refresh. Must be ≥ 1 so two
     /// consecutive polls never see the same playlist (the
     /// -12888 trigger). Picked > 1 so the visible window grows faster
@@ -2839,45 +2794,27 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
         if isLive {
             let total = segments.count
             let window = liveWindowSizing.windowSegmentCount
-            // Hold the advertised live edge back behind the production edge
-            // by up to `liveEdgeHoldBackSegments`, so AVPlayer always has a
-            // forward cushion of finished segments and never sits on the
-            // bleeding edge where a high-bitrate transcode's burst gap
-            // starves it (-16832 / playbackStalled). The cushion RAMPS in:
-            // it only grows once more than `minVisibleBeforeHoldBack`
-            // segments exist, and grows 1:1 with production until it
-            // saturates at `holdBack`. This keeps the exposed edge index
-            // (`effectiveTop`) monotonically non-decreasing (AVPlayer never
-            // sees the live edge jump backward) AND leaves the very first
-            // segment exposed immediately, so time-to-first-frame is
-            // unaffected. The held-back segments are produced and cached
-            // (they sit above the eviction cutoff), just not listed.
-            let holdBack = liveWindowSizing.liveEdgeHoldBackSegments
-            let cushion = min(holdBack, max(0, total - Self.minVisibleBeforeHoldBack))
-            let effectiveTop = total - cushion
-            // highWater is the last visible index (effectiveTop - 1). Keep
-            // the last `window` visible segments: firstVisible =
-            // effectiveTop - window. Until at least `window` segments are
-            // visible, do not advance past 0 so AVPlayer's first read sees
-            // all visible segments and can establish a live edge without
-            // losing a not-yet-buffered position.
-            let newFirst = max(0, effectiveTop - window)
+            // highWater is the last produced index (total - 1). Keep the
+            // last `window` segments visible: firstVisible = highWater -
+            // window + 1 = total - window. Until at least `window`
+            // segments exist, do not advance past 0 so AVPlayer's first
+            // read sees all produced segments and can establish a live
+            // edge without losing a not-yet-buffered position.
+            let newFirst = max(0, total - window)
             if newFirst > _liveFirstVisible {
                 _liveFirstVisible = newFirst
                 // Evict everything below the new firstVisible. Off-lock to
                 // avoid holding stateLock during file I/O; evictBelow takes
                 // its own lock. Strictly below firstVisible, so no segment
                 // the playlist still lists (or AVPlayer's live-edge buffer
-                // still references) is ever removed. The held-back cushion
-                // sits at/above effectiveTop > firstVisible, so it is never
-                // evicted.
+                // still references) is ever removed.
                 let cutoff = newFirst
                 let cacheRef = cache
                 DispatchQueue.global(qos: .utility).async {
                     cacheRef.evictBelow(cutoff)
                 }
             }
-            return (effectiveTop, refreshCounter, false)
+            return (total, refreshCounter, false)
         }
         return (segments.count, refreshCounter, false)
     }
