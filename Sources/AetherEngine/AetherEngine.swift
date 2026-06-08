@@ -1323,7 +1323,11 @@ public final class AetherEngine: ObservableObject {
         host.load(url: url,
                   startPosition: nil,
                   perFrameHDR: true,
-                  skipInitialSeek: true)
+                  skipInitialSeek: true,
+                  // System-adaptive buffering for fast live startup. The
+                  // 4 s VOD floor forced a 3-4 s black screen pulling the
+                  // buffer from the remote Jellyfin transcode before play.
+                  forwardBufferDuration: 0)
 
         // Self-start playback. The VOD native path triggers play() at the
         // tail of load() (after loadNative returns + the display-criteria

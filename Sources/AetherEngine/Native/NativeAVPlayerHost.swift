@@ -117,7 +117,7 @@ final class NativeAVPlayerHost {
     /// `DisplayCriteriaController.apply(...)` must have been invoked
     /// upstream so AVKit can configure the HDR pipeline against the
     /// right target mode before the first segment is fetched.
-    func load(url: URL, startPosition: Double?, perFrameHDR: Bool = true, skipInitialSeek: Bool = false) {
+    func load(url: URL, startPosition: Double?, perFrameHDR: Bool = true, skipInitialSeek: Bool = false, forwardBufferDuration: Double = 4.0) {
         unloadCurrentItem()
 
         Self.nextSessionID += 1
@@ -128,13 +128,22 @@ final class NativeAVPlayerHost {
 
         let asset = AVURLAsset(url: url)
         let item = AVPlayerItem(asset: asset)
-        // Match the audio engine's HLSAudioEngine config so any
-        // "video-pattern is wrong" hypothesis can be ruled out as we
-        // iterate. 4 s of forward buffer matches Apple's HLS authoring
-        // recommendation for the current 4 s VOD segment cadence:
-        // enough to ride out a normal segment-generation hiccup
-        // without ballooning resident memory.
-        item.preferredForwardBufferDuration = 4.0
+        // Forward-buffer floor before AVPlayer leaves
+        // `waitingToPlayAtSpecifiedRate` and starts rendering.
+        //
+        // VOD/loopback default (4 s): matches the loopback HLS segment
+        // cadence, enough to ride out a normal segment-generation hiccup
+        // from the local producer without ballooning resident memory.
+        //
+        // Live native-HLS passes 0 (system adaptive). Against a remote
+        // Jellyfin live transcode the 4 s floor forced AVPlayer to pull
+        // ~4 s (~10 MB at 20 Mbps) before unblocking — a 3-4 s black
+        // screen at startup while the server transcoded + shipped that
+        // buffer. 0 hands buffering back to AVPlayer's own heuristic,
+        // which starts as soon as it has a playable lead. preferredForward-
+        // BufferDuration == 0.0 is the documented "let the player choose"
+        // value.
+        item.preferredForwardBufferDuration = forwardBufferDuration
 
         // Forward per-frame HDR metadata (HDR10+ ST 2094-40 and Dolby
         // Vision RPU) from the source bitstream into AVPlayer's
