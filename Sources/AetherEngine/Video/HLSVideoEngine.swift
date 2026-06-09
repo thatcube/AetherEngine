@@ -3234,6 +3234,32 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
             if !firstSegmentCondition.wait(until: deadline) { return count > 0 }
         }
     }
+
+    /// LL-HLS blocking reload: block until segment `index` (0-based absolute
+    /// index = the requested Media Sequence Number) has been appended, or
+    /// until `timeout`. `segments.count > index` means the segment exists.
+    /// Reuses the same per-append broadcast as `waitForFirstLiveSegment`, so
+    /// the wait wakes the instant the producer finalizes the next segment.
+    /// On timeout returns whether the segment happens to exist by then; the
+    /// caller serves the current playlist either way (AVPlayer retries).
+    func waitForLiveSegment(index: Int, timeout: TimeInterval) -> Bool {
+        guard isLive else { return true }
+        let deadline = Date().addingTimeInterval(timeout)
+        firstSegmentCondition.lock()
+        defer { firstSegmentCondition.unlock() }
+        while true {
+            stateLock.lock()
+            let count = segments.count
+            stateLock.unlock()
+            if count > index { return true }
+            if !firstSegmentCondition.wait(until: deadline) {
+                stateLock.lock()
+                let final = segments.count
+                stateLock.unlock()
+                return final > index
+            }
+        }
+    }
     var masterCodecs: String? { codecsString }
     var masterSupplementalCodecs: String? { supplementalCodecsString }
     var masterResolution: (width: Int, height: Int)? {
