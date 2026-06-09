@@ -131,15 +131,14 @@ final class NativeAVPlayerHost {
         // Forward-buffer floor before AVPlayer leaves
         // `waitingToPlayAtSpecifiedRate` and starts rendering.
         //
-        // VOD default (4 s): matches the loopback HLS segment cadence,
-        // enough to ride out a normal segment-generation hiccup from the
-        // local producer without ballooning resident memory.
-        //
-        // Live loopback passes 8 s (caller-supplied). The loopback server
-        // delivers locally and instantly, so a deep forward buffer is free
-        // at startup (no black screen) and lets AVPlayer pull both
-        // already-cut startup segments up front to ride past the transcode
-        // warm-up gap. See the call site in AetherEngine.loadNative.
+        // VOD and loopback-live both use this 4 s default: it matches the
+        // loopback HLS segment cadence, enough to ride out a normal
+        // segment-generation hiccup from the local producer without
+        // ballooning resident memory. Loopback-live deliberately does NOT
+        // raise this — a deeper buffer makes AVPlayer pull the whole visible
+        // playlist up front and race to the live edge, then stall on the
+        // transcode warm-up gap; the 4 s buffer paces consumption instead
+        // (see AetherEngine.loadNative call site, verified on device).
         //
         // Live remote-HLS (loadRemoteHLS) passes 0 (system adaptive).
         // Against a remote, bandwidth-limited Jellyfin live transcode the
