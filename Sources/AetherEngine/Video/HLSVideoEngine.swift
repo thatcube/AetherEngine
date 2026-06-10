@@ -334,7 +334,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// (potentially long-blocking) open so `stop()` can abort it. Without
     /// this, a reopen blocked in the AVIO reconnect loop against a dead
     /// tuner survives a channel zap and keeps reconnecting into the next
-    /// session — the same orphan class the probe-abort hook fixed for
+    /// session, the same orphan class the probe-abort hook fixed for
     /// `load()`. Guarded by `restartLock`.
     private var reopenDemuxer: Demuxer?
     /// Fires when a live program-boundary rebase changes the shift.

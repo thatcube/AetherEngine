@@ -2166,7 +2166,7 @@ public final class AetherEngine: ObservableObject {
         guard isLive, let w = liveWindow else { return }
         // Live-only (no DVR window): seek(to:) refuses every target since
         // there is no rewind range, but snapping TO the edge is always
-        // legal — and it is the recovery move after a long pause leaves
+        // legal, and it is the recovery move after a long pause leaves
         // the playhead on evicted content. Drive the native host directly
         // at its own seekable end (the SW live-only path has no ring and
         // plays at the edge by construction; nothing to do there).
