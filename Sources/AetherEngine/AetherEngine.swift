@@ -190,12 +190,21 @@ public final class AetherEngine: ObservableObject {
     /// window, or decoding fails. Never throws.
     public func liveScrubThumbnail(atSessionSeconds seconds: Double, maxWidth: Int = 320) async -> CGImage? {
         guard isLive, let session = nativeVideoSession else { return nil }
+        let gen = loadGeneration
         let source = await Task.detached(priority: .userInitiated) { [session] in
             session.liveScrubThumbnailSource(atSeconds: seconds)
         }.value
         guard let source else { return nil }
+        // A zap/stop while the detached read was in flight cleared the
+        // LRU (stopInternal); inserting now would revive a dead-session
+        // extractor whose per-session segment indices collide with the
+        // next channel's, serving frames from the PREVIOUS channel.
+        guard loadGeneration == gen else { return nil }
         let extractor: FrameExtractor
-        if let hit = liveThumbnailExtractors.first(where: { $0.segmentIndex == source.segmentIndex }) {
+        if let idx = liveThumbnailExtractors.firstIndex(where: { $0.segmentIndex == source.segmentIndex }) {
+            // Move hit to the back so it's the last to be evicted (true LRU).
+            let hit = liveThumbnailExtractors.remove(at: idx)
+            liveThumbnailExtractors.append(hit)
             extractor = hit.extractor
         } else {
             extractor = FrameExtractor(reader: DataIOReader(data: source.data), formatHint: "mp4")

@@ -1458,13 +1458,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
     }
 
     /// Composed init.mp4 + segment bytes for the live scrub-thumbnail
-    /// path, plus the segment's output-timeline start and index. The
-    /// byte copy makes window-slide eviction harmless: if the file
-    /// vanishes between lookup and read, this returns nil and the
-    /// preview falls back to time-only. Synchronous local file I/O on a
-    /// 1-3 MB file; call off-main. `segmentIndex` lets the caller
-    /// dedupe repeat probes into the same segment (extractor reuse).
-    func liveScrubThumbnailSource(atSeconds seconds: Double) -> (data: Data, startSeconds: Double, segmentIndex: Int)? {
+    /// path, plus the segment index. The byte copy makes window-slide
+    /// eviction harmless: if the file vanishes between lookup and read,
+    /// this returns nil and the preview falls back to time-only.
+    /// Synchronous local file I/O on a 1-3 MB file; call off-main.
+    /// `segmentIndex` lets the caller dedupe repeat probes into the same
+    /// segment (extractor reuse).
+    func liveScrubThumbnailSource(atSeconds seconds: Double) -> (data: Data, segmentIndex: Int)? {
         // Snapshot provider under restartLock -- mirrors the live-reopen
         // path's convention (stop() writes provider = nil under the same
         // lock), keeping this unsynchronized off-main read safe.
@@ -1475,7 +1475,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         guard let seg = prov.liveThumbnailSegment(atSeconds: seconds) else { return nil }
         guard let initData = prov.peekInitSegment(),
               let segData = try? Data(contentsOf: seg.fileURL) else { return nil }
-        return (initData + segData, seg.startSeconds, seg.index)
+        return (initData + segData, seg.index)
     }
 
     /// Locate the segment that contains a given source-time offset.
