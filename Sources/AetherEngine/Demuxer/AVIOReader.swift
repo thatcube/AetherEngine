@@ -836,7 +836,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // the response handler cancelled). Reconnect at the frontier with
             // backoff; honour Retry-After for 429/503.
             winCond.unlock()
-            if recordReconnectAndShouldGiveUp() {
+            if recordReconnectAndShouldGiveUp(status: status) {
                 EngineLog.emit("[AVIOReader] Persistent reconnect exhausted at offset \(frontier) status=\(status) (\(unproductiveReconnects) unproductive)\(isLive ? " [live source lost]" : "")", category: .demux)
                 if isLive {
                     liveExhausted = true
@@ -882,7 +882,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// otherwise it grows. Returns true once the streak exceeds the cap, so
     /// a dead or flapping origin neither hangs the demux thread nor hammers
     /// the CDN forever. Demux-thread-only.
-    private func recordReconnectAndShouldGiveUp() -> Bool {
+    private func recordReconnectAndShouldGiveUp(status: Int = 0) -> Bool {
         let now = cumulativeBytesFetched
         if now - bytesAtLastReconnect >= Self.minReconnectProgress {
             unproductiveReconnects = 0
@@ -890,6 +890,17 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             unproductiveReconnects += 1
         }
         bytesAtLastReconnect = now
+        // A hard HTTP error (4xx/5xx without retry semantics; 429/503
+        // carry Retry-After and stay on the normal budget) on a source
+        // that has NEVER delivered a byte is a server-side open failure,
+        // e.g. Jellyfin's ffmpeg cannot read the channel and answers 500
+        // only after its full transcode-failure latency (~15-20s per
+        // attempt). Grinding the regular budget against that costs a
+        // minute+ before the user sees an error. One retry, then out.
+        let isHardError = status >= 400 && status != 429 && status != 503
+        if now == 0 && isHardError {
+            return unproductiveReconnects > 1
+        }
         // A source that has NEVER delivered a single byte is dead-on-arrival
         // (hard HTTP 5xx on a live tuner, wrong URL), not a flaky-but-alive
         // link; the full 13-attempt budget kept such opens grinding for
