@@ -287,6 +287,14 @@ final class AudioAVPlayerHost {
         avPlayer.replaceCurrentItem(with: nil)
         isReady = false
         playerItem = nil
+        // The host is persistent across tracks; clear the published
+        // terminal flags so the next load's subscriptions (wired before
+        // host.load) don't replay them: a stale didReachEnd=true fired
+        // the engine's .idle edge mid-load (queue auto-advance hosts
+        // would double-skip), a stale failureMessage flipped the new
+        // track to .error before it started.
+        didReachEnd = false
+        failureMessage = nil
     }
 
     var volume: Float {

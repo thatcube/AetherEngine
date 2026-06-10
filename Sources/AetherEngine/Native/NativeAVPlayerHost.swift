@@ -620,6 +620,16 @@ final class NativeAVPlayerHost {
         }
         notificationObservers.removeAll()
         accessLogCount = 0
+        // Clear the published terminal flags so a REUSED host (issue-15
+        // keepNativeHost reload) doesn't replay the previous session's
+        // values into the next session: @Published replays the current
+        // value on subscribe, and the engine subscribes BEFORE calling
+        // load(), so a stale failureMessage flipped the new session to
+        // .error before it started (terminal on state machines that
+        // refuse to leave .error), and a stale didReachEnd fired a
+        // spurious end-of-item edge.
+        failureMessage = nil
+        didReachEnd = false
         // Force the player rate to 0 before swapping the item. On a
         // native->native reload the host (and its AVPlayer) is reused to
         // keep AVKit's system Now-Playing registration alive (issue #15),

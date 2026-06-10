@@ -405,6 +405,34 @@ public final class AetherEngine: ObservableObject {
     /// next periodic time tick. Unused on the SW / audio paths (shift 0).
     private var nativeClockSeconds: Double = 0
 
+    /// Monotonic load/stop generation. Bumped by every `stopInternal`
+    /// (which runs at the head of every `load()`, `stop()`, and audio
+    /// reload), captured by `load()`/`reloadWithAudioOverride` after
+    /// their own teardown, and re-checked after every suspension point.
+    /// Without it, a load suspended at the probe / criteria handshake /
+    /// session start resumed AFTER a newer load (or a plain `stop()`)
+    /// and kept executing: it overwrote the successor's published
+    /// state, registered its own session over the successor's (orphaning
+    /// the successor's producer + loopback server forever), reloaded the
+    /// SHARED native host's item out from under it, and could resurrect
+    /// playback after dismissal. A superseded load now unwinds with
+    /// `CancellationError` at the first checkpoint.
+    private var loadGeneration: UInt64 = 0
+
+    /// Throw when the captured generation is stale (a newer load/stop
+    /// owns the engine). Callers clean up their LOCAL resources before
+    /// calling; shared state belongs to the successor and must not be
+    /// touched on the unwind path.
+    private func checkLoadCurrent(_ gen: UInt64) throws {
+        guard loadGeneration == gen else {
+            EngineLog.emit(
+                "[AetherEngine] load superseded (gen \(gen) -> \(loadGeneration)); unwinding",
+                category: .engine
+            )
+            throw CancellationError()
+        }
+    }
+
     /// Queued live program-boundary shift changes, in output-timeline
     /// order. The producer rebases its timeline the moment it READS a
     /// boundary, but AVPlayer renders that seam ~buffer + holdback later;
@@ -847,6 +875,9 @@ public final class AetherEngine: ObservableObject {
         // in the dispatch below releases the preserved host.
         let priorBackendWasNative = (playbackBackend == .native)
         stopInternal(keepNativeHost: priorBackendWasNative)
+        // This load owns the engine as long as no newer stop/load bumps
+        // the generation; every suspension point below re-checks.
+        let gen = loadGeneration
         // A url binding the rest of the body uses. For custom sources this
         // is synthetic: it is never dereferenced for I/O (probe, native, and
         // software opens all run against the preopened probe demuxer below),
@@ -985,6 +1016,17 @@ public final class AetherEngine: ObservableObject {
             EngineLog.emit("[AetherEngine] probe failed (\(error)); proceeding without criteria", category: .engine)
         }
 
+        // Superseded while the probe was blocked? The probe is this
+        // load's local; close it (detached, the close can block) and
+        // unwind without touching shared state.
+        if loadGeneration != gen {
+            probe.markClosed()
+            if probeOpened {
+                Task.detached { [probe] in probe.close() }
+            }
+            try checkLoadCurrent(gen)
+        }
+
         // Custom sources have no URL to reopen from: a failed probe is fatal.
         if case .custom = source, !probeOpened {
             state = .error("Failed to load: custom source probe failed")
@@ -1055,7 +1097,8 @@ public final class AetherEngine: ObservableObject {
             do {
                 if useNativeAudio {
                     if probeOpened { probe.close() }
-                    try await loadAudioNative(url: url, startPosition: startPosition, httpHeaders: options.httpHeaders)
+                    try await loadAudioNative(url: url, startPosition: startPosition, httpHeaders: options.httpHeaders, generation: gen)
+                    try checkLoadCurrent(gen)
                     playbackBackend = .audio
                     activeVideoDecoder = nil
                     activeAudioDecoder = "AVPlayer"
@@ -1069,8 +1112,10 @@ public final class AetherEngine: ObservableObject {
                         sourceHTTPHeaders: options.httpHeaders,
                         startPosition: startPosition,
                         audioSourceStreamIndex: resolvedInitialAudio >= 0 ? resolvedInitialAudio : nil,
-                        preopenedDemuxer: probeOpened ? probe : nil
+                        preopenedDemuxer: probeOpened ? probe : nil,
+                        generation: gen
                     )
+                    try checkLoadCurrent(gen)
                     playbackBackend = .audio
                     activeVideoDecoder = nil
                     activeAudioDecoder = Self.softwareAudioDecoderLabel(
@@ -1082,6 +1127,9 @@ public final class AetherEngine: ObservableObject {
                     state = .playing
                     startMemoryProbe()
                 }
+            } catch is CancellationError {
+                // Superseded: the successor owns `state`; just unwind.
+                throw CancellationError()
             } catch {
                 state = .error("Failed to load: \(error.localizedDescription)")
                 throw error
@@ -1101,6 +1149,15 @@ public final class AetherEngine: ObservableObject {
             )
             if willSwitch {
                 await displayCriteria.waitForSwitch()
+                // Superseded during the panel handshake? The probe is
+                // still this load's local; close it and unwind.
+                if loadGeneration != gen {
+                    probe.markClosed()
+                    if probeOpened {
+                        Task.detached { [probe] in probe.close() }
+                    }
+                    try checkLoadCurrent(gen)
+                }
             }
         }
 
@@ -1223,7 +1280,8 @@ public final class AetherEngine: ObservableObject {
                     audioSourceStreamIndex: audioSourceStreamIndex,
                     isLive: options.isLive,
                     dvrWindowSeconds: options.dvrWindowSeconds,
-                    preopenedDemuxer: probeOpened ? probe : nil
+                    preopenedDemuxer: probeOpened ? probe : nil,
+                    generation: gen
                 )
                 playbackBackend = .software
                 activeVideoDecoder = Self.videoDecoderLabel(
@@ -1259,7 +1317,8 @@ public final class AetherEngine: ObservableObject {
                     audioBridgeMode: options.audioBridgeMode,
                     isLive: options.isLive,
                     dvrWindowSeconds: options.dvrWindowSeconds,
-                    preopenedDemuxer: probeOpened ? probe : nil
+                    preopenedDemuxer: probeOpened ? probe : nil,
+                    generation: gen
                 )
                 playbackBackend = .native
                 activeVideoDecoder = Self.videoDecoderLabel(
@@ -1284,6 +1343,7 @@ public final class AetherEngine: ObservableObject {
                 // immediate DV mode), this is what makes cold-start
                 // playback land.
                 await displayCriteria.waitForSwitch()
+                try checkLoadCurrent(gen)
                 // Auto-play after load. AVPlayer's
                 // `automaticallyWaitsToMinimizeStalling = true` (default)
                 // handles "play before ready" correctly: it transitions
@@ -1294,6 +1354,9 @@ public final class AetherEngine: ObservableObject {
                 startMemoryProbe()
                 startLiveTelemetrySampler()
             }
+        } catch is CancellationError {
+            // Superseded: a newer load/stop owns `state`; unwind quietly.
+            throw CancellationError()
         } catch {
             state = .error("Failed to load: \(error.localizedDescription)")
             throw error
@@ -1447,7 +1510,8 @@ public final class AetherEngine: ObservableObject {
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         isLive: Bool = false,
         dvrWindowSeconds: Double? = nil,
-        preopenedDemuxer: Demuxer? = nil
+        preopenedDemuxer: Demuxer? = nil,
+        generation: UInt64
     ) async throws {
         let session = HLSVideoEngine(
             url: url,
@@ -1503,6 +1567,13 @@ public final class AetherEngine: ObservableObject {
         let playbackURL = try await Task.detached(priority: .userInitiated) { [session] in
             try session.start()
         }.value
+        // Superseded while the session was starting? The session is this
+        // load's local: stop it (its teardown detaches internally) and
+        // unwind before touching the shared host or registering it.
+        if loadGeneration != generation {
+            session.stop()
+            try checkLoadCurrent(generation)
+        }
         self.nativeVideoSession = session
 
         // Reuse the existing native host across a native->native reload
@@ -1685,7 +1756,8 @@ public final class AetherEngine: ObservableObject {
         audioSourceStreamIndex: Int32?,
         isLive: Bool = false,
         dvrWindowSeconds: Double? = nil,
-        preopenedDemuxer: Demuxer?
+        preopenedDemuxer: Demuxer?,
+        generation: UInt64
     ) async throws {
         activateRendererAudioSession()
         let host = SoftwarePlaybackHost()
@@ -1759,6 +1831,14 @@ public final class AetherEngine: ObservableObject {
                 dvrWindowSeconds: dvrWindowSeconds
             )
         }.value
+        // Superseded while the host was loading? The successor's
+        // stopInternal already detached this host from the engine;
+        // stop it again (idempotent) so the demuxer the detached
+        // closure opened is torn down, then unwind.
+        if loadGeneration != generation {
+            host.stop()
+            try checkLoadCurrent(generation)
+        }
     }
 
     /// Open an `AudioPlaybackHost` against an audio-only source and wire
@@ -1770,7 +1850,8 @@ public final class AetherEngine: ObservableObject {
         sourceHTTPHeaders: [String: String] = [:],
         startPosition: Double?,
         audioSourceStreamIndex: Int32?,
-        preopenedDemuxer: Demuxer?
+        preopenedDemuxer: Demuxer?,
+        generation: UInt64
     ) async throws {
         activateRendererAudioSession()
         let host = AudioPlaybackHost()
@@ -1831,6 +1912,12 @@ public final class AetherEngine: ObservableObject {
                 audioSourceStreamIndex: audioSourceStreamIndex
             )
         }.value
+        // Superseded while the host was loading? Same unwind as
+        // loadSoftware: re-stop the detached host, then throw.
+        if loadGeneration != generation {
+            host.stop()
+            try checkLoadCurrent(generation)
+        }
     }
 
     /// Open an `AudioAVPlayerHost` against an audio-only source AVPlayer can
@@ -1841,7 +1928,8 @@ public final class AetherEngine: ObservableObject {
     private func loadAudioNative(
         url: URL,
         startPosition: Double?,
-        httpHeaders: [String: String]
+        httpHeaders: [String: String],
+        generation: UInt64
     ) async throws {
         // Reuse the persistent host (and its MPNowPlayingSession) across
         // tracks; only create it the first time. host.load() below swaps the
@@ -1905,6 +1993,10 @@ public final class AetherEngine: ObservableObject {
         try await Task.detached(priority: .userInitiated) { [host] in
             try await host.load(url: url, startPosition: startPosition, httpHeaders: httpHeaders)
         }.value
+        // Superseded while the (persistent, shared) host was loading?
+        // Don't tear the host down, the successor may be using it; just
+        // unwind before play()/state writes.
+        try checkLoadCurrent(generation)
     }
 
     // MARK: - Transport
@@ -2382,6 +2474,9 @@ public final class AetherEngine: ObservableObject {
         // is no native host to preserve.
         stopInternal(resetDisplayCriteria: false, keepNativeHost: !wasOnSoftwarePath, keepCustomReader: true)
         EngineLog.emit("[AetherEngine] reload: stopInternal done (\(elapsedMs(since: reloadStart))ms)", category: .engine)
+        // Same supersede contract as load(): a newer load/stop bumps the
+        // generation and this reload unwinds at the next checkpoint.
+        let gen = loadGeneration
         loadedURL = url
         lastDetectedVideoCodec = preservedVideoCodec
 
@@ -2406,6 +2501,14 @@ public final class AetherEngine: ObservableObject {
                 state = .error("Reload failed: \(error.localizedDescription)")
                 return
             }
+            if loadGeneration != gen {
+                customPreopened?.markClosed()
+                if let d = customPreopened {
+                    Task.detached { d.close() }
+                }
+                EngineLog.emit("[AetherEngine] reload superseded after reader reopen; unwinding", category: .engine)
+                return
+            }
         }
 
         do {
@@ -2419,7 +2522,8 @@ public final class AetherEngine: ObservableObject {
                     audioSourceStreamIndex: audioStreamIndex,
                     isLive: loadedOptions.isLive,
                     dvrWindowSeconds: loadedOptions.dvrWindowSeconds,
-                    preopenedDemuxer: customPreopened
+                    preopenedDemuxer: customPreopened,
+                    generation: gen
                 )
                 EngineLog.emit("[AetherEngine] reload: loadSoftware done (\(elapsedMs(since: loadStart))ms)", category: .engine)
                 playbackBackend = .software
@@ -2443,7 +2547,8 @@ public final class AetherEngine: ObservableObject {
                     matchContentEnabled: loadedOptions.matchContentEnabled,
                     panelIsInHDRMode: loadedOptions.panelIsInHDRMode,
                     audioBridgeMode: loadedOptions.audioBridgeMode,
-                    preopenedDemuxer: customPreopened
+                    preopenedDemuxer: customPreopened,
+                    generation: gen
                 )
                 EngineLog.emit("[AetherEngine] reload: loadNative done (\(elapsedMs(since: loadStart))ms)", category: .engine)
                 playbackBackend = .native
@@ -2458,8 +2563,10 @@ public final class AetherEngine: ObservableObject {
                 // so the first decoded frame after the audio-track reload
                 // doesn't hit a mid-transition panel.
                 await displayCriteria.waitForSwitch()
+                try checkLoadCurrent(gen)
                 nativeHost?.play()
             }
+            try checkLoadCurrent(gen)
             state = .playing
             // Re-arm the diagnostic samplers. stopInternal nilled the
             // sampler instance + the published liveTelemetry value, and
@@ -2471,6 +2578,9 @@ public final class AetherEngine: ObservableObject {
             startMemoryProbe()
             startLiveTelemetrySampler()
             EngineLog.emit("[AetherEngine] reload: state=.playing total=\(elapsedMs(since: reloadStart))ms", category: .engine)
+        } catch is CancellationError {
+            // Superseded by a newer load/stop: it owns the engine state.
+            return
         } catch {
             EngineLog.emit(
                 "[AetherEngine] selectAudioTrack reload failed: \(error), playback stopped",
@@ -2919,6 +3029,9 @@ public final class AetherEngine: ObservableObject {
     ///   never settles and times out at 5 s, adding ~12 s of black-
     ///   screen latency per audio switch.
     private func stopInternal(resetDisplayCriteria: Bool = true, keepNativeHost: Bool = false, keepCustomReader: Bool = false) {
+        // Invalidate any in-flight load(): its post-await checkpoints
+        // compare against this counter and unwind when stale.
+        loadGeneration &+= 1
         // Stop AVPlayer fetching before tearing down the loopback HLS
         // server, otherwise AVPlayer's segment requests race the
         // server shutdown and produce noisy errors in the log. Display
