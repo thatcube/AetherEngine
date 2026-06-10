@@ -1457,6 +1457,21 @@ public final class HLSVideoEngine: @unchecked Sendable {
         prov.extendVisibleWindow(toCover: idx)
     }
 
+    /// Composed init.mp4 + segment bytes for the live scrub-thumbnail
+    /// path, plus the segment's output-timeline start and index. The
+    /// byte copy makes window-slide eviction harmless: if the file
+    /// vanishes between lookup and read, this returns nil and the
+    /// preview falls back to time-only. Synchronous local file I/O on a
+    /// 1-3 MB file; call off-main. `initSegment()` returns instantly
+    /// here because a scrubbing session produced init.mp4 long ago.
+    func liveScrubThumbnailSource(atSeconds seconds: Double) -> (data: Data, startSeconds: Double, segmentIndex: Int)? {
+        guard isLiveSession, let prov = provider else { return nil }
+        guard let seg = prov.liveThumbnailSegment(atSeconds: seconds) else { return nil }
+        guard let initData = prov.initSegment(),
+              let segData = try? Data(contentsOf: seg.fileURL) else { return nil }
+        return (initData + segData, seg.startSeconds, seg.index)
+    }
+
     /// Locate the segment that contains a given source-time offset.
     /// Linear scan, fine for our 2k-segment scale on the engine's
     /// rare-event paths (load + seek). Returns 0 if `seconds` is nil
@@ -3326,6 +3341,23 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
 
     func initSegment() -> Data? {
         return cache.fetchInit(timeout: 30.0)
+    }
+
+    /// Pure lookup for the live scrub-thumbnail path: the segment whose
+    /// [start, start+duration) span contains `seconds`, plus its cache
+    /// file URL. NO side effects: unlike `mediaSegmentURL(at:)` this must
+    /// not extend the visible window or trigger a producer restart; a
+    /// thumbnail probe outside the resident window simply returns nil.
+    func liveThumbnailSegment(atSeconds seconds: Double) -> (index: Int, startSeconds: Double, fileURL: URL)? {
+        guard isLive else { return nil }
+        stateLock.lock()
+        let segs = segments
+        stateLock.unlock()
+        guard let idx = segs.lastIndex(where: {
+            $0.startSeconds <= seconds && seconds < $0.startSeconds + $0.durationSeconds
+        }) else { return nil }
+        guard let url = cache.peekURL(index: idx) else { return nil }
+        return (idx, segs[idx].startSeconds, url)
     }
 
     /// File URL for a cached segment without materializing any bytes.
