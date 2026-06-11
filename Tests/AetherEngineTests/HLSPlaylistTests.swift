@@ -20,6 +20,25 @@ final class HLSPlaylistTests: XCTestCase {
         XCTAssertEqual(variants.max(by: { $0.bandwidth < $1.bandwidth })?.uri, "high/index.m3u8")
     }
 
+    func testBandwidthAttributeIgnoresAverageBandwidth() throws {
+        // AVERAGE-BANDWIDTH precedes BANDWIDTH on typical STREAM-INF
+        // lines; an unanchored substring match used to return the
+        // AVERAGE value and could rank variants wrongly.
+        let text = """
+        #EXTM3U
+        #EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=9000000,BANDWIDTH=1280000,RESOLUTION=640x360
+        low/index.m3u8
+        #EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=4500000,BANDWIDTH=6000000,RESOLUTION=1920x1080
+        high/index.m3u8
+        """
+        guard case .master(let variants) = try HLSPlaylistParser.parse(text) else {
+            return XCTFail("expected master playlist")
+        }
+        XCTAssertEqual(variants[0].bandwidth, 1_280_000)
+        XCTAssertEqual(variants[1].bandwidth, 6_000_000)
+        XCTAssertEqual(variants.max(by: { $0.bandwidth < $1.bandwidth })?.uri, "high/index.m3u8")
+    }
+
     func testParsesMediaPlaylist() throws {
         let text = """
         #EXTM3U

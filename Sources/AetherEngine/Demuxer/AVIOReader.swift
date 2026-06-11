@@ -1352,6 +1352,18 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             }
             bufferLock.unlock()
         } else {
+            // Streaming mode: the connection is forward-only and only
+            // `streamTrimThreshold` bytes behind the cursor are retained.
+            // A backward seek below the retained window can never be
+            // served; pre-fix this path reported success and the
+            // following readStreaming then waited 15 s for data that
+            // would never arrive and collapsed into a silent EOF, with
+            // FFmpeg believing the seek had landed. Report failure
+            // instead so the demuxer treats the position as unseekable.
+            streamLock.lock()
+            let oldestRetained = streamBytesRead
+            streamLock.unlock()
+            if newPosition < oldestRetained { return -1 }
             position = newPosition
         }
 

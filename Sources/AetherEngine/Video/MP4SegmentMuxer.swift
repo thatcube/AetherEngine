@@ -248,6 +248,13 @@ final class MP4SegmentMuxer {
     /// second call. See `cutFragmentForNextSegment` for the call site.
     private var moovFlushed: Bool = false
 
+    /// Latched when rotating to the next segment's staging file failed.
+    /// The muxer then has no open fd, the splitter discards every
+    /// subsequent fragment byte, and the session cannot recover (the
+    /// avformat context's fragment state is tied to the lost fd). The
+    /// producer checks this right after each cut and ends the pump.
+    private(set) var isWedged: Bool = false
+
     /// Muxer's chosen time_base for the video output stream, latched
     /// after avformat_write_header. The mp4 muxer rewrites the stream's
     /// time_base to its own auto-pick (usually 1/16000 for 24 fps
@@ -696,8 +703,19 @@ final class MP4SegmentMuxer {
             self.currentSegmentIndex = nextIdx
             byteCounter.fd = nextFd
         } catch {
-            // Failed to open the next file. Caller should give up on
-            // this session; we can't keep producing.
+            // Failed to open the next file: the muxer can't keep
+            // producing. Latch isWedged so the producer ends the pump at
+            // THIS cut. Returning only the completed tuple (pre-fix
+            // behavior) made the caller treat the cut as fully
+            // successful; with fd == -1 the splitter then silently
+            // discarded every fragment byte of the next segment and the
+            // pump only failed one cut later, with no log at the actual
+            // failure site.
+            EngineLog.emit(
+                "[MP4SegmentMuxer] open next staging file seg-\(nextIdx) FAILED: \(error)",
+                category: .session
+            )
+            isWedged = true
             return (path: completedPath, bytesWritten: completedBytes)
         }
 

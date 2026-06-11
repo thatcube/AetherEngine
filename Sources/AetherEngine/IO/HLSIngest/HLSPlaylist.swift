@@ -126,15 +126,31 @@ enum HLSPlaylistParser {
     }
 
     /// Extract a KEY=VALUE attribute from a tag line; tolerates quoted values.
+    ///
+    /// The match is anchored: the character before the key must be `:`
+    /// or `,` (the attribute-list separators). A bare substring search
+    /// matched `BANDWIDTH=` inside `AVERAGE-BANDWIDTH=` (which precedes
+    /// it on typical `#EXT-X-STREAM-INF:` lines), so variant selection
+    /// ranked streams by their AVERAGE values and could pick the wrong
+    /// variant.
     private static func attribute(_ key: String, in line: String) -> String? {
-        guard let range = line.range(of: "\(key)=") else { return nil }
-        let rest = line[range.upperBound...]
-        if rest.hasPrefix("\"") {
-            let afterQuote = rest.dropFirst()
-            guard let end = afterQuote.firstIndex(of: "\"") else { return nil }
-            return String(afterQuote[..<end])
+        let needle = "\(key)="
+        var searchStart = line.startIndex
+        while let range = line.range(of: needle, range: searchStart..<line.endIndex) {
+            searchStart = range.upperBound
+            if range.lowerBound != line.startIndex {
+                let before = line[line.index(before: range.lowerBound)]
+                guard before == ":" || before == "," else { continue }
+            }
+            let rest = line[range.upperBound...]
+            if rest.hasPrefix("\"") {
+                let afterQuote = rest.dropFirst()
+                guard let end = afterQuote.firstIndex(of: "\"") else { return nil }
+                return String(afterQuote[..<end])
+            }
+            let end = rest.firstIndex(of: ",") ?? rest.endIndex
+            return String(rest[..<end])
         }
-        let end = rest.firstIndex(of: ",") ?? rest.endIndex
-        return String(rest[..<end])
+        return nil
     }
 }

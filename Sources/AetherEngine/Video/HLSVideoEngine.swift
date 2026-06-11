@@ -358,10 +358,27 @@ public final class HLSVideoEngine: @unchecked Sendable {
     private var audioBridge: AudioBridge?
     private var segmentPlan: [Segment] = []
 
-    /// Serializes restart requests so multiple AVPlayer GETs racing
-    /// the same scrub can't tear down and rebuild the producer in
-    /// parallel.
+    /// Guards the subsystem references (producer / cache / server /
+    /// demuxer / audioBridge / provider), the saved configs, and
+    /// `sessionEpoch`. Held only for brief state mutations / snapshots,
+    /// never across waits or network I/O, so `stop()` (often on the main
+    /// thread via a SwiftUI dismiss) is never blocked behind a restart's
+    /// 5 s producer wait or a network-bound demuxer seek.
     private let restartLock = NSLock()
+
+    /// Serializes restart requests among themselves so multiple AVPlayer
+    /// GETs racing the same scrub can't tear down and rebuild the
+    /// producer in parallel. Deliberately separate from `restartLock`:
+    /// this one IS held across the restart's waits, which is fine because
+    /// only other restarts contend on it.
+    private let restartGate = NSLock()
+
+    /// Bumped by `stop()` under `restartLock`. A restart that dropped the
+    /// lock for its waits re-validates the epoch before installing the
+    /// new producer, so a stop() that landed mid-restart wins and the
+    /// restart unwinds instead of resurrecting a producer into a
+    /// torn-down session.
+    private var sessionEpoch: UInt64 = 0
 
     /// Fires once per session, the first time the producer sees an
     /// HDR10+ T.35 signature in a packet. Hooked by `AetherEngine` to
@@ -1433,61 +1450,82 @@ public final class HLSVideoEngine: @unchecked Sendable {
     // as `diagnosticStats()` above) but exposes it as a single getter so
     // the sampler doesn't have to walk private subsystem pointers. All
     // return zero when the relevant subsystem isn't built yet.
+    //
+    // Every forwarder snapshots its subsystem ref under `restartLock`
+    // first: stop(), restartProducer(at:), and the live-reopen path
+    // replace/nil these strong refs under that lock, so a lock-free read
+    // from the sampler/memprobe thread was an ARC data race (a read
+    // interleaved with the final release in stop() can retain a freed
+    // object). Only the ref snapshot happens under the lock; the actual
+    // counter read runs after unlock so telemetry can't block a restart.
+
+    /// Snapshot the subsystem references under `restartLock`. See the
+    /// comment above; `liveScrubThumbnailSource` documents the same
+    /// convention.
+    private func subsystemSnapshot() -> (
+        producer: HLSSegmentProducer?, cache: SegmentCache?,
+        server: HLSLocalServer?, demuxer: Demuxer?, audioBridge: AudioBridge?
+    ) {
+        restartLock.lock()
+        defer { restartLock.unlock() }
+        return (producer, cache, server, demuxer, audioBridge)
+    }
 
     /// Bytes the active demuxer has fetched from the source. Mirrors
     /// `Demuxer.avioBytesFetched`.
-    var demuxerBytesFetched: Int64 { demuxer?.avioBytesFetched ?? 0 }
+    var demuxerBytesFetched: Int64 { subsystemSnapshot().demuxer?.avioBytesFetched ?? 0 }
 
     /// Resident bytes in the loopback HLS segment cache.
-    var segmentCacheTotalBytes: Int { cache?.totalBytes ?? 0 }
+    var segmentCacheTotalBytes: Int { subsystemSnapshot().cache?.totalBytes ?? 0 }
 
     /// Authoritative on-disk byte footprint of the resident segment files
     /// (freshly stat-ed). 0 when no native session is active. Used by the
     /// `aetherctl live --report-cache-bytes` harness to verify the live
     /// window keeps disk bounded.
-    var segmentCacheDiskBytes: Int64 { cache?.diskBytes() ?? 0 }
+    var segmentCacheDiskBytes: Int64 { subsystemSnapshot().cache?.diskBytes() ?? 0 }
 
     /// Producer restart sessions in the current session.
-    var producerRestartCount: Int { producer?.restartCount ?? 0 }
+    var producerRestartCount: Int { subsystemSnapshot().producer?.restartCount ?? 0 }
 
     /// Lifetime bytes emitted by the active MP4SegmentMuxer.
-    var muxedBytesLifetime: Int { producer?.muxerLifetimeFragmentBytes ?? 0 }
+    var muxedBytesLifetime: Int { subsystemSnapshot().producer?.muxerLifetimeFragmentBytes ?? 0 }
 
     /// Lifetime bytes the loopback HLS server has written to AVPlayer.
-    var serverLifetimeBytesSent: Int { server?.lifetimeBytesSent ?? 0 }
+    var serverLifetimeBytesSent: Int { subsystemSnapshot().server?.lifetimeBytesSent ?? 0 }
 
     /// HTTP requests served by the loopback HLS server.
-    var serverRequestCount: Int { server?.requestCount ?? 0 }
+    var serverRequestCount: Int { subsystemSnapshot().server?.requestCount ?? 0 }
 
     /// Bytes currently held in AudioBridge's FIFO + swr-delay buffers.
-    var audioBridgeLiveBytes: Int { audioBridge?.liveBytes.totalBytes ?? 0 }
+    var audioBridgeLiveBytes: Int { subsystemSnapshot().audioBridge?.liveBytes.totalBytes ?? 0 }
 
     /// Most recently measured audio/video gate gap in source-clock ms.
-    var lastAVGapMs: Double { producer?.lastAVGapMs ?? 0 }
+    var lastAVGapMs: Double { subsystemSnapshot().producer?.lastAVGapMs ?? 0 }
 
     /// Read the current pipeline counters. Returns zeros for any
     /// sub-system that hasn't been constructed yet (pre-start or
     /// post-stop).
     public func diagnosticStats() -> DiagnosticStats {
-        let abLive = audioBridge?.liveBytes
+        let subs = subsystemSnapshot()
+        let abLive = subs.audioBridge?.liveBytes
         return DiagnosticStats(
-            segmentCacheCount: cache?.count ?? 0,
-            segmentCacheBytes: cache?.totalBytes ?? 0,
-            producerPacketsWritten: producer?.packetsWrittenCount ?? 0,
-            avioBytesFetched: demuxer?.avioBytesFetched ?? 0,
-            audioFifoSamples: audioBridge?.fifoSampleCount ?? 0,
+            segmentCacheCount: subs.cache?.count ?? 0,
+            segmentCacheBytes: subs.cache?.totalBytes ?? 0,
+            producerPacketsWritten: subs.producer?.packetsWrittenCount ?? 0,
+            avioBytesFetched: subs.demuxer?.avioBytesFetched ?? 0,
+            audioFifoSamples: subs.audioBridge?.fifoSampleCount ?? 0,
             audioBridgeFifoBytes: abLive?.fifoBytes ?? 0,
             audioBridgeSwrBytes: abLive?.swrDelayBytes ?? 0,
-            muxerLifetimeFragmentBytes: producer?.muxerLifetimeFragmentBytes ?? 0,
-            muxerFragmentCuts: producer?.muxerFragmentCuts ?? 0,
-            serverConnectionCount: server?.activeConnectionCount ?? 0,
-            serverLifetimeBytesSent: server?.lifetimeBytesSent ?? 0,
-            serverSendfileBytesSent: server?.lifetimeSendfileBytes ?? 0,
+            muxerLifetimeFragmentBytes: subs.producer?.muxerLifetimeFragmentBytes ?? 0,
+            muxerFragmentCuts: subs.producer?.muxerFragmentCuts ?? 0,
+            serverConnectionCount: subs.server?.activeConnectionCount ?? 0,
+            serverLifetimeBytesSent: subs.server?.lifetimeBytesSent ?? 0,
+            serverSendfileBytesSent: subs.server?.lifetimeSendfileBytes ?? 0,
             packetsAlive: PacketBalanceTracker.alive,
             packetsTotalAllocs: PacketBalanceTracker.totalAllocs,
-            producerRestartCount: producer?.restartCount ?? 0,
-            lastAVGapMs: producer?.lastAVGapMs ?? 0,
-            serverRequestCount: server?.requestCount ?? 0
+            producerRestartCount: subs.producer?.restartCount ?? 0,
+            lastAVGapMs: subs.producer?.lastAVGapMs ?? 0,
+            serverRequestCount: subs.server?.requestCount ?? 0
         )
     }
 
@@ -1548,6 +1586,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // inside demuxer.readPacket waiting on an HTTP byte-range
         // read) finishes exiting.
         restartLock.lock()
+        sessionEpoch &+= 1
         let p = producer
         producer = nil
         let s = server
@@ -2253,14 +2292,32 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// the cache.setInit overwrite during restart is a no-op from
     /// AVPlayer's perspective.
     private func restartProducer(at idx: Int) {
-        restartLock.lock()
-        defer { restartLock.unlock() }
+        // Restarts serialize among themselves on restartGate (held across
+        // the waits below). restartLock is only taken for the brief state
+        // snapshots/mutations, so a stop() landing mid-restart (SwiftUI
+        // dismiss on the main thread) is never blocked behind the old
+        // producer's 5 s waitForFinish or the network-bound demuxer seek;
+        // it bumps sessionEpoch instead and this restart unwinds at the
+        // re-validation below.
+        restartGate.lock()
+        defer { restartGate.unlock() }
 
-        guard idx >= 0, idx < segmentPlan.count, demuxer != nil else { return }
+        restartLock.lock()
+        guard idx >= 0, idx < segmentPlan.count, let dem = demuxer else {
+            restartLock.unlock()
+            return
+        }
+        let epoch = sessionEpoch
+        let old = producer
+        producer = nil
+        let ab = audioBridge
+        let targetStartPts = segmentPlan[idx].startPts
+        let videoTb = savedVideoConfig?.timeBase ?? AVRational(num: 1, den: 1000)
+        restartLock.unlock()
 
         let restartStart = DispatchTime.now()
 
-        if let old = producer {
+        if let old {
             old.stop()
             let ok = old.waitForFinish(timeout: 5.0)
             if !ok {
@@ -2270,7 +2327,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 )
             }
         }
-        producer = nil
 
         // Seek the demuxer to the ABSOLUTE source-PTS of the target
         // segment's first keyframe, not to the relative playlist time.
@@ -2287,21 +2343,38 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // diffs), and embedded subtitle cue.startTime stays in
         // absolute source-PTS. Net effect: subtitles appear up to one
         // segment duration AHEAD of the corresponding audio.
-        let absoluteTargetPts = segmentPlan[idx].startPts
-        let videoTb = savedVideoConfig?.timeBase ?? AVRational(num: 1, den: 1000)
-        let absoluteTargetSeconds = Double(absoluteTargetPts) * Double(videoTb.num) / Double(videoTb.den)
-        demuxer?.seek(to: absoluteTargetSeconds)
+        let absoluteTargetSeconds = Double(targetStartPts) * Double(videoTb.num) / Double(videoTb.den)
+        // Seek on the snapshotted demuxer, outside restartLock: the seek
+        // is network-bound on remote sources. A concurrent stop() calls
+        // markClosed() on the same demuxer, which makes this seek fail
+        // fast instead of racing the teardown.
+        dem.seek(to: absoluteTargetSeconds)
         // Re-arm the FLAC bridge's PTS rebase off the new demuxer
         // cursor. Without this, the bridge's encoder timeline keeps
         // climbing from where the old producer left off, drifting
         // out of alignment with the freshly-seeked video PTS.
-        audioBridge?.startSegment()
+        ab?.startSegment()
 
+        // Re-validate before installing the new producer: a stop() that
+        // landed during the waits above already tore the session down
+        // (and bumped the epoch); bringing up a producer now would
+        // resurrect the pump into a closed cache/server.
+        restartLock.lock()
+        guard sessionEpoch == epoch else {
+            restartLock.unlock()
+            EngineLog.emit(
+                "[HLSVideoEngine] restart at idx=\(idx): superseded by stop(), unwinding",
+                category: .session
+            )
+            return
+        }
         do {
             let newProd = try makeProducer(baseIndex: idx)
             producer = newProd
+            restartLock.unlock()
             newProd.start()
         } catch {
+            restartLock.unlock()
             EngineLog.emit(
                 "[HLSVideoEngine] restart at idx=\(idx) failed: \(error)",
                 category: .session
@@ -3158,7 +3231,17 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
     /// or the host's resume target, with the engine updating this
     /// after the first explicit restart it triggers via the public
     /// `restartProducer(at:)` path.
-    private var lastRestartIndex: Int = 0
+    ///
+    /// Guarded by `stateLock`: the server's workQueue is concurrent, so
+    /// `mediaSegment(at:)` / `handleTargetChange(to:)` can race on this
+    /// from multiple connection threads (an unsynchronized read/write is
+    /// a Swift data race; two racing GETs could also both read a stale
+    /// value and double-trigger a restart).
+    private var lastRestartIndex: Int {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return _lastRestartIndex }
+        set { stateLock.lock(); _lastRestartIndex = newValue; stateLock.unlock() }
+    }
+    private var _lastRestartIndex: Int = 0
 
     /// Forward-distance threshold beyond which a fetch triggers a
     /// restart instead of waiting for the producer to catch up.

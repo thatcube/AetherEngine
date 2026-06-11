@@ -953,7 +953,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     }
                 }
             )
+            // currentMuxer is read under stateLock by the telemetry
+            // getters (muxerLifetimeFragmentBytes / muxerFragmentCuts);
+            // the write must take the same lock or the reader-side lock
+            // is useless (ARC race on the strong ref).
+            stateLock.lock()
             self.currentMuxer = muxer
+            stateLock.unlock()
             self.currentMuxerSegmentIndex = initialSegmentIndex
             return muxer
         } catch {
@@ -988,6 +994,19 @@ final class HLSSegmentProducer: @unchecked Sendable {
             if isLive {
                 reportLiveSegmentFinalized(index: currentMuxerSegmentIndex,
                                            nextIndex: newIdx)
+            }
+            // The cut completed but the muxer failed to open the NEXT
+            // staging file: it has no fd, so every byte of the next
+            // segment would be silently discarded. End the pump here, at
+            // the actual failure point (the completed segment above was
+            // still adopted).
+            if muxer.isWedged {
+                EngineLog.emit(
+                    "[HLSSegmentProducer] muxer wedged after seg-\(currentMuxerSegmentIndex) cut "
+                    + "(next staging fd open failed), ending pump",
+                    category: .session
+                )
+                return nil
             }
         } else {
             // A failed fragment cut leaves the muxer WITHOUT an open
@@ -1078,7 +1097,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 category: .session
             )
         }
+        // Locked for the same reason as the write in allocateMuxer: the
+        // telemetry getters read currentMuxer under stateLock.
+        stateLock.lock()
         currentMuxer = nil
+        stateLock.unlock()
         currentMuxerSegmentIndex = .min
     }
 
