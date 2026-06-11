@@ -16,6 +16,10 @@ import Foundation
 /// Forward-only: `seek` always returns -1 (including AVSEEK_SIZE; length is
 /// unknown). Requires the engine's live custom-source gates (same commit
 /// series) so it still dispatches to the native loopback path.
+///
+/// Memory: the FIFO caps at 16 MB plus at most one segment of overshoot;
+/// extreme-bitrate sources transiently hold one fetched segment on top.
+/// Switching to streamed segment reads is a P2 option if that ever bites.
 public final class HLSLiveIngestReader: IOReader, @unchecked Sendable {
     private let playlistURL: URL
     private let fifo = ByteFIFO(capacity: 16 * 1024 * 1024)
@@ -23,18 +27,27 @@ public final class HLSLiveIngestReader: IOReader, @unchecked Sendable {
     private var ingestTask: Task<Void, Never>?
     private let startLock = NSLock()
     private var started = false
+    private var closed = false
     /// Terminal ingest error, readable by the host for fallback logging.
     /// Protected by startLock: written from the detached ingest task under
     /// startLock, read by the host after the FIFO signals failure.
-    public private(set) var terminalError: HLSIngestError?
+    private var _terminalError: HLSIngestError?
+
+    /// Terminal ingest error, readable by the host for fallback logging.
+    public var terminalError: HLSIngestError? {
+        startLock.withLock { _terminalError }
+    }
 
     public init(playlistURL: URL) {
         self.playlistURL = playlistURL
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 10
-        // No timeoutIntervalForResource ceiling: segment fetches are
-        // one-shot data tasks, and the 60s-resource-ceiling lesson
-        // (AetherEngine c7592ed) says never cap long-lived live I/O.
+        config.timeoutIntervalForResource = 30
+        // 30s resource ceiling per one-shot fetch: a trickling CDN must fail
+        // the segment (and ultimately the ingest) instead of stalling
+        // playback forever with no host fallback. The c7592ed no-ceiling
+        // lesson applies to LONG-LIVED stream connections, not to bounded
+        // one-shot playlist/segment fetches.
         self.session = URLSession(configuration: config)
     }
 
@@ -54,9 +67,20 @@ public final class HLSLiveIngestReader: IOReader, @unchecked Sendable {
     }
 
     public func close() {
+        startLock.lock()
+        closed = true
+        let wasStarted = started
+        let task = ingestTask
+        ingestTask = nil
+        task?.cancel()
+        startLock.unlock()
+
         fifo.cancel()
-        ingestTask?.cancel()
-        session.invalidateAndCancel()
+        if !wasStarted {
+            // Ingest never launched: we are the sole owner of the session.
+            session.invalidateAndCancel()
+        }
+        // If wasStarted, the defer inside runIngest() owns session teardown.
     }
 
     public func cancel() {
@@ -69,24 +93,38 @@ public final class HLSLiveIngestReader: IOReader, @unchecked Sendable {
     private func startIfNeeded() {
         startLock.lock()
         defer { startLock.unlock() }
-        guard !started else { return }
+        guard !started, !closed else { return }
         started = true
-        ingestTask = Task.detached(priority: .userInitiated) { [weak self] in
-            await self?.runIngest()
+        // Strong capture on purpose: the ingest loop must keep the reader
+        // (and its FIFO) alive until close() cancels it; close() is
+        // guaranteed by the IOReader contract.
+        ingestTask = Task.detached(priority: .userInitiated) { [self] in
+            await runIngest()
         }
     }
 
     private func runIngest() async {
+        defer { session.invalidateAndCancel() }
         do {
-            let mediaURL = try await resolveMediaPlaylistURL()
+            let (mediaURL, seedPlaylist) = try await resolveMediaPlaylistURL()
             var tracker = HLSPlaylistTracker()
             var sniffedFirstSegment = false
             var refreshInterval: Double = 2
+            var pendingPlaylist: HLSMediaPlaylist? = seedPlaylist
 
             while !Task.isCancelled {
-                let (playlist, _) = try await fetchPlaylist(mediaURL)
-                guard case .media(let media) = playlist else {
-                    throw HLSIngestError.playlistInvalid(reason: "expected media playlist on refresh")
+                let media: HLSMediaPlaylist
+                if let seeded = pendingPlaylist {
+                    // First iteration: reuse the already-parsed media playlist
+                    // from resolveMediaPlaylistURL so we don't refetch it.
+                    media = seeded
+                    pendingPlaylist = nil
+                } else {
+                    let (playlist, _) = try await fetchPlaylist(mediaURL)
+                    guard case .media(let fetched) = playlist else {
+                        throw HLSIngestError.playlistInvalid(reason: "expected media playlist on refresh")
+                    }
+                    media = fetched
                 }
                 if media.isEncrypted { throw HLSIngestError.encryptedNotSupported }
                 if media.hasMap { throw HLSIngestError.unsupportedSegmentFormat }
@@ -97,6 +135,12 @@ public final class HLSLiveIngestReader: IOReader, @unchecked Sendable {
 
                 for segment in fresh {
                     guard !Task.isCancelled else { return }
+                    if segment.discontinuityBefore {
+                        // Phase 1 decision (design spec): the seam is logged, the actual
+                        // timestamp handling rides on the producer's PTS-leap rebase
+                        // heuristic downstream; a deterministic force-cut hint is a P2 item.
+                        EngineLog.emit("[HLSIngest] discontinuity seam before segment \(segment.uri)", category: .engine)
+                    }
                     guard let segmentURL = HLSPlaylistParser.resolve(uri: segment.uri, against: mediaURL) else {
                         throw HLSIngestError.playlistInvalid(reason: "unresolvable segment URI")
                     }
@@ -122,28 +166,37 @@ public final class HLSLiveIngestReader: IOReader, @unchecked Sendable {
         } catch is CancellationError {
             // teardown
         } catch let error as HLSIngestError {
-            startLock.withLock { terminalError = error }
+            startLock.withLock { _terminalError = error }
             EngineLog.emit("[HLSIngest] terminal: \(error)", category: .engine)
             fifo.cancel()
         } catch {
-            startLock.withLock { terminalError = .playlistUnreachable(status: -1) }
+            if Task.isCancelled || (error as? URLError)?.code == .cancelled {
+                return // teardown rides through as cancellation, not a terminal error
+            }
+            startLock.withLock { _terminalError = .playlistUnreachable(status: -1) }
             EngineLog.emit("[HLSIngest] terminal (transport): \(error.localizedDescription)", category: .engine)
             fifo.cancel()
         }
     }
 
-    private func resolveMediaPlaylistURL() async throws -> URL {
+    /// Resolves the media playlist URL and returns the already-parsed
+    /// `HLSMediaPlaylist` when the input URL is a direct media playlist
+    /// (so the caller can reuse it without a second fetch). Returns `nil`
+    /// for the seed in the master-playlist case.
+    private func resolveMediaPlaylistURL() async throws -> (URL, HLSMediaPlaylist?) {
         let (playlist, finalURL) = try await fetchPlaylist(playlistURL)
         switch playlist {
-        case .media:
-            return finalURL
+        case .media(let media):
+            // Direct media playlist: hand the parsed result back so the
+            // ingest loop's first iteration does not refetch it.
+            return (finalURL, media)
         case .master(let variants):
             guard let best = variants.max(by: { $0.bandwidth < $1.bandwidth }),
                   let url = HLSPlaylistParser.resolve(uri: best.uri, against: finalURL) else {
                 throw HLSIngestError.playlistInvalid(reason: "no usable variant")
             }
             EngineLog.emit("[HLSIngest] master playlist: picked variant bandwidth=\(best.bandwidth)", category: .engine)
-            return url
+            return (url, nil)
         }
     }
 
@@ -177,7 +230,9 @@ public final class HLSLiveIngestReader: IOReader, @unchecked Sendable {
                 }
             } catch let error as HLSIngestError { throw error }
             catch { /* transport blip: retry */ }
-            try await Task.sleep(nanoseconds: UInt64(0.5 * Double(attempt + 1) * 1_000_000_000))
+            if attempt < 2 {
+                try await Task.sleep(nanoseconds: UInt64(0.5 * Double(attempt + 1) * 1_000_000_000))
+            }
         }
         throw HLSIngestError.playlistUnreachable(status: lastStatus)
     }
