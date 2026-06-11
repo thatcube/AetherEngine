@@ -26,22 +26,24 @@ enum SubtitleDecoder {
     /// Decode every cue out of the subtitle file at `url`. Cancellable
     /// via `Task.cancel()`; throws on open / codec failure. Returns
     /// cues sorted by `startTime`.
-    static func decodeFile(url: URL) async throws -> [SubtitleCue] {
+    static func decodeFile(url: URL, httpHeaders: [String: String] = [:]) async throws -> [SubtitleCue] {
         try await Task.detached(priority: .userInitiated) {
-            try decodeFileSync(url: url)
+            try decodeFileSync(url: url, httpHeaders: httpHeaders)
         }.value
     }
 
     // MARK: - Synchronous core
 
-    private static func decodeFileSync(url: URL) throws -> [SubtitleCue] {
+    private static func decodeFileSync(url: URL, httpHeaders: [String: String]) throws -> [SubtitleCue] {
         let isHTTP = url.scheme == "http" || url.scheme == "https"
 
         var formatContext: UnsafeMutablePointer<AVFormatContext>?
         var avioReader: AVIOReader?
 
         if isHTTP {
-            let reader = AVIOReader(url: url)
+            // Auth headers (WebDAV-hosted sidecars and friends, #32)
+            // ride the same AVIO reader path as the media source.
+            let reader = AVIOReader(url: url, extraHeaders: httpHeaders)
             try reader.open()
             avioReader = reader
             guard let ctx = avformat_alloc_context() else {

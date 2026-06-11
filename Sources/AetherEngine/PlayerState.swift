@@ -79,9 +79,10 @@ public struct LoadOptions: Sendable, Equatable {
     /// runs for embedded subtitles). Use this for `Authorization`
     /// tokens, custom auth headers, or anything else the source server
     /// requires. Headers are NOT forwarded to AVPlayer (AVPlayer hits
-    /// the engine's loopback HLS server, not the source). Headers are
-    /// NOT applied to sidecar subtitle fetches via
-    /// `selectSidecarSubtitle(url:)`; that path has its own load entry.
+    /// the engine's loopback HLS server, not the source). Sidecar
+    /// subtitle fetches via `selectSidecarSubtitle(url:)` forward
+    /// these by default; pass that call's own `httpHeaders` parameter
+    /// to override per fetch (#32).
     /// Default is empty (no extra headers).
     public var httpHeaders: [String: String]
 

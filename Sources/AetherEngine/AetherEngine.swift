@@ -3301,7 +3301,13 @@ public final class AetherEngine: ObservableObject {
     /// `isLoadingSubtitles` flips on for the duration so the host can
     /// show a spinner. Subsequent calls cancel any in-flight sidecar
     /// decode.
-    public func selectSidecarSubtitle(url: URL) {
+    ///
+    /// `httpHeaders`: extra headers for the subtitle fetch (WebDAV
+    /// auth and friends, #32). nil forwards the loaded session's
+    /// `LoadOptions.httpHeaders`, so a subtitle served by the same
+    /// authenticated host as the media works without repeating the
+    /// headers; pass an explicit dictionary (or `[:]`) to override.
+    public func selectSidecarSubtitle(url: URL, httpHeaders: [String: String]? = nil) {
         cancelSidecarTask()
         // Sidecar replaces any active embedded stream.
         embeddedSubtitleTask?.cancel()
@@ -3317,10 +3323,11 @@ public final class AetherEngine: ObservableObject {
         subtitleCues = []
         isLoadingSubtitles = true
 
+        let effectiveHeaders = httpHeaders ?? loadedOptions.httpHeaders
         sidecarTask = Task { [weak self] in
             let cues: [SubtitleCue]
             do {
-                cues = try await SubtitleDecoder.decodeFile(url: url)
+                cues = try await SubtitleDecoder.decodeFile(url: url, httpHeaders: effectiveHeaders)
             } catch {
                 EngineLog.emit("[AetherEngine] sidecar decode failed: \(error)", category: .engine)
                 await MainActor.run {
