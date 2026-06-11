@@ -130,12 +130,14 @@ public final class Demuxer: @unchecked Sendable {
     /// Open a media source backed by a custom `IOReader` (memory buffer,
     /// encrypted archive, etc.). `formatHint` (e.g. "mp4", "matroska")
     /// disambiguates probing when no filename is available; pass nil to
-    /// probe from content only.
-    func open(reader: IOReader, formatHint: String? = nil, profile: DemuxerOpenProfile = .playback) throws {
+    /// probe from content only. `isLive` suppresses the duration-estimate
+    /// SEEK_END that would latch EOF on a forward-only live reader (same
+    /// fix as the URL live path, 38ad60b, now for custom sources).
+    func open(reader: IOReader, formatHint: String? = nil, profile: DemuxerOpenProfile = .playback, isLive: Bool = false) throws {
         self.openProfile = profile
         let bridge = CustomIOReaderBridge(reader: reader)
         let inputFormat: UnsafePointer<AVInputFormat>? = formatHint.flatMap { av_find_input_format($0) }
-        try openWithProvider(bridge, inputFormat: inputFormat)
+        try openWithProvider(bridge, inputFormat: inputFormat, isLive: isLive)
     }
 
     /// Open an HTTP(S) URL via custom AVIO context + URLSession.

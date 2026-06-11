@@ -1175,7 +1175,12 @@ public final class AetherEngine: ObservableObject {
                     // the producer starts reading from it.
                     try probe.open(url: u, extraHeaders: options.httpHeaders, isLive: options.isLive)
                 case .custom(let reader, let formatHint):
-                    try probe.open(reader: reader, formatHint: formatHint)
+                    // Pass isLive so the probe demuxer suppresses the
+                    // SEEK_END duration estimate on a forward-only live
+                    // reader (same reason as the .url arm above). The probe
+                    // demuxer is reused as the session demuxer, so the live
+                    // flag must be set at open time.
+                    try probe.open(reader: reader, formatHint: formatHint, isLive: options.isLive)
                 }
             }.value
             probeOpened = true
@@ -1447,7 +1452,12 @@ public final class AetherEngine: ObservableObject {
         // Forward-only custom sources cannot serve the native path's seeks
         // (cue prewarm, segment seeks). The software path reads strictly
         // forward and decodes every codec, so route them there regardless.
-        if isCustomSource && !probe.isSourceSeekable {
+        // Live custom sources are exempt: the live producer is forward-only
+        // by design and never seeks the source backward, scrub previews come
+        // from the DVR segment cache (not the source reader), and the
+        // audio-switch reload guard below already no-ops for forward-only
+        // custom sources. VOD keeps the SW-only rule.
+        if isCustomSource && !probe.isSourceSeekable && !options.isLive {
             useSoftwarePath = true
             EngineLog.emit("[AetherEngine] custom source is forward-only, forcing software path", category: .engine)
         }
@@ -2747,9 +2757,12 @@ public final class AetherEngine: ObservableObject {
         if isCustomSource, let reader = customReader {
             let hint = customFormatHint
             do {
+                let isLiveReload = loadedOptions.isLive
                 customPreopened = try await Task.detached(priority: .userInitiated) {
                     let d = Demuxer()
-                    try d.open(reader: reader, formatHint: hint)
+                    // isLive preserved across audio-track reload: a live
+                    // custom source must not trigger SEEK_END on reopen.
+                    try d.open(reader: reader, formatHint: hint, isLive: isLiveReload)
                     return d
                 }.value
             } catch {
