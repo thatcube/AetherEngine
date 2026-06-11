@@ -54,7 +54,7 @@ public final class AetherEngine: ObservableObject {
 
     // MARK: - Public State
 
-    @Published public private(set) var state: PlaybackState = .idle
+    @Published public internal(set) var state: PlaybackState = .idle
 
     /// High-frequency playback clock (`currentTime`, `sourceTime`,
     /// live-edge fields). Deliberately a SEPARATE ObservableObject:
@@ -71,7 +71,7 @@ public final class AetherEngine: ObservableObject {
     /// fire on clock ticks).
     public var currentTime: Double { clock.currentTime }
 
-    @Published public private(set) var duration: Double = 0
+    @Published public internal(set) var duration: Double = 0
 
     /// Forwarder; see `clock.progress`.
     public var progress: Float { clock.progress }
@@ -89,8 +89,8 @@ public final class AetherEngine: ObservableObject {
     /// `selectAudioTrack(index:)` reloads the pipeline; the host's
     /// picker reflects what the engine actually muxed rather than the
     /// last optimistic UI write.
-    @Published public private(set) var activeAudioTrackIndex: Int?
-    @Published public private(set) var videoFormat: VideoFormat = .sdr
+    @Published public internal(set) var activeAudioTrackIndex: Int?
+    @Published public internal(set) var videoFormat: VideoFormat = .sdr
 
     /// Source-detected video range as read from the demuxer probe, before
     /// any panel clamping. Differs from `videoFormat` when the panel can't
@@ -107,7 +107,7 @@ public final class AetherEngine: ObservableObject {
     /// Late HDR10+ upgrades from T.35 SEI flip this from `.hdr10` to
     /// `.hdr10Plus` independent of `videoFormat`'s panel guard, because
     /// SEI detection is a source-side fact.
-    @Published public private(set) var sourceVideoFormat: VideoFormat = .sdr
+    @Published public internal(set) var sourceVideoFormat: VideoFormat = .sdr
 
     /// Which internal backend rendered the current session. Resolves
     /// to `.native` for AVPlayer-decodable sources (HEVC, H.264, plus
@@ -116,7 +116,7 @@ public final class AetherEngine: ObservableObject {
     /// libavcodec for VP9, MPEG-4 Part 2, MPEG-2, VC-1). Kept on the
     /// public surface for diagnostic overlays and TestFlight badges;
     /// hosts should not switch on it.
-    @Published public private(set) var playbackBackend: PlaybackBackend = .none
+    @Published public internal(set) var playbackBackend: PlaybackBackend = .none
 
     /// Timer-sampled diagnostics (`liveTelemetry`, 1 Hz). Deliberately
     /// a SEPARATE ObservableObject for the same reason as `clock`: a
@@ -146,7 +146,7 @@ public final class AetherEngine: ObservableObject {
     /// `nil` while no playback session is loaded. Cleared in
     /// `stopInternal` so a new session never inherits the previous
     /// label.
-    @Published public private(set) var activeVideoDecoder: String?
+    @Published public internal(set) var activeVideoDecoder: String?
 
     /// Human-readable identity of the audio pipeline currently in use.
     /// For the native AVPlayer path this reflects what
@@ -158,7 +158,7 @@ public final class AetherEngine: ObservableObject {
     /// For the SW path: `"libavcodec <codec> → CoreAudio"`.
     /// `nil` when the source has no audio, when the cascade fell
     /// through to video-only, or while no session is loaded.
-    @Published public private(set) var activeAudioDecoder: String?
+    @Published public internal(set) var activeAudioDecoder: String?
 
     /// Decoded subtitle cues for the active subtitle source. Populated
     /// by `selectSidecarSubtitle(url:)` only — embedded subtitle
@@ -166,11 +166,11 @@ public final class AetherEngine: ObservableObject {
     /// fMP4 wrapper but aren't decoded back to text on this side yet
     /// (AVMediaSelection wiring is a tracked follow-up). Sidecar SRT
     /// works end-to-end.
-    @Published public private(set) var subtitleCues: [SubtitleCue] = []
+    @Published public internal(set) var subtitleCues: [SubtitleCue] = []
     /// True while a sidecar file is being downloaded + decoded.
-    @Published public private(set) var isLoadingSubtitles: Bool = false
+    @Published public internal(set) var isLoadingSubtitles: Bool = false
     /// True when sidecar subtitles are the active subtitle source.
-    @Published public private(set) var isSubtitleActive: Bool = false
+    @Published public internal(set) var isSubtitleActive: Bool = false
 
     /// True while the active session is a live stream (the host set
     /// `LoadOptions.isLive = true` at load time). Hosts use this to
@@ -212,55 +212,7 @@ public final class AetherEngine: ObservableObject {
     /// index. Tiny LRU (capacity 2) so scrubbing within one segment
     /// reuses the open demux/decode context; torn down in stopInternal
     /// with the rest of the session state.
-    private var liveThumbnailExtractors: [(segmentIndex: Int, extractor: FrameExtractor)] = []
-
-    /// A frame from the live DVR window at `atSessionSeconds` (the
-    /// `seekableLiveRange` timeline), decoded locally from the engine's
-    /// own segment cache: no network, no server round-trip. The session
-    /// time is converted to the raw output timeline via the seam history
-    /// before the segment lookup and the extractor seek, mirroring the
-    /// inverse of the `$currentTime` fold. Returns nil when no native
-    /// live session is active, the time is outside the resident window,
-    /// or decoding fails. Never throws.
-    public func liveScrubThumbnail(atSessionSeconds seconds: Double, maxWidth: Int = 320) async -> CGImage? {
-        guard isLive, let session = nativeVideoSession else { return nil }
-        // Session -> output conversion: the published seekableLiveRange is
-        // output-time + shift (seam-resolved), while the segment table and
-        // the muxed tfdt live on the raw output timeline. Resolve the seam
-        // whose output-domain span contains the converted value, newest
-        // first (mirrors the $currentTime fold, inverted).
-        let outputSeconds: Double
-        if let seam = liveShiftSeams.last(where: { seconds - $0.shift >= $0.activateAt }) {
-            outputSeconds = seconds - seam.shift
-        } else {
-            outputSeconds = seconds - playlistShiftSeconds
-        }
-        let gen = loadGeneration
-        let source = await Task.detached(priority: .userInitiated) { [session] in
-            session.liveScrubThumbnailSource(atSeconds: outputSeconds)
-        }.value
-        guard let source else { return nil }
-        // A zap/stop while the detached read was in flight cleared the
-        // LRU (stopInternal); inserting now would revive a dead-session
-        // extractor whose per-session segment indices collide with the
-        // next channel's, serving frames from the PREVIOUS channel.
-        guard loadGeneration == gen else { return nil }
-        let extractor: FrameExtractor
-        if let idx = liveThumbnailExtractors.firstIndex(where: { $0.segmentIndex == source.segmentIndex }) {
-            // Move hit to the back so it's the last to be evicted (true LRU).
-            let hit = liveThumbnailExtractors.remove(at: idx)
-            liveThumbnailExtractors.append(hit)
-            extractor = hit.extractor
-        } else {
-            extractor = FrameExtractor(reader: DataIOReader(data: source.data), formatHint: "mp4")
-            liveThumbnailExtractors.append((source.segmentIndex, extractor))
-            while liveThumbnailExtractors.count > 2 {
-                let evicted = liveThumbnailExtractors.removeFirst()
-                Task { await evicted.extractor.shutdown() }
-            }
-        }
-        return await extractor.thumbnail(at: outputSeconds, maxWidth: maxWidth)
-    }
+    var liveThumbnailExtractors: [(segmentIndex: Int, extractor: FrameExtractor)] = []
 
     // MARK: - Output
 
@@ -282,7 +234,7 @@ public final class AetherEngine: ObservableObject {
             softwareHost?.displayLayer.videoGravity = newValue
         }
     }
-    private var _videoGravity: AVLayerVideoGravity = .resizeAspect
+    var _videoGravity: AVLayerVideoGravity = .resizeAspect
 
     // MARK: - Capabilities
 
@@ -374,42 +326,42 @@ public final class AetherEngine: ObservableObject {
     /// Engine-owned HDMI HDR handshake controller. Programs
     /// `AVDisplayManager.preferredDisplayCriteria` from the format +
     /// frame rate the demuxer probes; no-op on iOS / macOS.
-    private let displayCriteria = DisplayCriteriaController()
+    let displayCriteria = DisplayCriteriaController()
 
     /// HLS video engine that demuxes the source and serves a
     /// loopback HLS-fMP4 playlist for AVPlayer to consume. Non-nil
     /// between `load` and `stop`.
-    private var nativeVideoSession: HLSVideoEngine?
+    var nativeVideoSession: HLSVideoEngine?
 
     /// The native AVPlayer + AVPlayerLayer host. Non-nil between
     /// `load` and `stop`.
-    private var nativeHost: NativeAVPlayerHost?
+    var nativeHost: NativeAVPlayerHost?
 
     /// Combine subscriptions from `nativeHost`'s @Published into the
     /// engine's own @Published mirrors. Cancelled on stopInternal so
     /// a new session doesn't accumulate them.
-    private var nativeCancellables: Set<AnyCancellable> = []
+    var nativeCancellables: Set<AnyCancellable> = []
 
     /// Software-decode host for codecs AVPlayer cannot decode on the
     /// active platform (today: AV1 on Apple TV, where Apple ships
     /// dav1d on iOS / macOS but not on tvOS and no Apple TV chip has
     /// HW AV1). Non-nil between `load` and `stop` when the source's
     /// video stream routed through the SW pipeline.
-    private var softwareHost: SoftwarePlaybackHost?
+    var softwareHost: SoftwarePlaybackHost?
 
     /// Combine subscriptions from `softwareHost`'s @Published mirrors.
     /// Cancelled on stopInternal alongside `nativeCancellables`.
-    private var softwareCancellables: Set<AnyCancellable> = []
+    var softwareCancellables: Set<AnyCancellable> = []
 
     /// The lean audio-only playback host. Non-nil only while an
     /// audio-only session (music) is active. Mutually exclusive with
     /// `nativeHost` / `softwareHost`: a load tears all of them down via
     /// `stopInternal` before bringing one up.
-    private var audioHost: AudioPlaybackHost?
+    var audioHost: AudioPlaybackHost?
 
     /// Combine subscriptions from `audioHost`'s @Published mirrors into
     /// the engine's own surface. Cleared on stopInternal.
-    private var audioCancellables = Set<AnyCancellable>()
+    var audioCancellables = Set<AnyCancellable>()
 
     /// Native AVPlayer audio host. Created lazily on the first AVPlayer
     /// audio load and then KEPT for the engine's lifetime, reused across
@@ -419,9 +371,9 @@ public final class AetherEngine: ObservableObject {
     /// session each time) prevented the background Siri Remote + system
     /// Now-Playing UI from ever stabilising. `audioAVPlayerActive` gates
     /// whether this host is the CURRENT backend.
-    private var audioAVPlayerHost: AudioAVPlayerHost?
-    private var audioAVPlayerActive = false
-    private var audioNativeCancellables = Set<AnyCancellable>()
+    var audioAVPlayerHost: AudioAVPlayerHost?
+    var audioAVPlayerActive = false
+    var audioNativeCancellables = Set<AnyCancellable>()
 
     /// Periodic memory diagnostic. Emits the process's resident memory
     /// footprint and engine-internal counters every 30 s so we can
@@ -433,14 +385,14 @@ public final class AetherEngine: ObservableObject {
     ///
     /// On macOS / aetherctl the line goes to stdout; on tvOS it goes to
     /// `EngineLog.handler` so the host's diagnostic overlay sees it too.
-    private var memoryProbeTask: Task<Void, Never>?
+    var memoryProbeTask: Task<Void, Never>?
 
     /// 1 Hz live-telemetry sampler. Mirrors the lifecycle of
     /// `memoryProbeTask`: started when the engine enters `.playing`
     /// (load completes) and torn down in `stopInternal`. The sampler
     /// holds a weak reference back to the engine so its retained task
     /// can't keep `self` alive past teardown.
-    private var liveTelemetrySampler: LiveTelemetrySampler?
+    var liveTelemetrySampler: LiveTelemetrySampler?
 
     /// DVR / live window tracker. Non-nil for ANY live session (both the
     /// native and software-decode paths construct it at load). Its
@@ -449,14 +401,14 @@ public final class AetherEngine: ObservableObject {
     /// requested. Updated by `publishLiveWindow`, which both the native
     /// time tick and the SW host's edge callback drive; the published
     /// live surfaces above reflect its state.
-    private var liveWindow: LiveWindow?
+    var liveWindow: LiveWindow?
 
     /// The URL of the current playback session. Used by
     /// `reloadAtCurrentPosition()` to rebuild the pipeline after
     /// background suspension.
     // Internal getter (not public API): read by the same-module
     // AetherEngine+FrameExtractor extension to vend a FrameExtractor.
-    private(set) var loadedURL: URL?
+    var loadedURL: URL?
 
     /// True when the active source is a custom `IOReader` (loaded via
     /// `load(source: .custom(...))`). Such a source has no URL: `loadedURL`
@@ -495,14 +447,14 @@ public final class AetherEngine: ObservableObject {
     /// producer init / restart (matroska seek imprecision means the
     /// shift can differ session-to-session for the same source).
     /// 0 on the SW / audio paths, whose clocks track source PTS directly.
-    @Published public private(set) var playlistShiftSeconds: Double = 0
+    @Published public internal(set) var playlistShiftSeconds: Double = 0
 
     /// Raw AVPlayer HLS clock (`source_pts - playlistShiftSeconds`) on the
     /// native path, before the shift is folded back into `currentTime`.
     /// Held so `onPlaylistShiftChanged` can re-derive `currentTime` the
     /// instant the shift changes mid-session, instead of waiting for the
     /// next periodic time tick. Unused on the SW / audio paths (shift 0).
-    private var nativeClockSeconds: Double = 0
+    var nativeClockSeconds: Double = 0
 
     /// Monotonic load/stop generation. Bumped by every `stopInternal`
     /// (which runs at the head of every `load()`, `stop()`, and audio
@@ -516,13 +468,13 @@ public final class AetherEngine: ObservableObject {
     /// SHARED native host's item out from under it, and could resurrect
     /// playback after dismissal. A superseded load now unwinds with
     /// `CancellationError` at the first checkpoint.
-    private var loadGeneration: UInt64 = 0
+    var loadGeneration: UInt64 = 0
 
     /// Throw when the captured generation is stale (a newer load/stop
     /// owns the engine). Callers clean up their LOCAL resources before
     /// calling; shared state belongs to the successor and must not be
     /// touched on the unwind path.
-    private func checkLoadCurrent(_ gen: UInt64) throws {
+    func checkLoadCurrent(_ gen: UInt64) throws {
         guard loadGeneration == gen else {
             EngineLog.emit(
                 "[AetherEngine] load superseded (gen \(gen) -> \(loadGeneration)); unwinding",
@@ -544,7 +496,7 @@ public final class AetherEngine: ObservableObject {
     /// The baseline entry (activateAt -infinity) is seeded by the
     /// gate-open / restart shift. Cleared on every load/stop; capped in
     /// the append handler.
-    private var liveShiftSeams: [(activateAt: Double, shift: Double)] = []
+    var liveShiftSeams: [(activateAt: Double, shift: Double)] = []
 
     /// 1 Hz live-window publisher, independent of playback ticks. The
     /// `$currentTime` sink only fires while AVPlayer's periodic time
@@ -555,23 +507,7 @@ public final class AetherEngine: ObservableObject {
     /// scrub issued while paused seeks against a stale edge. The edge is
     /// reachable while paused via `host.seekableEnd` (AVPlayer keeps
     /// reloading the live playlist during a pause).
-    private var liveWindowTimerTask: Task<Void, Never>?
-
-    /// Drive the live surfaces at 1 Hz for the lifetime of a native live
-    /// session. Replaces nothing: the `$currentTime` sink still publishes
-    /// on every playback tick; this covers the paused case.
-    private func startLiveWindowTimer(host: NativeAVPlayerHost) {
-        liveWindowTimerTask?.cancel()
-        guard isLive else { return }
-        liveWindowTimerTask = Task { [weak self, weak host] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                guard let self, let host else { return }
-                guard self.isLive else { continue }
-                self.publishLiveWindow(edgeSessionTime: host.seekableEnd + self.playlistShiftSeconds)
-            }
-        }
-    }
+    var liveWindowTimerTask: Task<Void, Never>?
 
     /// Source PTS of the currently displayed frame. Equal to `currentTime`
     /// on every path now that the native clock is unified onto source time;
@@ -597,7 +533,7 @@ public final class AetherEngine: ObservableObject {
     /// In-flight sidecar subtitle decode. Cancelled on subtitle
     /// clear / track switch so a stale decode can't overwrite fresh
     /// cues.
-    private var sidecarTask: Task<Void, Never>?
+    var sidecarTask: Task<Void, Never>?
 
     /// In-flight embedded-subtitle reader Task. Runs a side Demuxer
     /// against the same source URL, seeked to the current playhead,
@@ -607,12 +543,12 @@ public final class AetherEngine: ObservableObject {
     /// packets near the visible time have already been read and
     /// discarded). Cancelled + restarted on track change, on
     /// `clearSubtitle`, on `seek`, and on `stop`.
-    private var embeddedSubtitleTask: Task<Void, Never>?
+    var embeddedSubtitleTask: Task<Void, Never>?
 
     /// Active embedded subtitle stream index, or -1 for none. Used by
     /// `seek` to know whether to re-arm the side demuxer at the new
     /// playback position.
-    private var activeEmbeddedSubtitleStreamIndex: Int32 = -1
+    var activeEmbeddedSubtitleStreamIndex: Int32 = -1
 
     /// Source video dimensions captured at `load()` probe time. The
     /// embedded subtitle decoder uses these as a canvas-size fallback
@@ -638,7 +574,7 @@ public final class AetherEngine: ObservableObject {
     /// reused by the audio-track-switch reload path so it can re-derive
     /// the same `activeVideoDecoder` label without re-running the
     /// demuxer probe. Reset to `AV_CODEC_ID_NONE` in `stopInternal`.
-    private var lastDetectedVideoCodec: AVCodecID = AV_CODEC_ID_NONE
+    var lastDetectedVideoCodec: AVCodecID = AV_CODEC_ID_NONE
 
     /// Probe demuxer of the CURRENTLY RUNNING load(), registered before the
     /// (detached, potentially minutes-blocking) open and cleared when load()
@@ -652,12 +588,12 @@ public final class AetherEngine: ObservableObject {
     /// `markClosed()` it: Task cancellation alone is only observed
     /// between `readPacket` calls and a read blocked in the AVIO
     /// reconnect loop otherwise survives stop()/track switches.
-    private var activeSubtitleSideDemuxer: Demuxer?
+    var activeSubtitleSideDemuxer: Demuxer?
 
     /// Cap the per-session subtitle event diagnostic logs so the in-
     /// app overlay stays readable. Reset on `load()` so each new
     /// session gets a fresh budget.
-    private var subtitleCueDiagnosticCount: Int = 0
+    var subtitleCueDiagnosticCount: Int = 0
 
     /// How far behind `currentTime` to retain old subtitle cues
     /// before pruning them out of `subtitleCues`. Bounds the
@@ -672,7 +608,7 @@ public final class AetherEngine: ObservableObject {
     /// before that get re-emitted after a producer restart: the side
     /// reader task restarts alongside it and instantiates a FRESH
     /// `EmbeddedSubtitleDecoder`, so the dedupe set starts empty.
-    private let subtitleCueRetentionSeconds: Double = 300
+    let subtitleCueRetentionSeconds: Double = 300
 
     /// How far past the playhead (source-PTS seconds) the embedded-
     /// subtitle side demuxer may read before parking. Without this
@@ -691,7 +627,7 @@ public final class AetherEngine: ObservableObject {
     /// and TCP backpressure (the 16 MB window high-water) pauses the
     /// transfer server-side, so the second connection throttles to
     /// playback rate instead of line rate.
-    nonisolated private static let embeddedSubtitleReadAheadSeconds: Double = 90
+    nonisolated static let embeddedSubtitleReadAheadSeconds: Double = 90
 
     // MARK: - Init
 
@@ -753,255 +689,6 @@ public final class AetherEngine: ObservableObject {
         #endif
 
         setupLifecycleObservers()
-    }
-
-    // MARK: - Probe
-
-    /// One-shot read of a source's container + stream metadata,
-    /// without spinning up the HLS server or any decoders. Returns
-    /// the same kind of info `load(url:)` collects internally before
-    /// dispatching, packaged as a `SourceProbe` for hosts and CLI
-    /// tools that just want to know "what's in this file?".
-    ///
-    /// Network sources fetch a HEAD probe + a small initial range
-    /// for libavformat's stream info pass; total bytes pulled depend
-    /// on the container but typically a few MB. File sources read
-    /// from disk directly via FFmpeg's file protocol.
-    ///
-    /// - Parameters:
-    ///   - url: Media source (`file://`, `http://`, or `https://`).
-    ///   - options: Forwarded for `httpHeaders` only; other flags are
-    ///     ignored since no playback session starts.
-    /// - Throws: Any error the demuxer raises during open / probe.
-    public nonisolated static func probe(
-        url: URL,
-        options: LoadOptions = .init()
-    ) throws -> SourceProbe {
-        try probe(source: .url(url), options: options)
-    }
-
-    /// `probe(url:)` for a custom byte source (AetherEngine#27). Same
-    /// one-shot metadata read, but against a caller-supplied
-    /// `IOReader` instead of a URL.
-    ///
-    /// Reader contract: the caller retains ownership. The probe seeks
-    /// and reads through the reader for libavformat's stream-info
-    /// pass and leaves the cursor at an unspecified position; it does
-    /// NOT call `close()`. Hand the engine a fresh reader (or one you
-    /// rewind yourself) when you `load(source:)` afterwards. For the
-    /// `.url` case this is exactly `probe(url:)`.
-    ///
-    /// `SourceProbe.url` echoes the probed URL for `.url` sources and
-    /// the synthetic `aether-custom://source` for custom readers
-    /// (mirroring what `load(source:)` publishes as `loadedURL`).
-    public nonisolated static func probe(
-        source: MediaSource,
-        options: LoadOptions = .init()
-    ) throws -> SourceProbe {
-        let demuxer = Demuxer()
-        let displayURL: URL
-        switch source {
-        case .url(let u):
-            try demuxer.open(url: u, extraHeaders: options.httpHeaders)
-            displayURL = u
-        case .custom(let reader, let formatHint):
-            try demuxer.open(reader: reader, formatHint: formatHint)
-            displayURL = URL(string: "aether-custom://source")!
-        }
-        defer { demuxer.close() }
-        return makeSourceProbe(demuxer: demuxer, displayURL: displayURL)
-    }
-
-    /// Assemble a `SourceProbe` from an open demuxer. Shared by the
-    /// static probe entry points and `load(source:)`'s internal probe
-    /// stage, so all of them report identical metadata for the same
-    /// source.
-    private nonisolated static func makeSourceProbe(
-        demuxer: Demuxer,
-        displayURL: URL
-    ) -> SourceProbe {
-        var detectedFormat: VideoFormat = .sdr
-        var detectedRate: Double? = nil
-        var detectedCodecID: AVCodecID = AV_CODEC_ID_NONE
-        var width: Int32 = 0
-        var height: Int32 = 0
-        let videoIdx = demuxer.videoStreamIndex
-        if videoIdx >= 0, let stream = demuxer.stream(at: videoIdx) {
-            detectedFormat = Self.detectVideoFormat(stream: stream)
-            detectedRate = Self.detectFrameRate(stream: stream)
-            detectedCodecID = stream.pointee.codecpar.pointee.codec_id
-            width = stream.pointee.codecpar.pointee.width
-            height = stream.pointee.codecpar.pointee.height
-        }
-        let codecName: String? = {
-            guard detectedCodecID != AV_CODEC_ID_NONE,
-                  let cstr = avcodec_get_name(detectedCodecID) else { return nil }
-            return String(cString: cstr)
-        }()
-        let snappedRate = detectedRate.flatMap { FrameRateSnap.snap($0) }
-        let duration = demuxer.duration
-        // Live-stream hint: duration absent + network-feed URL scheme.
-        // Heuristic only; hosts decide whether to flip
-        // LoadOptions.isLive based on this plus their own context
-        // (e.g. an IPTV catalog entry vs a movie file). Custom readers
-        // (synthetic aether-custom:// scheme) never match.
-        let liveSchemes: Set<String> = ["http", "https", "udp", "rtp", "rtsp"]
-        let isLive = duration <= 0
-            && liveSchemes.contains(displayURL.scheme?.lowercased() ?? "")
-
-        return SourceProbe(
-            url: displayURL,
-            durationSeconds: duration,
-            videoFormat: detectedFormat,
-            videoCodecID: Int32(bitPattern: detectedCodecID.rawValue),
-            videoCodecName: codecName,
-            videoWidth: width,
-            videoHeight: height,
-            videoFrameRate: snappedRate,
-            isDolbyVision: detectedFormat == .dolbyVision,
-            audioTracks: demuxer.audioTrackInfos(),
-            subtitleTracks: demuxer.subtitleTrackInfos(),
-            metadata: demuxer.mediaMetadata(),
-            isLive: isLive
-        )
-    }
-
-    // MARK: - SW-decoder repro probe
-
-    /// One-shot SW-decoder repro for `aetherctl swdecode` and any
-    /// future host-side diagnostic that wants to localise SW-pipeline
-    /// failures (MPEG-4 Part 2, MPEG-2, VC-1, AV1 on platforms without
-    /// HW AV1) without spinning up a render target.
-    ///
-    /// Opens the demuxer, opens `SoftwareVideoDecoder` for the video
-    /// stream, reads up to `maxPackets` packets and feeds the video
-    /// ones to the decoder, returns counters + first-frame metadata.
-    /// Useful failure modes the result discriminates:
-    ///
-    /// - `openSucceeded == false`: decoder couldn't open (FFmpegBuild
-    ///   missing the libavcodec decoder, codec-private extradata
-    ///   malformed). `openError` carries the reason.
-    /// - `openSucceeded == true && framesDecoded == 0`: decoder
-    ///   opened but never produced a frame from the packets fed.
-    ///   Suggests pixel-format conversion failure or all-skipped
-    ///   non-IDR packets.
-    /// - `framesDecoded > 0` with a populated `firstFramePixelFormat`:
-    ///   SW decode path is functionally healthy end-to-end; if real
-    ///   playback still hangs, the failure is downstream
-    ///   (`SoftwarePlaybackHost` frame-enqueue, `AVSampleBufferDisplayLayer`
-    ///   attach, audio-clock sync).
-    public nonisolated static func swDecodeProbe(
-        url: URL,
-        maxPackets: Int = 100,
-        options: LoadOptions = .init()
-    ) throws -> SoftwareDecodeProbeResult {
-        let demuxer = Demuxer()
-        try demuxer.open(url: url, extraHeaders: options.httpHeaders)
-        defer { demuxer.close() }
-
-        let videoIdx = demuxer.videoStreamIndex
-        guard videoIdx >= 0, let stream = demuxer.stream(at: videoIdx) else {
-            throw AetherEngineError.noVideoStream
-        }
-
-        let codecID = stream.pointee.codecpar.pointee.codec_id
-        let codecName: String = {
-            guard let cstr = avcodec_get_name(codecID) else { return "unknown" }
-            return String(cString: cstr)
-        }()
-        let width = stream.pointee.codecpar.pointee.width
-        let height = stream.pointee.codecpar.pointee.height
-
-        let decoder = SoftwareVideoDecoder()
-        // Captured-by-reference accumulators via a class so the onFrame
-        // closure can mutate them safely without inout / @escaping
-        // capture gymnastics. Closure fires synchronously from inside
-        // avcodec_send_packet / receive_frame, all on this thread.
-        final class Accum {
-            var framesDecoded = 0
-            var firstFramePixelFormat: String?
-            var firstFrameWidth: Int = 0
-            var firstFrameHeight: Int = 0
-        }
-        let accum = Accum()
-
-        do {
-            try decoder.open(stream: stream) { pixelBuffer, _, _ in
-                accum.framesDecoded += 1
-                if accum.firstFramePixelFormat == nil {
-                    let pfType = CVPixelBufferGetPixelFormatType(pixelBuffer)
-                    let bytes: [UInt8] = [
-                        UInt8((pfType >> 24) & 0xff),
-                        UInt8((pfType >> 16) & 0xff),
-                        UInt8((pfType >> 8) & 0xff),
-                        UInt8(pfType & 0xff),
-                    ]
-                    let printable = bytes.map { ($0 >= 0x20 && $0 < 0x7f) ? $0 : 0x2e }
-                    let fourCC = String(bytes: printable, encoding: .ascii) ?? "????"
-                    accum.firstFramePixelFormat = "\(fourCC) (0x\(String(pfType, radix: 16)))"
-                    accum.firstFrameWidth = CVPixelBufferGetWidth(pixelBuffer)
-                    accum.firstFrameHeight = CVPixelBufferGetHeight(pixelBuffer)
-                }
-            }
-        } catch {
-            return SoftwareDecodeProbeResult(
-                codecName: codecName,
-                codecID: Int32(bitPattern: codecID.rawValue),
-                width: width,
-                height: height,
-                openSucceeded: false,
-                openError: "\(error)",
-                packetsRead: 0,
-                packetsFedToDecoder: 0,
-                framesDecoded: 0,
-                firstFramePixelFormat: nil,
-                firstFrameWidth: 0,
-                firstFrameHeight: 0,
-                firstError: "decoder open failed: \(error)"
-            )
-        }
-        defer { decoder.close() }
-
-        var packetsRead = 0
-        var packetsFedToDecoder = 0
-        var firstError: String?
-
-        while packetsRead < maxPackets, accum.framesDecoded < maxPackets {
-            do {
-                guard let packet = try demuxer.readPacket() else {
-                    break  // EOF
-                }
-                packetsRead += 1
-                if packet.pointee.stream_index == videoIdx {
-                    packetsFedToDecoder += 1
-                    decoder.decode(packet: packet)
-                }
-                av_packet_unref(packet)
-                av_packet_free_safe(packet)
-            } catch {
-                if firstError == nil {
-                    firstError = "\(error)"
-                }
-                break
-            }
-        }
-        decoder.flush()
-
-        return SoftwareDecodeProbeResult(
-            codecName: codecName,
-            codecID: Int32(bitPattern: codecID.rawValue),
-            width: width,
-            height: height,
-            openSucceeded: true,
-            openError: nil,
-            packetsRead: packetsRead,
-            packetsFedToDecoder: packetsFedToDecoder,
-            framesDecoded: accum.framesDecoded,
-            firstFramePixelFormat: accum.firstFramePixelFormat,
-            firstFrameWidth: accum.firstFrameWidth,
-            firstFrameHeight: accum.firstFrameHeight,
-            firstError: firstError
-        )
     }
 
     // MARK: - Public load
@@ -1629,680 +1316,6 @@ public final class AetherEngine: ObservableObject {
         return sourceProbe
     }
 
-    /// Open HLSVideoEngine against the source, wire NativeAVPlayerHost
-    /// to its loopback URL, forward host @Published into the engine's
-    /// own published mirrors. `audioSourceStreamIndex` overrides the
-    /// auto-picked audio stream when non-nil; used by the mid-playback
-    /// audio-track-switch path so the new pipeline picks up the host's
-    /// chosen language without a separate API entry point.
-    /// Lean native-HLS live path: build an `AVPlayerItem` from the remote
-    /// URL on the (reused) `NativeAVPlayerHost` and wire its @Published
-    /// mirrors into the engine surface. No Demuxer, no HLSVideoEngine, no
-    /// producer, no loopback server, no display-criteria handshake (AVKit
-    /// drives match-content for the AVPlayerViewController). The live-window
-    /// surfaces are published off `host.seekableEnd`, which reflects the
-    /// remote HLS playlist's seekable range. Mirrors `loadNative`'s host +
-    /// publisher wiring, minus everything loopback-specific.
-    private func loadRemoteHLS(url: URL, options: LoadOptions) async throws {
-        playbackBackend = .native
-
-        let host: NativeAVPlayerHost
-        if let existing = nativeHost {
-            host = existing
-        } else {
-            host = NativeAVPlayerHost()
-        }
-        host.playerLayer.videoGravity = _videoGravity
-        if !pendingExternalMetadata.isEmpty {
-            host.setExternalMetadata(pendingExternalMetadata)
-        }
-        self.nativeHost = host
-        // No producer on this path, so the playhead carries the AVPlayer
-        // clock directly (no source-PTS fold). Keep the shift at 0.
-        self.playlistShiftSeconds = 0
-        self.liveShiftSeams.removeAll()
-        if currentAVPlayer !== host.avPlayer {
-            self.currentAVPlayer = host.avPlayer
-        }
-
-        nativeCancellables.removeAll()
-        host.$currentTime
-            .sink { [weak self] value in
-                guard let self = self else { return }
-                self.nativeClockSeconds = value
-                self.clock.currentTime = value
-                self.clock.sourceTime = value
-                if self.isLive {
-                    self.publishLiveWindow(edgeSessionTime: host.seekableEnd)
-                }
-            }
-            .store(in: &nativeCancellables)
-        startLiveWindowTimer(host: host)
-        host.$duration
-            .sink { [weak self] value in
-                if value > 0 { self?.duration = value }
-            }
-            .store(in: &nativeCancellables)
-        // Intentionally do NOT flip to .paused on readiness for this path.
-        // The live autostart has already called host.play(), so readyToPlay
-        // is just a waypoint to .playing: the AVPlayer item is ready but is
-        // still filling its initial buffer (the Jellyfin live transcode
-        // spin-up can leave it in waitingToPlay for ~10 s AFTER readiness).
-        // Flipping to .paused here would drop the host's loading spinner and
-        // show a black 'paused' frame for that whole window. The
-        // timeControlStatus sink below instead holds .loading until AVPlayer
-        // actually renders, then flips to .playing.
-        host.$failureMessage
-            .compactMap { $0 }
-            .sink { [weak self] msg in self?.state = .error(msg) }
-            .store(in: &nativeCancellables)
-        host.$didReachEnd
-            .filter { $0 }
-            .sink { [weak self] _ in self?.state = .idle }
-            .store(in: &nativeCancellables)
-        // Drive the host's loading/playing UI off AVPlayer's REAL transport
-        // state. Critical for live: the stream stays in .loading (spinner up)
-        // through the whole transcode spin-up + initial buffer, and only
-        // reaches .playing when AVPlayer genuinely starts rendering. Setting
-        // state = .playing eagerly at load() time (as a prior revision did)
-        // dropped the spinner immediately and showed a ~10 s black screen
-        // while AVPlayer was still in waitingToPlay.
-        host.$timeControlStatus
-            .sink { [weak self] status in
-                guard let self = self else { return }
-                // .error / .idle are terminal; don't resurrect them.
-                if case .error = self.state { return }
-                if self.state == .idle { return }
-                switch status {
-                case .playing:
-                    if self.state != .playing { self.state = .playing }
-                case .waitingToPlayAtSpecifiedRate:
-                    // Bringing the stream up, or a mid-playback rebuffer.
-                    // Hold .loading so the spinner shows during startup; once
-                    // playback has begun the host treats .loading as a no-op
-                    // for the full-screen spinner (hasStartedPlaying gate).
-                    if self.state != .playing { self.state = .loading }
-                case .paused:
-                    // Only an explicit pause after playback began. The
-                    // transient pre-roll paused at load (state == .loading)
-                    // must not be mistaken for a user pause.
-                    if self.state == .playing { self.state = .paused }
-                @unknown default:
-                    break
-                }
-            }
-            .store(in: &nativeCancellables)
-
-        // Start at AVPlayer's natural live edge (skipInitialSeek). AVPlayer
-        // hits the remote server directly here (not the loopback); the
-        // Jellyfin HLS URL carries its own auth (ApiKey / PlaySessionId /
-        // LiveStreamId) as query params, so no extra HTTP headers are needed.
-        host.load(url: url,
-                  startPosition: nil,
-                  perFrameHDR: true,
-                  skipInitialSeek: true,
-                  // System-adaptive buffering for fast live startup. The
-                  // 4 s VOD floor forced a 3-4 s black screen pulling the
-                  // buffer from the remote Jellyfin transcode before play.
-                  forwardBufferDuration: 0)
-
-        // Self-start playback. The VOD native path triggers play() at the
-        // tail of load() (after loadNative returns + the display-criteria
-        // handshake); this lean path early-returns from load() before that
-        // code, so it must start the AVPlayer itself. No criteria handshake
-        // here: AVKit drives match-content from the live AVPlayerItem on the
-        // AVPlayerViewController. AVPlayer's `automaticallyWaitsToMinimize-
-        // Stalling = true` handles "play before ready" — it sits in
-        // `waitingToPlayAtSpecifiedRate`, buffers the first segments, then
-        // plays. Without this the item loads to `readyToPlay` but stays at
-        // `timeControlStatus == .paused` (one frame, never advances).
-        //
-        // State is left at .loading (set by load() before dispatch). It flips
-        // to .playing only when the timeControlStatus sink sees AVPlayer
-        // actually rendering, so the host keeps its loading spinner up through
-        // the transcode spin-up instead of showing a premature black screen.
-        host.play()
-        startMemoryProbe()
-        // No startLiveTelemetrySampler() here, deliberately: the sampler's
-        // counters all read the loopback pipeline (demuxer / producer /
-        // cache / server), none of which exists on this AVPlayer-direct
-        // bypass. Its fields are nil-safe, but a sampler emitting all-zero
-        // rows would only mislead.
-    }
-
-    private func loadNative(
-        url: URL,
-        sourceHTTPHeaders: [String: String] = [:],
-        startPosition: Double?,
-        audioSourceStreamIndex: Int32? = nil,
-        keepDvh1TagWithoutDV: Bool = false,
-        matchContentEnabled: Bool = true,
-        panelIsInHDRMode: Bool = false,
-        audioBridgeMode: AudioBridgeMode = .surroundCompat,
-        isLive: Bool = false,
-        dvrWindowSeconds: Double? = nil,
-        preopenedDemuxer: Demuxer? = nil,
-        generation: UInt64
-    ) async throws {
-        // Upstream cadence hint for ingest sessions (nil for URL sources).
-        // Safe to read here: the load probe's demuxer open blocked on the
-        // reader's first bytes, and HLSLiveIngestReader publishes its
-        // upstreamTargetDuration before any segment byte enters the FIFO
-        // (see the ordering guarantee on that property), so by the time
-        // loadNative runs the value is set for any reader that knows it.
-        // HLSVideoEngine derives the playlist shaping (blocking-reload
-        // eligibility, TARGETDURATION floor) from the hint itself.
-        let liveSourceCadenceHint = (customReader as? LiveIngestSourceInfo)?.upstreamTargetDuration
-        let session = HLSVideoEngine(
-            url: url,
-            sourceHTTPHeaders: sourceHTTPHeaders,
-            dvModeAvailable: Self.displayCapabilities.supportsDolbyVision,
-            displaySupportsHDR: Self.displayCapabilities.supportsHDR,
-            keepDvh1TagWithoutDV: keepDvh1TagWithoutDV,
-            matchContentEnabled: matchContentEnabled,
-            panelIsInHDRMode: panelIsInHDRMode,
-            audioSourceStreamIndexOverride: audioSourceStreamIndex,
-            initialPositionSeconds: startPosition,
-            audioBridgeMode: audioBridgeMode,
-            isLiveSession: isLive,
-            dvrWindowSeconds: dvrWindowSeconds,
-            liveSourceCadenceHint: liveSourceCadenceHint,
-            preopenedDemuxer: preopenedDemuxer,
-            sourceReopenableByURL: !isCustomSource
-        )
-        session.onFirstHDR10PlusDetected = { [weak self] in
-            Task { @MainActor in self?.handleHDR10PlusDetected() }
-        }
-        session.onPlaylistShiftChanged = { [weak self] seconds in
-            Task { @MainActor in
-                guard let self = self else { return }
-                self.playlistShiftSeconds = seconds
-                // Gate-open / restart shift = the session baseline of the
-                // seam history (valid from the beginning of the output
-                // timeline). Boundary seams append after it.
-                self.liveShiftSeams = [(activateAt: -.infinity, shift: seconds)]
-                // Re-fold against the raw clock so the published source-PTS
-                // currentTime tracks the new shift immediately (e.g. after a
-                // restart that landed past the planned keyframe), rather than
-                // lagging until the next periodic time tick.
-                self.clock.currentTime = self.nativeClockSeconds + seconds
-                self.clock.sourceTime = self.currentTime
-            }
-        }
-        session.onPlaylistShiftRebased = { [weak self] seconds, seamOutputSeconds in
-            Task { @MainActor in
-                guard let self = self else { return }
-                // Live program boundary: the producer rebased its timeline,
-                // but AVPlayer is still rendering ~buffer + holdback of OLD
-                // program. Record the seam and let the $currentTime sink
-                // resolve the active shift from the history, so the
-                // published currentTime/sourceTime never jump ahead of what
-                // is actually on screen, and a backward DVR seek across a
-                // crossed seam folds with the pre-seam shift again. Seams
-                // append in output-timeline order by construction (the
-                // continuation dts is monotonic even for backward source
-                // jumps).
-                self.liveShiftSeams.append(
-                    (activateAt: seamOutputSeconds, shift: seconds)
-                )
-                if self.liveShiftSeams.count > 64 {
-                    // Bound the history; dropping the oldest only loses
-                    // shift fidelity for DVR positions older than 60+
-                    // program boundaries, far outside any real window.
-                    self.liveShiftSeams.removeFirst(self.liveShiftSeams.count - 64)
-                }
-            }
-        }
-        session.onLiveSourceReset = { [weak self, weak session] in
-            Task { @MainActor in
-                // A stale session (superseded by a zap) must not trigger a
-                // retune of whatever is playing now.
-                guard let self, let session,
-                      self.nativeVideoSession === session else { return }
-                self.liveSourceReset.send()
-            }
-        }
-        // AVPlayer HLS playback over the loopback HTTP server. Detach
-        // the synchronous network I/O inside `session.start()` (opens
-        // its own Demuxer + prewarm seek = another ~1-3 s on slow CDN)
-        // so the @MainActor doesn't block. See the probe-detach comment
-        // above for the rationale.
-        let playbackURL = try await Task.detached(priority: .userInitiated) { [session] in
-            try session.start()
-        }.value
-        // Superseded while the session was starting? The session is this
-        // load's local: stop it (its teardown detaches internally) and
-        // unwind before touching the shared host or registering it.
-        if loadGeneration != generation {
-            session.stop()
-            try checkLoadCurrent(generation)
-        }
-        self.nativeVideoSession = session
-
-        // Reuse the existing native host across a native->native reload
-        // (episode change, audio-track switch) so the AVPlayer instance,
-        // and AVKit's MediaRemote system Now-Playing registration bound to
-        // it, survives the seam. Building a fresh AVPlayer here makes AVKit
-        // fail to re-register ("Code=14 client callback") and the iPhone
-        // Control Center widget goes blank (issue #15). stopInternal kept
-        // the host alive (keepNativeHost) and unloaded its old item; a
-        // brand-new host is built only on a cold load or after a
-        // native->SW transition released the previous one.
-        let host: NativeAVPlayerHost
-        if let existing = nativeHost {
-            host = existing
-        } else {
-            host = NativeAVPlayerHost()
-        }
-        host.playerLayer.videoGravity = _videoGravity
-        // Replay any pre-load externalMetadata onto the host so its
-        // AVPlayerItem picks it up before AVPlayer assigns the item. Hosts
-        // that called `engine.setExternalMetadata` before `engine.load`
-        // rely on this transfer.
-        if !pendingExternalMetadata.isEmpty {
-            host.setExternalMetadata(pendingExternalMetadata)
-        }
-        self.nativeHost = host
-        // Publish before wiring up the @Published mirrors below so any host
-        // that subscribes via the same Combine sink sees the AVPlayer
-        // instance before the first time / state update lands. Only emit
-        // when the instance actually changed: re-publishing the same player
-        // would drive the host's currentAVPlayer sink to reassign
-        // AVPlayerViewController.player to the same instance, re-triggering
-        // the exact AVKit re-registration this reuse path exists to avoid.
-        if currentAVPlayer !== host.avPlayer {
-            self.currentAVPlayer = host.avPlayer
-        }
-
-        nativeCancellables.removeAll()
-        host.$currentTime
-            .sink { [weak self] value in
-                guard let self = self else { return }
-                // Fold the producer's shift into the published clock so
-                // currentTime carries source PTS, unifying it with the
-                // SW / audio paths. nativeClockSeconds keeps the raw value
-                // for onPlaylistShiftChanged to re-derive against.
-                self.nativeClockSeconds = value
-                // Resolve the shift for the playhead's position from the
-                // seam history (see onPlaylistShiftRebased above): newest
-                // seam at or before the raw clock wins, so forward
-                // playback activates seams as they're crossed AND a
-                // backward DVR seek re-applies the pre-seam shift.
-                if let active = self.liveShiftSeams.last(where: { value >= $0.activateAt }) {
-                    self.playlistShiftSeconds = active.shift
-                }
-                self.clock.currentTime = value + self.playlistShiftSeconds
-                self.clock.sourceTime = self.currentTime
-                // Live: publish the DVR window surfaces on every tick. The
-                // edge must sit on the SAME session axis as the playhead. The
-                // playhead is folded as host.currentTime + playlistShiftSeconds
-                // above, so the edge (host.seekableEnd in the AVPlayer clock)
-                // folds the same way: seekableEnd + playlistShiftSeconds. Using
-                // the opposite sign would put edge and playhead on different
-                // axes and behindLiveSeconds would be meaningless.
-                if self.isLive {
-                    self.publishLiveWindow(edgeSessionTime: host.seekableEnd + self.playlistShiftSeconds)
-                }
-            }
-            .store(in: &nativeCancellables)
-        startLiveWindowTimer(host: host)
-        host.$duration
-            .sink { [weak self] value in
-                if value > 0 { self?.duration = value }
-            }
-            .store(in: &nativeCancellables)
-        host.$isReady
-            .sink { [weak self] ready in
-                guard let self = self else { return }
-                if ready, self.state == .loading {
-                    self.state = .paused
-                }
-            }
-            .store(in: &nativeCancellables)
-        host.$failureMessage
-            .compactMap { $0 }
-            .sink { [weak self] msg in self?.state = .error(msg) }
-            .store(in: &nativeCancellables)
-        host.$didReachEnd
-            .filter { $0 }
-            .sink { [weak self] _ in
-                // AVPlayer reached end-of-stream. Flip to .idle so the
-                // host's end-of-content flow fires.
-                self?.state = .idle
-            }
-            .store(in: &nativeCancellables)
-        host.$timeControlStatus
-            .sink { [weak self] status in
-                guard let self = self else { return }
-                // Reconcile `state` when something other than the engine's
-                // own play()/pause() drives the AVPlayer: AVKit's transport
-                // bar (kept active for Control Center skip routing), CC's
-                // play/pause, or the hardware play/pause button AVKit handles
-                // internally. Without this `state` goes stale and the host's
-                // togglePlayPause() resolves to a no-op (swallowed press).
-                // Only reconcile between the two steady transport states;
-                // never clobber loading/seeking/error/idle.
-                // `.waitingToPlayAtSpecifiedRate` is a buffer stall while the
-                // user still intends to play, so it maps to .playing and the
-                // play/pause icon doesn't flicker on a rebuffer.
-                guard self.state == .playing || self.state == .paused else { return }
-                switch status {
-                case .paused:
-                    if self.state != .paused { self.state = .paused }
-                case .playing, .waitingToPlayAtSpecifiedRate:
-                    if self.state != .playing { self.state = .playing }
-                @unknown default:
-                    break
-                }
-            }
-            .store(in: &nativeCancellables)
-
-        // appliesPerFrameHDRDisplayMetadata = true unconditionally.
-        // The earlier `session.servingMasterPlaylist` gating was a
-        // speculative memory-leak mitigation (~3 MB/sec RSS growth on
-        // long DV 8.1 sessions, never measurement-validated). DrHurt #4
-        // 2026-05-26 correctly flagged that DV Profile 5 is pure DV with
-        // no HDR10 base layer — the per-frame DV RPU is what AVPlayer's
-        // tone-mapper needs to render anything at all on a non-DV panel
-        // routed via the media playlist (`dv5OnSdrLockedNonDVPanel`
-        // path). Setting the flag to false on that path was breaking
-        // P5 playback entirely. Apple's default for the property is
-        // also true (so setting it true explicitly is a no-op against
-        // an unset property anyway; we keep the explicit write so
-        // diagnostics surface the live value).
-        // Loopback live deliberately keeps the 4 s forwardBufferDuration
-        // default rather than a deeper buffer. A deep buffer is actively
-        // harmful for live: against the instant-delivering loopback server
-        // AVPlayer pulls the entire visible playlist up front, races to the
-        // live edge, and then hits the one-time transcode warm-up gap (the
-        // ~8 s before the producer cuts the next segment) head-on at the
-        // edge, stalling for the full gap on -12888. A 4 s buffer instead
-        // PACES AVPlayer's consumption to match production, so it plays
-        // through its lead while the producer rides out the warm-up, leaving
-        // only a brief startup hiccup. Verified on device: 8 s made the
-        // startup pause far worse (8-10 s) than the 4 s default (~1 s).
-        host.load(url: playbackURL,
-                  startPosition: startPosition,
-                  perFrameHDR: true)
-    }
-
-    /// Open a `SoftwarePlaybackHost` against the source and wire its
-    /// @Published mirror into the engine's own surface. Used when the
-    /// source's video codec isn't decodable by AVPlayer on the active
-    /// platform (today: AV1 on Apple TV). Same lifecycle shape as
-    /// `loadNative`: host loads the URL itself (no HLS-fMP4 wrapper —
-    /// the SW pipeline reads the source directly through its own
-    /// Demuxer).
-    /// Activate the shared audio session for the renderer paths that have
-    /// no AVPlayerViewController to own activation: SoftwarePlaybackHost
-    /// (FFmpeg decode -> AVSampleBufferAudioRenderer) and the audio-only
-    /// hosts. The native AVPlayer video path deliberately does NOT call
-    /// this — AVKit activates per playback so tvOS can auto-negotiate the
-    /// HDMI route (issue #24). Restores the preferred-channel hint the
-    /// init path used to set, now scoped to the renderer paths.
-    private func activateRendererAudioSession() {
-        #if os(iOS) || os(tvOS)
-        let session = AVAudioSession.sharedInstance()
-        do { try session.setActive(true) }
-        catch {
-            EngineLog.emit("[AetherEngine] activateRendererAudioSession error: \(error)", category: .engine)
-        }
-        let maxCh = session.maximumOutputNumberOfChannels
-        if maxCh > 2 { try? session.setPreferredOutputNumberOfChannels(maxCh) }
-        EngineLog.emit("[AetherEngine] renderer audio session active: maxChannels=\(maxCh) preferred=\(session.preferredOutputNumberOfChannels) output=\(session.outputNumberOfChannels)", category: .engine)
-        #endif
-    }
-
-    private func loadSoftware(
-        url: URL,
-        sourceHTTPHeaders: [String: String] = [:],
-        startPosition: Double?,
-        audioSourceStreamIndex: Int32?,
-        isLive: Bool = false,
-        dvrWindowSeconds: Double? = nil,
-        preopenedDemuxer: Demuxer?,
-        generation: UInt64
-    ) async throws {
-        activateRendererAudioSession()
-        let host = SoftwarePlaybackHost()
-        host.onFirstHDR10PlusDetected = { [weak self] in
-            Task { @MainActor in self?.handleHDR10PlusDetected() }
-        }
-        // Live edge publishing: the SW host calls this on its time tick
-        // with the session-relative edge; the engine publishes the same
-        // four live surfaces it does for the native path. No-op when the
-        // session is not live (liveWindow nil -> publishLiveWindow no-ops).
-        host.onLiveEdge = { [weak self] edge in
-            self?.publishLiveWindow(edgeSessionTime: edge)
-        }
-        self.softwareHost = host
-        // SW path's currentTime tracks source PTS directly, so the
-        // AVPlayer-clock shift is 0 and sourceTime mirrors currentTime.
-        self.playlistShiftSeconds = 0
-        self.liveShiftSeams.removeAll()
-
-        softwareCancellables.removeAll()
-        host.$currentTime
-            .sink { [weak self] value in
-                guard let self = self else { return }
-                self.clock.currentTime = value
-                self.clock.sourceTime = value
-            }
-            .store(in: &softwareCancellables)
-        host.$duration
-            .sink { [weak self] value in
-                if value > 0 { self?.duration = value }
-            }
-            .store(in: &softwareCancellables)
-        host.$isReady
-            .sink { [weak self] ready in
-                guard let self = self else { return }
-                if ready, self.state == .loading {
-                    self.state = .paused
-                }
-            }
-            .store(in: &softwareCancellables)
-        host.$failureMessage
-            .compactMap { $0 }
-            .sink { [weak self] msg in self?.state = .error(msg) }
-            .store(in: &softwareCancellables)
-        host.$didReachEnd
-            .filter { $0 }
-            .sink { [weak self] _ in
-                self?.state = .idle
-            }
-            .store(in: &softwareCancellables)
-
-        // Reuse the probe demuxer when present (no second avformat_open_input;
-        // also what makes forward-only sources work here, no seek(0) reopen).
-        // Fall back to a fresh open only when the probe failed to open.
-        // The (possibly blocking) open stays detached so the @MainActor
-        // runloop keeps ticking, matching the probe / session.start pattern.
-        try await Task.detached(priority: .userInitiated) {
-            [host, preopenedDemuxer, url, sourceHTTPHeaders, isLive, dvrWindowSeconds] in
-            let dem: Demuxer
-            if let pre = preopenedDemuxer {
-                dem = pre
-            } else {
-                dem = Demuxer()
-                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, isLive: isLive)
-            }
-            try await host.load(
-                demuxer: dem,
-                startPosition: startPosition,
-                audioSourceStreamIndex: audioSourceStreamIndex,
-                isLive: isLive,
-                dvrWindowSeconds: dvrWindowSeconds
-            )
-        }.value
-        // Superseded while the host was loading? The successor's
-        // stopInternal already detached this host from the engine;
-        // stop it again (idempotent) so the demuxer the detached
-        // closure opened is torn down, then unwind.
-        if loadGeneration != generation {
-            host.stop()
-            try checkLoadCurrent(generation)
-        }
-    }
-
-    /// Open an `AudioPlaybackHost` against an audio-only source and wire
-    /// its @Published mirror into the engine's surface. The lean path:
-    /// no HLS pipeline, no display layer, no display-criteria handshake.
-    /// Same lifecycle shape as `loadSoftware`.
-    private func loadAudio(
-        url: URL,
-        sourceHTTPHeaders: [String: String] = [:],
-        startPosition: Double?,
-        audioSourceStreamIndex: Int32?,
-        preopenedDemuxer: Demuxer?,
-        generation: UInt64
-    ) async throws {
-        activateRendererAudioSession()
-        let host = AudioPlaybackHost()
-        self.audioHost = host
-        // Audio path tracks source PTS directly: no AVPlayer-clock shift.
-        self.playlistShiftSeconds = 0
-        self.liveShiftSeams.removeAll()
-
-        audioCancellables.removeAll()
-        host.$currentTime
-            .sink { [weak self] value in
-                guard let self = self else { return }
-                self.clock.currentTime = value
-                self.clock.sourceTime = value
-            }
-            .store(in: &audioCancellables)
-        host.$duration
-            .sink { [weak self] value in
-                if value > 0 { self?.duration = value }
-            }
-            .store(in: &audioCancellables)
-        host.$isReady
-            .sink { [weak self] ready in
-                guard let self = self else { return }
-                if ready, self.state == .loading {
-                    self.state = .paused
-                }
-            }
-            .store(in: &audioCancellables)
-        host.$failureMessage
-            .compactMap { $0 }
-            .sink { [weak self] msg in self?.state = .error(msg) }
-            .store(in: &audioCancellables)
-        host.$didReachEnd
-            .filter { $0 }
-            .sink { [weak self] _ in
-                self?.state = .idle
-            }
-            .store(in: &audioCancellables)
-
-        // Reuse the probe demuxer when present (custom sources require it,
-        // since they have no URL to reopen; URL sources just skip a redundant
-        // open). Fall back to a fresh open only when the probe failed.
-        // The (possibly blocking) open stays detached so the @MainActor
-        // runloop keeps ticking.
-        try await Task.detached(priority: .userInitiated) {
-            [host, preopenedDemuxer, url, sourceHTTPHeaders] in
-            let dem: Demuxer
-            if let pre = preopenedDemuxer {
-                dem = pre
-            } else {
-                dem = Demuxer()
-                try dem.open(url: url, extraHeaders: sourceHTTPHeaders)
-            }
-            try await host.load(
-                demuxer: dem,
-                startPosition: startPosition,
-                audioSourceStreamIndex: audioSourceStreamIndex
-            )
-        }.value
-        // Superseded while the host was loading? Same unwind as
-        // loadSoftware: re-stop the detached host, then throw.
-        if loadGeneration != generation {
-            host.stop()
-            try checkLoadCurrent(generation)
-        }
-    }
-
-    /// Open an `AudioAVPlayerHost` against an audio-only source AVPlayer can
-    /// decode natively, and wire its @Published mirror into the engine's
-    /// surface. The native, energy-efficient default for audio-only; the
-    /// FFmpeg `loadAudio` path is the fallback for codecs AVPlayer cannot
-    /// decode. Same lifecycle shape as loadAudio.
-    private func loadAudioNative(
-        url: URL,
-        startPosition: Double?,
-        httpHeaders: [String: String],
-        generation: UInt64
-    ) async throws {
-        // Reuse the persistent host (and its MPNowPlayingSession) across
-        // tracks; only create it the first time. host.load() below swaps the
-        // item via replaceCurrentItem on the same AVPlayer.
-        activateRendererAudioSession()
-        let host = audioAVPlayerHost ?? AudioAVPlayerHost()
-        self.audioAVPlayerHost = host
-        self.audioAVPlayerActive = true
-        self.playlistShiftSeconds = 0
-        self.liveShiftSeams.removeAll()
-        // Reclaim Now-Playing ownership for this session on each track start,
-        // so the Home badge + remote commands stay bound across a pause.
-        host.becomeActiveNowPlaying()
-        host.setExternalMetadata(pendingExternalMetadata)
-
-        audioNativeCancellables.removeAll()
-        host.$currentTime
-            .sink { [weak self] value in
-                guard let self = self else { return }
-                self.clock.currentTime = value
-                self.clock.sourceTime = value
-            }
-            .store(in: &audioNativeCancellables)
-        host.$duration
-            .sink { [weak self] value in
-                if value > 0 { self?.duration = value }
-            }
-            .store(in: &audioNativeCancellables)
-        host.$isReady
-            .sink { [weak self] ready in
-                guard let self = self else { return }
-                if ready, self.state == .loading {
-                    self.state = .paused
-                }
-            }
-            .store(in: &audioNativeCancellables)
-        host.$failureMessage
-            .compactMap { $0 }
-            .sink { [weak self] msg in self?.state = .error(msg) }
-            .store(in: &audioNativeCancellables)
-        host.$didReachEnd
-            .filter { $0 }
-            .sink { [weak self] _ in
-                self?.state = .idle
-            }
-            .store(in: &audioNativeCancellables)
-        // NOTE: deliberately NO reconciliation of `state` from the host's
-        // `timeControlStatus` on the audio path. All audio transport flows
-        // through the engine's own play()/pause() (driven host-side by
-        // MPRemoteCommandCenter handlers, the in-app .onPlayPauseCommand, and
-        // the queue logic), so those are the single source of truth for
-        // `state`. Feeding timeControlStatus back into `state` mis-latched a
-        // TRANSIENT `.paused` that AVFoundation emits during the app's
-        // background transition as a real pause: the engine flipped to
-        // paused while audio kept playing, the published now-playing rate
-        // went to 0, and tvOS (which reads MPNowPlayingInfoPropertyPlaybackRate
-        // to infer play-vs-pause) then believed we were paused-while-playing,
-        // breaking the system Now-Playing badge and the Siri Remote routing.
-        // timeControlStatus is advisory display state, not a command source.
-
-        try await Task.detached(priority: .userInitiated) { [host] in
-            try await host.load(url: url, startPosition: startPosition, httpHeaders: httpHeaders)
-        }.value
-        // Superseded while the (persistent, shared) host was loading?
-        // Don't tear the host down, the successor may be using it; just
-        // unwind before play()/state writes.
-        try checkLoadCurrent(generation)
-    }
-
     // MARK: - Transport
 
     /// The host that currently owns transport, in the canonical
@@ -2322,41 +1335,6 @@ public final class AetherEngine: ObservableObject {
             state = .playing
         }
         clampLiveResumeIfBehindWindow()
-    }
-
-    /// Live resume clamp. While paused the live edge keeps advancing (the
-    /// 1 Hz window timer keeps `liveWindow` fresh), and a pause longer
-    /// than the retention window leaves the playhead on content the
-    /// sliding window has already evicted. AVPlayer would then fetch
-    /// evicted segments (fast-404'd by the provider) instead of cleanly
-    /// resuming, so jump the playhead back inside the window: to just
-    /// above the DVR window's lower bound when a DVR window exists, or to
-    /// the live edge for live-only sessions (their server-side retention
-    /// floor is 60 s; clamping at 45 s leaves headroom before eviction).
-    private func clampLiveResumeIfBehindWindow() {
-        guard isLive, let w = liveWindow else { return }
-        let margin: Double = 5
-        if let win = w.windowSeconds {
-            guard w.behindLiveSeconds > (win - margin) else { return }
-            let t = (w.seekableRange?.lowerBound ?? w.edgeTime) + margin
-            EngineLog.emit(
-                "[AetherEngine] live resume clamp: behind=\(String(format: "%.1f", w.behindLiveSeconds))s "
-                + "window=\(String(format: "%.0f", win)) -> seek \(String(format: "%.1f", t))",
-                category: .session
-            )
-            Task { await self.seek(to: t) }
-        } else {
-            // Live-only: seek(to:) refuses targets without a DVR window,
-            // so route through the edge snap (which drives the host
-            // directly).
-            guard w.behindLiveSeconds > 45 else { return }
-            EngineLog.emit(
-                "[AetherEngine] live resume clamp: behind=\(String(format: "%.1f", w.behindLiveSeconds))s "
-                + "window=live-only -> edge snap",
-                category: .session
-            )
-            Task { await self.seekToLiveEdge() }
-        }
     }
 
     public func pause() {
@@ -2541,50 +1519,6 @@ public final class AetherEngine: ObservableObject {
         await seek(to: seconds)
     }
 
-    /// Update the live DVR window from a path's reported edge and publish the
-    /// four live surfaces (`liveEdgeTime`, `seekableLiveRange`, `isAtLiveEdge`,
-    /// `behindLiveSeconds`). Path-agnostic: the native tick and the SW
-    /// tick both call this with their session-relative edge time. No-op when
-    /// no live window is active.
-    @MainActor
-    private func publishLiveWindow(edgeSessionTime: Double) {
-        guard var w = liveWindow else { return }
-        w.noteEdge(edgeSessionTime)
-        w.notePlayhead(currentTime)
-        liveWindow = w
-        clock.liveEdgeTime = w.edgeTime
-        clock.seekableLiveRange = w.seekableRange
-        clock.isAtLiveEdge = w.isAtEdge
-        clock.behindLiveSeconds = w.behindLiveSeconds
-    }
-
-    /// Seek to the current live edge. No-op when not live. With DVR enabled this
-    /// resolves to `behind = 0` -> `clockTarget = seekableEnd`, i.e. the edge.
-    public func seekToLiveEdge() async {
-        guard isLive, let w = liveWindow else { return }
-        // Live-only (no DVR window): seek(to:) refuses every target since
-        // there is no rewind range, but snapping TO the edge is always
-        // legal, and it is the recovery move after a long pause leaves
-        // the playhead on evicted content. Drive the native host directly
-        // at its own seekable end (the SW live-only path has no ring and
-        // plays at the edge by construction; nothing to do there).
-        guard w.windowSeconds != nil else {
-            if let host = nativeHost {
-                let clockTarget = max(0, host.seekableEnd)
-                EngineLog.emit(
-                    "[AetherEngine] live-only edge snap: clockTarget=\(String(format: "%.1f", clockTarget))",
-                    category: .engine
-                )
-                host.seek(to: clockTarget)
-                nativeClockSeconds = clockTarget
-                clock.currentTime = clockTarget + playlistShiftSeconds
-                clock.sourceTime = currentTime
-            }
-            return
-        }
-        await seek(to: w.edgeTime)
-    }
-
     public func stop() {
         stopInternal()
         state = .idle
@@ -2628,7 +1562,7 @@ public final class AetherEngine: ObservableObject {
     /// `.player` whenever the engine swaps the underlying instance
     /// (every `selectAudioTrack` reload tears the previous host down
     /// and brings up a fresh one, so a one-shot assignment goes stale).
-    @Published public private(set) var currentAVPlayer: AVPlayer?
+    @Published public internal(set) var currentAVPlayer: AVPlayer?
 
     #if os(tvOS) || os(iOS)
     /// The Now-Playing session bound to the active AVPlayer audio path, or
@@ -2649,7 +1583,7 @@ public final class AetherEngine: ObservableObject {
     /// the AVPlayerItem before AVPlayer.replaceCurrentItem. Survives
     /// across native loads so internal reloads (audio-track switch,
     /// background reopen) replay the metadata.
-    private var pendingExternalMetadata: [AVMetadataItem] = []
+    var pendingExternalMetadata: [AVMetadataItem] = []
 
     /// Stage the metadata items for the system Now Playing surface
     /// (title, artwork, description, etc.). Set this rather than writing
@@ -2732,757 +1666,9 @@ public final class AetherEngine: ObservableObject {
     /// The sidecar subtitle URL the host most recently activated, kept
     /// so `selectAudioTrack` can rehydrate the same selection after the
     /// pipeline reload. Cleared by `clearSubtitle` and `stopInternal`.
-    private var loadedSidecarURL: URL?
-
-    /// Perform a pipeline rebuild at the current playhead. Tears the current
-    /// session down, brings a fresh pipeline up with an optional audio source
-    /// stream override (nil keeps the auto-picked track), resumes at the
-    /// current position, and re-arms whichever subtitle source was active when
-    /// this task actually began executing. Called by `selectAudioTrack` (with a
-    /// concrete index) and by `reloadAtCurrentPosition` for custom sources
-    /// (with nil to keep the current track). For custom sources the rebuild
-    /// reuses the retained `customReader` (see the `customPreopened` block);
-    /// for URL sources `loadSoftware`/`loadNative` reopen the URL.
-    ///
-    /// Subtitle and playhead state are snapshotted INSIDE the task body
-    /// rather than at the call site, because hosts commonly chain a
-    /// `selectSubtitleTrack` call right after `selectAudioTrack` (e.g.
-    /// auto-subs-for-foreign-audio): the chained call lands on the
-    /// MainActor before this task body runs, and snapshotting at call
-    /// time would miss it, leaving the picker showing a subtitle that
-    /// the post-reload state never actually re-armed.
-    private func reloadWithAudioOverride(
-        url: URL,
-        audioStreamIndex: Int32?
-    ) async {
-        let resumeAt = currentTime
-        let embeddedStreamToResume: Int32 = activeEmbeddedSubtitleStreamIndex
-        let sidecarToResume: URL? = isSubtitleActive && activeEmbeddedSubtitleStreamIndex < 0
-            ? loadedSidecarURL
-            : nil
-        EngineLog.emit(
-            "[AetherEngine] reload begin: audioStream=\(audioStreamIndex.map(String.init) ?? "nil") resumeAt=\(String(format: "%.2f", resumeAt))s embeddedSub=\(embeddedStreamToResume) sidecar=\(sidecarToResume?.lastPathComponent ?? "nil")",
-            category: .engine
-        )
-
-        state = .loading
-        let previousAudioIndex = activeAudioTrackIndex
-        // Snapshot the active backend BEFORE stopInternal wipes it.
-        // The reload has to land on whichever pipeline currently owns
-        // playback — calling loadNative on a SW-routed source would
-        // throw `unsupportedCodec` (HLSVideoEngine accepts HEVC / H.264
-        // / VP9 / probed-AV1, not SW-only AV1) and leave the user
-        // staring at a "playback stopped" error after picking a
-        // different audio track.
-        let wasOnSoftwarePath = (playbackBackend == .software)
-        // Snapshot the video codec before stopInternal wipes it. The
-        // reload re-uses the same source, so the decoder identity
-        // label can be reconstructed without re-probing the demuxer.
-        let preservedVideoCodec = lastDetectedVideoCodec
-        let reloadStart = DispatchTime.now()
-        EngineLog.emit("[AetherEngine] reload: stopInternal start", category: .engine)
-        // Keep the active display criteria intact across the audio-track
-        // switch. The video format isn't changing — `reloadWithAudioOverride`
-        // only swaps the audio source stream inside the same HLS engine —
-        // so a `displayCriteria.reset()` here is at best a no-op and at
-        // worst triggers a 5 s `waitForSwitch` Stage 2 timeout on every
-        // reload (Vincent test 2026-05-26, Bose SLIII A2DP route + 4K
-        // HDR10 PQ source: each audio switch added ~12 s of black-screen
-        // latency because the post-RESET handshake never re-settled,
-        // even though the panel never actually left HDR mode). Preserving
-        // the criteria also fixes a separate failure mode on the same
-        // route: when the panel briefly dropped to SDR during the RESET
-        // window, the new AVPlayer asset's PQ variant failed item open
-        // with `AVFoundationErrorDomain -11868 / CoreMediaErrorDomain
-        // -17223` at variant selection.
-        // Keep the native AVPlayer host alive across the audio-track switch
-        // (issue #15) unless playback is on the software path, where there
-        // is no native host to preserve.
-        stopInternal(resetDisplayCriteria: false, keepNativeHost: !wasOnSoftwarePath, keepCustomReader: true)
-        EngineLog.emit("[AetherEngine] reload: stopInternal done (\(elapsedMs(since: reloadStart))ms)", category: .engine)
-        // Same supersede contract as load(): a newer load/stop bumps the
-        // generation and this reload unwinds at the next checkpoint.
-        let gen = loadGeneration
-        loadedURL = url
-        lastDetectedVideoCodec = preservedVideoCodec
-
-        // Custom sources have no URL to reopen; rebuild the pipeline on the
-        // retained reader. Build the demuxer off-main (find_stream_info
-        // blocks) and hand it through the existing preopenedDemuxer channel.
-        // The reader is seekable here (forward-only custom reload entry points
-        // no-op). The demuxer opens at byte 0; loadSoftware/loadNative then
-        // seek to the resume position via their startPosition argument.
-        var customPreopened: Demuxer? = nil
-        if isCustomSource, let reader = customReader {
-            let hint = customFormatHint
-            do {
-                let isLiveReload = loadedOptions.isLive
-                customPreopened = try await Task.detached(priority: .userInitiated) {
-                    let d = Demuxer()
-                    // isLive preserved across audio-track reload: a live
-                    // custom source must not trigger SEEK_END on reopen.
-                    try d.open(reader: reader, formatHint: hint, isLive: isLiveReload)
-                    return d
-                }.value
-            } catch {
-                EngineLog.emit("[AetherEngine] reload: custom reader reopen failed: \(error)", category: .engine)
-                activeAudioTrackIndex = previousAudioIndex
-                state = .error("Reload failed: \(error.localizedDescription)")
-                return
-            }
-            if loadGeneration != gen {
-                customPreopened?.markClosed()
-                if let d = customPreopened {
-                    Task.detached { d.close() }
-                }
-                EngineLog.emit("[AetherEngine] reload superseded after reader reopen; unwinding", category: .engine)
-                return
-            }
-        }
-
-        do {
-            let loadStart = DispatchTime.now()
-            if wasOnSoftwarePath {
-                EngineLog.emit("[AetherEngine] reload: loadSoftware enter audio=\(audioStreamIndex.map(String.init) ?? "nil") resumeAt=\(String(format: "%.2f", resumeAt))s", category: .engine)
-                try await loadSoftware(
-                    url: url,
-                    sourceHTTPHeaders: loadedOptions.httpHeaders,
-                    // Live rejoins at the live edge; a stale playhead
-                    // resume position is meaningless against the fresh
-                    // source connection.
-                    startPosition: loadedOptions.isLive ? nil : (resumeAt > 1 ? resumeAt : nil),
-                    audioSourceStreamIndex: audioStreamIndex,
-                    isLive: loadedOptions.isLive,
-                    dvrWindowSeconds: loadedOptions.dvrWindowSeconds,
-                    preopenedDemuxer: customPreopened,
-                    generation: gen
-                )
-                EngineLog.emit("[AetherEngine] reload: loadSoftware done (\(elapsedMs(since: loadStart))ms)", category: .engine)
-                playbackBackend = .software
-                activeAudioTrackIndex = audioStreamIndex.map { Int($0) }
-                activeVideoDecoder = Self.videoDecoderLabel(
-                    codecID: preservedVideoCodec, isSoftware: true
-                )
-                activeAudioDecoder = Self.softwareAudioDecoderLabel(
-                    audioTracks: audioTracks, activeIndex: audioStreamIndex ?? -1
-                )
-                presentCurrentLayer()
-                softwareHost?.play()
-            } else {
-                EngineLog.emit("[AetherEngine] reload: loadNative enter audio=\(audioStreamIndex.map(String.init) ?? "nil") resumeAt=\(String(format: "%.2f", resumeAt))s", category: .engine)
-                try await loadNative(
-                    url: url,
-                    sourceHTTPHeaders: loadedOptions.httpHeaders,
-                    // Live rejoins at the live edge (see loadSoftware above).
-                    startPosition: loadedOptions.isLive ? nil : (resumeAt > 1 ? resumeAt : nil),
-                    audioSourceStreamIndex: audioStreamIndex,
-                    keepDvh1TagWithoutDV: loadedOptions.keepDvh1TagWithoutDV,
-                    matchContentEnabled: loadedOptions.matchContentEnabled,
-                    panelIsInHDRMode: loadedOptions.panelIsInHDRMode,
-                    audioBridgeMode: loadedOptions.audioBridgeMode,
-                    // Without these the audio-switch reload of a LIVE session
-                    // rebuilt the pipeline as VOD: the demuxer opened in
-                    // streaming mode (no live reconnect machinery) and
-                    // HLSVideoEngine ran the duration guard against a 0-length
-                    // source, failing the whole switch with "cannot build
-                    // segment plan" (device repro: KiKA).
-                    isLive: loadedOptions.isLive,
-                    dvrWindowSeconds: loadedOptions.dvrWindowSeconds,
-                    preopenedDemuxer: customPreopened,
-                    generation: gen
-                )
-                EngineLog.emit("[AetherEngine] reload: loadNative done (\(elapsedMs(since: loadStart))ms)", category: .engine)
-                playbackBackend = .native
-                activeAudioTrackIndex = audioStreamIndex.map { Int($0) }
-                activeVideoDecoder = Self.videoDecoderLabel(
-                    codecID: preservedVideoCodec, isSoftware: false
-                )
-                activeAudioDecoder = nativeVideoSession?.audioPipelineDescription
-                presentCurrentLayer()
-                // Same play-gate as the initial load path: wait for any
-                // pending AVKit auto-criteria handshake before resuming,
-                // so the first decoded frame after the audio-track reload
-                // doesn't hit a mid-transition panel.
-                await displayCriteria.waitForSwitch()
-                try checkLoadCurrent(gen)
-                nativeHost?.play()
-            }
-            try checkLoadCurrent(gen)
-            state = .playing
-            // Re-arm the diagnostic samplers. stopInternal nilled the
-            // sampler instance + diagnostics.liveTelemetry, and the
-            // reload path bypasses the public load() that would
-            // otherwise restart them, so without this the host's
-            // stats overlay sees liveTelemetry stuck at nil and
-            // renders "-" for every field after the first audio
-            // track switch in a session.
-            startMemoryProbe()
-            startLiveTelemetrySampler()
-            EngineLog.emit("[AetherEngine] reload: state=.playing total=\(elapsedMs(since: reloadStart))ms", category: .engine)
-        } catch is CancellationError {
-            // Superseded by a newer load/stop: it owns the engine state.
-            return
-        } catch {
-            EngineLog.emit(
-                "[AetherEngine] selectAudioTrack reload failed: \(error), playback stopped",
-                category: .engine
-            )
-            activeAudioTrackIndex = previousAudioIndex
-            state = .error("Audio track switch failed: \(error.localizedDescription)")
-            return
-        }
-
-        // Resume whichever subtitle source the host had active when
-        // this task started running. The sidecar branch wins because
-        // `loadedSidecarURL` is set only when the active source is
-        // sidecar; the embedded branch restarts the side-demuxer at
-        // the new playhead.
-        if let sidecar = sidecarToResume {
-            selectSidecarSubtitle(url: sidecar)
-        } else if embeddedStreamToResume >= 0 {
-            selectSubtitleTrack(index: Int(embeddedStreamToResume))
-        }
-    }
-
-    /// Activate an embedded subtitle stream from the source. A side
-    /// Demuxer opens the source independently of the main HLS pump,
-    /// seeks to (just before) the current playback position, and
-    /// streams subtitle packets through an `EmbeddedSubtitleDecoder`.
-    /// Cues land in `subtitleCues` typically within 1-2 seconds of
-    /// activation.
-    ///
-    /// Supports text codecs (SubRip / ASS / SSA / WebVTT / mov_text)
-    /// and bitmap codecs (PGS / DVB / DVD / XSUB) with full canvas-
-    /// relative positioning.
-    ///
-    /// Why a side demuxer instead of routing through the main HLS
-    /// pump: when activation happens mid-playback, the main pump has
-    /// already raced ~60-80 s ahead of the playhead and discarded
-    /// every subtitle packet in that window. Re-reading from the
-    /// playhead via a side demuxer is the cheapest way to catch cues
-    /// for content the user is about to see. The side demuxer also
-    /// re-seeks on `engine.seek` so scrubs surface cues at the new
-    /// position immediately.
-    public func selectSubtitleTrack(index: Int) {
-        guard let url = loadedURL else { return }
-        // Embedded-subtitle selection runs a side demuxer concurrently with
-        // playback. For custom sources the side demuxer needs an independent
-        // second cursor; if the reader cannot clone, no-op. Mint the clone
-        // after the loadedURL guard so it is never leaked on an early return.
-        var customClone: IOReader? = nil
-        if isCustomSource {
-            guard let clone = customReader?.makeIndependentReader() else { return }
-            customClone = clone
-        }
-        cancelSidecarTask()
-        cancelEmbeddedSubtitleReader()
-
-        isSubtitleActive = true
-        subtitleCues = []
-        isLoadingSubtitles = true
-        activeEmbeddedSubtitleStreamIndex = Int32(index)
-
-        // Side-demuxer seeks in source PTS. sourceTime is the unified
-        // source-PTS playhead (equal to currentTime now that the native
-        // clock folds in playlistShiftSeconds), so it hands the demuxer
-        // the true source position directly. Reading the pre-fold AVPlayer
-        // clock here would land `playlistShiftSeconds` early and the first
-        // emitted cue would read as "subs are 3-5 s late" — repro on Cars
-        // at a restart-driven shift of ~3.92 s.
-        startEmbeddedSubtitleTask(url: url, reader: customClone, formatHint: customFormatHint, streamIndex: Int32(index), startAt: sourceTime)
-    }
-
-    /// Spin up the side-demuxer Task that streams cues into the
-    /// engine. Captured-on-init: the URL, the stream index, the
-    /// start position, and the source video dimensions. The Task's
-    /// run loop is cancellable; `cancel()` triggers a clean exit.
-    private func startEmbeddedSubtitleTask(url: URL, reader: IOReader?, formatHint: String?, streamIndex: Int32, startAt: Double) {
-        let w = sourceVideoWidth > 0 ? sourceVideoWidth : 1920
-        let h = sourceVideoHeight > 0 ? sourceVideoHeight : 1080
-        let headers = loadedOptions.httpHeaders
-        let preserveASS = loadedOptions.preserveASSMarkup
-        embeddedSubtitleTask = Task.detached(priority: .userInitiated) { [weak self] in
-            await self?.runEmbeddedSubtitleReader(
-                url: url, reader: reader, formatHint: formatHint,
-                headers: headers, streamIndex: streamIndex, startAt: startAt,
-                videoWidth: w, videoHeight: h, preserveASSMarkup: preserveASS
-            )
-        }
-    }
-
-    /// Side-demuxer read loop. Opens a fresh `Demuxer` against the
-    /// source URL, prewarms the cue table by seeking mid-file (so the
-    /// MKV demuxer's cue index is loaded before the real seek), then
-    /// seeks slightly before the requested start time and streams
-    /// subtitle packets through an `EmbeddedSubtitleDecoder`, emitting
-    /// cues back into the engine on the main actor. The loop paces
-    /// itself against the playhead (`embeddedSubtitleReadAheadSeconds`)
-    /// instead of racing to EOF; see the constant's doc for why.
-    nonisolated private func runEmbeddedSubtitleReader(
-        url: URL, reader: IOReader?, formatHint: String?,
-        headers: [String: String], streamIndex: Int32, startAt: Double,
-        videoWidth: Int32, videoHeight: Int32, preserveASSMarkup: Bool = false
-    ) async {
-        let demuxer = Demuxer()
-        // Register for abort: Task.cancel() is only observed BETWEEN
-        // readPacket calls, but a side demuxer blocked inside the AVIO
-        // reconnect loop against a stalled source survived stop()/track
-        // switches and kept its connection reconnecting into the next
-        // session, the same orphan class the probe-abort hook fixed for
-        // load(). markClosed (from the cancel sites) makes the blocked
-        // read return promptly.
-        let registered = await MainActor.run { [weak self] () -> Bool in
-            // Stale-task guard: if this task was already cancelled (track
-            // switch A->B where B's registration landed first), overwriting
-            // would hijack B's abort handle. The cancel sites would then
-            // markClosed the wrong demuxer and A's identity-guarded defer
-            // would nil B's registration, leaving B's reader unabortable.
-            guard !Task.isCancelled, let self else { return false }
-            self.activeSubtitleSideDemuxer = demuxer
-            return true
-        }
-        guard registered else {
-            reader?.close()
-            return
-        }
-        defer {
-            Task { @MainActor [weak self, weak demuxer] in
-                if let self, let demuxer, self.activeSubtitleSideDemuxer === demuxer {
-                    self.activeSubtitleSideDemuxer = nil
-                }
-            }
-        }
-        do {
-            if let reader = reader {
-                try demuxer.open(reader: reader, formatHint: formatHint)
-            } else {
-                try demuxer.open(url: url, extraHeaders: headers)
-            }
-        } catch {
-            EngineLog.emit("[AetherEngine] embedded subtitle open failed: \(error)", category: .engine)
-            reader?.close()
-            await MainActor.run { [weak self] in
-                // Stale-task guard: a cancelled reader (track switch in
-                // flight) must not clear the SUCCESSOR's loading spinner.
-                guard !Task.isCancelled else { return }
-                self?.isLoadingSubtitles = false
-            }
-            return
-        }
-        // The side demuxer owns the clone reader (the bridge does not close
-        // it); close it after the demuxer is torn down.
-        defer {
-            demuxer.close()
-            reader?.close()
-        }
-
-        // Prewarm the cue table by seeking mid-file before the actual
-        // playhead seek. MKV cues live at the end of the file; a fresh
-        // demuxer doesn't load them until first seek. Without this
-        // prewarm, the seek-to-playhead lands inaccurately and we
-        // either miss subtitle packets near the playhead or land far
-        // away from where we asked. HLSVideoEngine does the same thing
-        // for the same reason; we mirror it on the side demuxer.
-        let duration = demuxer.duration
-        if duration > 0 {
-            demuxer.seek(to: duration * 0.5)
-        }
-
-        // Now the real seek. Slightly before the playhead so bitmap
-        // subtitle codecs (PGS / DVB / HDMV) catch their state-machine
-        // SETUP segments before the first END / EVENT segment.
-        let seekTo = max(0, startAt - 2.0)
-        demuxer.seek(to: seekTo)
-
-        guard let stream = demuxer.stream(at: streamIndex),
-              let decoder = EmbeddedSubtitleDecoder(
-                  stream: stream,
-                  sourceVideoWidth: videoWidth,
-                  sourceVideoHeight: videoHeight,
-                  preserveASSMarkup: preserveASSMarkup
-              )
-        else {
-            EngineLog.emit("[AetherEngine] embedded subtitle decoder open failed for stream=\(streamIndex)", category: .engine)
-            await MainActor.run { [weak self] in
-                // Stale-task guard: a cancelled reader (track switch in
-                // flight) must not clear the SUCCESSOR's loading spinner.
-                guard !Task.isCancelled else { return }
-                self?.isLoadingSubtitles = false
-            }
-            return
-        }
-
-        let tb = stream.pointee.time_base
-        let streamStartTime = stream.pointee.start_time
-
-        // Comprehensive offset diagnostics: log every PTS-reference
-        // value we have access to so we can correlate cue startTime
-        // (source PTS based) with AVPlayer.currentTime (HLS playlist
-        // based). If videoStream.start_time or format.start_time is
-        // non-zero, that's the offset between source-time and
-        // playlist-time.
-        let formatStart = demuxer.formatStartTime
-        let videoStream = demuxer.videoStreamIndex >= 0 ? demuxer.stream(at: demuxer.videoStreamIndex) : nil
-        let videoStreamStart = videoStream?.pointee.start_time ?? 0
-        let videoTb = videoStream?.pointee.time_base ?? AVRational(num: 1, den: 1)
-        EngineLog.emit(
-            "[AetherEngine] embedded subtitle reader started: stream=\(streamIndex) " +
-            "startAt=\(String(format: "%.2f", startAt))s seekTo=\(String(format: "%.2f", seekTo))s " +
-            "codec=\(decoder.codecID.rawValue) " +
-            "subTb=\(tb.num)/\(tb.den) subStart=\(streamStartTime) " +
-            "videoTb=\(videoTb.num)/\(videoTb.den) videoStart=\(videoStreamStart) " +
-            "format.start_time=\(formatStart)us",
-            category: .engine
-        )
-
-        await MainActor.run { [weak self] in
-            guard !Task.isCancelled else { return }
-            self?.isLoadingSubtitles = false
-        }
-
-        var totalPacketsRead = 0
-        var subtitlePacketsRead = 0
-        var cuesEmitted = 0
-        var firstCueLogged = false
-
-        // Playhead pacing (AetherEngine#31): track demux progress via
-        // every packet's timestamp (video/audio packets included; the
-        // subtitle stream alone is too sparse to gate on) and park the
-        // loop once it runs `embeddedSubtitleReadAheadSeconds` past
-        // the playhead. `playheadSnapshot` is refreshed lazily from
-        // the MainActor only when the threshold trips, which in steady
-        // state is a couple of hops per second at the lead boundary.
-        var playheadSnapshot = startAt
-        var parkLogged = false
-        var timeBaseCache: [Int32: AVRational] = [:]
-
-        readLoop: while !Task.isCancelled {
-            guard let pkt = try? demuxer.readPacket() else {
-                break
-            }
-            totalPacketsRead += 1
-            let streamIdx = pkt.pointee.stream_index
-
-            // Packet position in source-PTS seconds, from the packet's
-            // own stream timebase. NOPTS-valued packets don't advance
-            // the pacing clock.
-            let rawTS = pkt.pointee.pts != Int64.min ? pkt.pointee.pts : pkt.pointee.dts
-            var pktSeconds: Double?
-            if rawTS != Int64.min {
-                let ptb: AVRational
-                if let cached = timeBaseCache[streamIdx] {
-                    ptb = cached
-                } else {
-                    ptb = demuxer.stream(at: streamIdx)?.pointee.time_base
-                        ?? AVRational(num: 0, den: 1)
-                    timeBaseCache[streamIdx] = ptb
-                }
-                if ptb.num > 0, ptb.den > 0 {
-                    pktSeconds = Double(rawTS) * Double(ptb.num) / Double(ptb.den)
-                }
-            }
-
-            if streamIdx == streamIndex {
-                subtitlePacketsRead += 1
-                let pktPTS = pkt.pointee.pts
-                let event = decoder.decode(
-                    packet: pkt,
-                    streamTimeBase: tb
-                )
-                var p: UnsafeMutablePointer<AVPacket>? = pkt
-                trackedPacketFree(&p)
-                if let event {
-                    cuesEmitted += event.cues.count
-                    if !firstCueLogged, let firstCue = event.cues.first {
-                        EngineLog.emit(
-                            "[AetherEngine] subtitle first cue: pktPTS=\(pktPTS) → " +
-                            "startTime=\(String(format: "%.3f", firstCue.startTime))s " +
-                            "endTime=\(String(format: "%.3f", firstCue.endTime))s",
-                            category: .engine
-                        )
-                        firstCueLogged = true
-                    }
-                    await MainActor.run { [weak self] in
-                        guard !Task.isCancelled else { return }
-                        self?.applySubtitleEvent(event)
-                    }
-                }
-            } else {
-                var p: UnsafeMutablePointer<AVPacket>? = pkt
-                trackedPacketFree(&p)
-            }
-
-            // Park until the playhead catches up to within the read-
-            // ahead window. Task cancellation (track switch, seek,
-            // stop) is observed by Task.sleep, which throws
-            // immediately on a cancelled task.
-            if let pktSeconds, pktSeconds > playheadSnapshot + Self.embeddedSubtitleReadAheadSeconds {
-                while !Task.isCancelled {
-                    guard let fresh = await MainActor.run(body: { [weak self] in self?.sourceTime }) else {
-                        break readLoop
-                    }
-                    playheadSnapshot = fresh
-                    if pktSeconds <= playheadSnapshot + Self.embeddedSubtitleReadAheadSeconds {
-                        break
-                    }
-                    if !parkLogged {
-                        parkLogged = true
-                        EngineLog.emit(
-                            "[AetherEngine] embedded subtitle reader parked: " +
-                            "demuxPos=\(String(format: "%.1f", pktSeconds))s " +
-                            "playhead=\(String(format: "%.1f", playheadSnapshot))s " +
-                            "lead=\(Int(Self.embeddedSubtitleReadAheadSeconds))s",
-                            category: .engine
-                        )
-                    }
-                    do {
-                        try await Task.sleep(nanoseconds: 500_000_000)
-                    } catch {
-                        break readLoop
-                    }
-                }
-            }
-        }
-
-        EngineLog.emit(
-            "[AetherEngine] embedded subtitle reader exited (cancelled=\(Task.isCancelled)) " +
-            "packetsRead=\(totalPacketsRead) subtitlePackets=\(subtitlePacketsRead) " +
-            "cuesEmitted=\(cuesEmitted)",
-            category: .engine
-        )
-    }
-
-    /// Apply a decoded subtitle event from HLSVideoEngine's embedded
-    /// decoder. Handles PGS clear-event semantics (trim previously
-    /// displayed bitmap cues so they actually disappear at the right
-    /// moment) and inserts new cues sorted by start time so the
-    /// overlay's lookup stays correct after backward scrubs.
-    @MainActor
-    private func applySubtitleEvent(_ event: EmbeddedSubtitleDecoder.SubtitleEvent) {
-        guard isSubtitleActive else { return }
-
-        // Diagnostic: for the first ~20 cues after activation, log
-        // each cue's time range alongside engine.currentTime (=
-        // AVPlayer.currentTime). Lets us spot whether the source-side
-        // PTS and the AVPlayer-side clock differ systematically.
-        if subtitleCueDiagnosticCount < 20, let firstCue = event.cues.first {
-            subtitleCueDiagnosticCount += 1
-            EngineLog.emit(
-                "[applySubtitleEvent #\(subtitleCueDiagnosticCount)] " +
-                "cueStart=\(String(format: "%.3f", firstCue.startTime))s " +
-                "cueEnd=\(String(format: "%.3f", firstCue.endTime))s " +
-                "engine.currentTime=\(String(format: "%.3f", currentTime))s",
-                category: .engine
-            )
-        }
-
-        // Cues stay in source PTS; the AVPlayer-clock translation is
-        // applied at the lookup boundary (host renders against
-        // `engine.sourceTime`, side-demuxer seeks against the same).
-
-        // PGS clear-event trim: each PGS event implicitly terminates
-        // whatever was on screen. Truncate any image cue whose
-        // interval straddles the new event's start so it disappears
-        // at the right moment instead of staying up for the
-        // UINT32_MAX (~50-day) default the decoder hands us.
-        if let trimAt = event.pgsTrimAt {
-            for i in 0..<subtitleCues.count {
-                guard case .image = subtitleCues[i].body else { continue }
-                let cue = subtitleCues[i]
-                if cue.startTime < trimAt && cue.endTime > trimAt {
-                    subtitleCues[i] = SubtitleCue(
-                        id: cue.id,
-                        startTime: cue.startTime,
-                        endTime: trimAt,
-                        body: cue.body
-                    )
-                }
-            }
-        }
-
-        // Cues mostly arrive in DTS order, but a backward scrub can
-        // make a fresh packet land before existing cues. Insert each
-        // in sorted position so the overlay's lookup (binary search
-        // then walk for overlapping cues) stays correct.
-        for cue in event.cues {
-            var lo = 0, hi = subtitleCues.count
-            while lo < hi {
-                let mid = (lo + hi) / 2
-                if subtitleCues[mid].startTime < cue.startTime {
-                    lo = mid + 1
-                } else {
-                    hi = mid
-                }
-            }
-            subtitleCues.insert(cue, at: lo)
-        }
-
-        // Prune cues that ended more than `subtitleCueRetentionSeconds`
-        // before the current playback time. Bitmap cues (PGS / DVB /
-        // DVD) each carry a CGImage with retained RGBA pixel data; on
-        // long sessions with PGS subtitles the array grows by 1-2
-        // cues / second and the heap climbs proportionally. The
-        // retention window covers typical pause durations and the
-        // backward-scrub reach that doesn't trigger a producer
-        // restart; anything older that the user revisits via a far
-        // scrub gets re-emitted on restart (the restarted side reader
-        // instantiates a fresh EmbeddedSubtitleDecoder, so its dedupe
-        // set starts empty).
-        pruneOldSubtitleCues()
-    }
-
-    /// Remove subtitle cues whose `endTime` has fallen further behind
-    /// the current source-PTS position than the retention window.
-    /// Called from `applySubtitleEvent` so the prune happens at the
-    /// cue-emit cadence (~1-2 / second on a typical PGS track) rather
-    /// than on a separate timer. Compares against `sourceTime` because
-    /// cue start / end timestamps are in
-    /// absolute source PTS seconds (see EmbeddedSubtitleDecoder.decode
-    /// docstring). sourceTime now equals currentTime (the clock is unified
-    /// onto source PTS), so either is correct; sourceTime keeps the intent
-    /// explicit.
-    private func pruneOldSubtitleCues() {
-        guard !subtitleCues.isEmpty else { return }
-        let cutoff = sourceTime - subtitleCueRetentionSeconds
-        guard cutoff > 0 else { return }
-        subtitleCues.removeAll { $0.endTime < cutoff }
-    }
-
-    /// Cancel the embedded-subtitle side reader: cancel the task AND
-    /// abort its demuxer. The markClosed matters because Task.cancel()
-    /// is only observed between reads; a side demuxer parked in a
-    /// network read (or the AVIO reconnect loop) would otherwise
-    /// survive the teardown (see runEmbeddedSubtitleReader).
-    private func cancelEmbeddedSubtitleReader() {
-        embeddedSubtitleTask?.cancel()
-        embeddedSubtitleTask = nil
-        activeSubtitleSideDemuxer?.markClosed()
-        activeSubtitleSideDemuxer = nil
-    }
-
-    /// Decode a sidecar subtitle file (`.srt` / `.ass` / `.vtt` /
-    /// `.ssa` served alongside the media). The whole file is fetched
-    /// and decoded up-front via `SubtitleDecoder.decodeFile`, then the
-    /// resulting cues replace `subtitleCues` atomically.
-    /// `isLoadingSubtitles` flips on for the duration so the host can
-    /// show a spinner. Subsequent calls cancel any in-flight sidecar
-    /// decode.
-    ///
-    /// `httpHeaders`: extra headers for the subtitle fetch (WebDAV
-    /// auth and friends, #32). nil forwards the loaded session's
-    /// `LoadOptions.httpHeaders`, so a subtitle served by the same
-    /// authenticated host as the media works without repeating the
-    /// headers; pass an explicit dictionary (or `[:]`) to override.
-    public func selectSidecarSubtitle(url: URL, httpHeaders: [String: String]? = nil) {
-        cancelSidecarTask()
-        // Sidecar replaces any active embedded stream.
-        cancelEmbeddedSubtitleReader()
-        activeEmbeddedSubtitleStreamIndex = -1
-
-        loadedSidecarURL = url
-        isSubtitleActive = true
-        subtitleCues = []
-        isLoadingSubtitles = true
-
-        let effectiveHeaders = httpHeaders ?? loadedOptions.httpHeaders
-        sidecarTask = Task { [weak self] in
-            let cues: [SubtitleCue]
-            do {
-                cues = try await SubtitleDecoder.decodeFile(url: url, httpHeaders: effectiveHeaders)
-            } catch {
-                EngineLog.emit("[AetherEngine] sidecar decode failed: \(error)", category: .engine)
-                await MainActor.run {
-                    // Stale-task guard: a superseded sidecar load (A->B
-                    // switch) must not clear the SUCCESSOR's loading
-                    // spinner. isSubtitleActive alone doesn't cover this:
-                    // it is true again for B by the time A's error lands.
-                    guard !Task.isCancelled, let self = self else { return }
-                    if self.isSubtitleActive {
-                        self.isLoadingSubtitles = false
-                    }
-                }
-                return
-            }
-
-            await MainActor.run {
-                // Stale-task guard, mirroring the embedded path: without
-                // it a superseded load A whose decode outlives the A->B
-                // switch overwrites B's cues (isSubtitleActive is true
-                // again for B, so that check alone can't catch it).
-                guard !Task.isCancelled, let self = self else { return }
-                guard self.isSubtitleActive else { return }
-                // Sidecar cues stay in source PTS; host renders
-                // against `engine.sourceTime`, which already adds the
-                // active producer's playlist shift to AVPlayer's clock.
-                self.subtitleCues = cues
-                self.isLoadingSubtitles = false
-            }
-        }
-    }
-
-    /// Turn subtitles off and clear cached cues. Tears down both the
-    /// sidecar SRT decode task and the side-demuxer embedded reader.
-    public func clearSubtitle() {
-        cancelSidecarTask()
-        cancelEmbeddedSubtitleReader()
-        activeEmbeddedSubtitleStreamIndex = -1
-        loadedSidecarURL = nil
-        isSubtitleActive = false
-        subtitleCues = []
-        isLoadingSubtitles = false
-    }
-
-    private func cancelSidecarTask() {
-        sidecarTask?.cancel()
-        sidecarTask = nil
-    }
+    var loadedSidecarURL: URL?
 
     // MARK: - Internal teardown
-
-    /// Milliseconds since a captured DispatchTime, rounded. Used by
-    /// the reload-path diagnostic markers so each step's duration is
-    /// visible without having to do mental arithmetic from absolute
-    /// timestamps.
-    private func elapsedMs(since start: DispatchTime) -> Int {
-        Int(Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000)
-    }
-
-    /// Decide whether a load should use the audio-only path. Pure and
-    /// `nonisolated` so it is unit-testable without a `@MainActor`
-    /// engine instance. The audio path is taken when the host explicitly
-    /// requested it OR the probe found no video stream.
-    nonisolated static func shouldUseAudioOnlyPath(audioOnlyRequested: Bool, hasVideoStream: Bool) -> Bool {
-        audioOnlyRequested || !hasVideoStream
-    }
-
-    /// Whether AVPlayer/AVFoundation can natively decode this audio codec
-    /// on Apple platforms, so the engine can hand the source straight to a
-    /// lean AVPlayer (hardware-accelerated, energy-efficient, native system
-    /// integration) instead of the FFmpeg software path. Whitelist, not
-    /// blacklist: anything not known-native (Opus, Vorbis, APE, WavPack,
-    /// Musepack, ...) falls back to `AudioPlaybackHost`, which decodes
-    /// everything via FFmpeg. AAC, MP3, MP2, ALAC, AC-3/E-AC-3, LPCM, and
-    /// FLAC (AVFoundation has decoded FLAC since iOS/tvOS 11) are native.
-    nonisolated static func avPlayerCanDecodeAudio(_ codecID: AVCodecID) -> Bool {
-        switch codecID {
-        case AV_CODEC_ID_AAC,
-             AV_CODEC_ID_MP3,
-             AV_CODEC_ID_MP2,
-             AV_CODEC_ID_MP1,
-             AV_CODEC_ID_ALAC,
-             AV_CODEC_ID_FLAC,
-             AV_CODEC_ID_AC3,
-             AV_CODEC_ID_EAC3,
-             AV_CODEC_ID_PCM_S16LE,
-             AV_CODEC_ID_PCM_S16BE,
-             AV_CODEC_ID_PCM_S24LE,
-             AV_CODEC_ID_PCM_S24BE,
-             AV_CODEC_ID_PCM_F32LE:
-            return true
-        default:
-            return false
-        }
-    }
 
     /// - Parameter resetDisplayCriteria: When `true` (default), release
     ///   the `AVDisplayManager.preferredDisplayCriteria` so the panel
@@ -3495,7 +1681,7 @@ public final class AetherEngine: ObservableObject {
     ///   panels (notably when paired with a Bluetooth A2DP audio route)
     ///   never settles and times out at 5 s, adding ~12 s of black-
     ///   screen latency per audio switch.
-    private func stopInternal(resetDisplayCriteria: Bool = true, keepNativeHost: Bool = false, keepCustomReader: Bool = false) {
+    func stopInternal(resetDisplayCriteria: Bool = true, keepNativeHost: Bool = false, keepCustomReader: Bool = false) {
         // Invalidate any in-flight load(): its post-await checkpoints
         // compare against this counter and unwind when stale.
         loadGeneration &+= 1
@@ -3614,411 +1800,6 @@ public final class AetherEngine: ObservableObject {
         clock.seekableLiveRange = nil
         clock.isAtLiveEdge = false
         clock.behindLiveSeconds = 0
-    }
-
-    // MARK: - Memory diagnostic
-
-    /// Start the periodic memory probe. Cancels any prior probe so a
-    /// fresh `load(url:)` cycle starts a clean timeline. Drives one
-    /// `EngineLog.emit` line every 30 s under the `.engine` category;
-    /// the line shape is documented on `memoryProbeTask`.
-    private func startMemoryProbe() {
-        memoryProbeTask?.cancel()
-        let sessionStart = Date()
-        memoryProbeTask = Task { @MainActor [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(30))
-                if Task.isCancelled { return }
-                guard let self = self else { return }
-                let elapsed = Int(Date().timeIntervalSince(sessionStart))
-                let rssMB = Self.residentMemoryMB()
-                let cueCount = self.subtitleCues.count
-
-                // AVPlayer-side buffer probe: how much content has the
-                // native host's current AVPlayerItem actually loaded? If
-                // this number balloons past `preferredForwardBufferDuration`,
-                // AVPlayer is buffering more than we asked it to and is
-                // a candidate for the linear-growth memory leak.
-                var bufferAheadSec = 0.0
-                var bufferBehindSec = 0.0
-                if let avPlayer = self.currentAVPlayer,
-                   let item = avPlayer.currentItem {
-                    let now = item.currentTime().seconds
-                    for value in item.loadedTimeRanges {
-                        let range = value.timeRangeValue
-                        let start = range.start.seconds
-                        let end = (range.start + range.duration).seconds
-                        if end > now { bufferAheadSec += end - max(start, now) }
-                        if start < now { bufferBehindSec += min(end, now) - start }
-                    }
-                }
-
-                // Pipeline counters from the native HLS engine. Zero
-                // when the SW path is active (no HLSVideoEngine) or
-                // pre-start. Read once per probe — fields are not
-                // mutually atomic but the 30 s cadence makes drift
-                // irrelevant for trend analysis.
-                let stats = self.nativeVideoSession?.diagnosticStats()
-                let avioMB = (stats?.avioBytesFetched ?? 0) / 1024 / 1024
-                let cacheMB = (stats?.segmentCacheBytes ?? 0) / 1024 / 1024
-                let cacheCount = stats?.segmentCacheCount ?? 0
-                let packetsWritten = stats?.producerPacketsWritten ?? 0
-                let audioFifo = stats?.audioFifoSamples ?? 0
-                let abFifoKB = (stats?.audioBridgeFifoBytes ?? 0) / 1024
-                let abSwrKB = (stats?.audioBridgeSwrBytes ?? 0) / 1024
-                let abTotKB = (stats?.audioBridgeTotalBytes ?? 0) / 1024
-                let muxBytesMB = (stats?.muxerLifetimeFragmentBytes ?? 0) / 1024 / 1024
-                let muxCuts = stats?.muxerFragmentCuts ?? 0
-                let srvConns = stats?.serverConnectionCount ?? 0
-                let srvBytesMB = (stats?.serverLifetimeBytesSent ?? 0) / 1024 / 1024
-                let srvSfMB = (stats?.serverSendfileBytesSent ?? 0) / 1024 / 1024
-                let pktAlive = stats?.packetsAlive ?? 0
-                let pktTotal = stats?.packetsTotalAllocs ?? 0
-
-                // VM breakdown so the leak source is visible at probe
-                // time: internal (Swift / libavformat heap) vs external
-                // (mmap'd cache files, dyld) vs IOSurface (HEVC decoded
-                // frames) vs compressed (kernel-compressed pages still
-                // accounted to us).
-                let vmStr: String
-                if let vm = Self.vmBreakdownMB() {
-                    vmStr = "vmInt=\(vm.internalMB)MB "
-                        + "vmExt=\(vm.externalMB)MB "
-                        + "vmCmp=\(vm.compressedMB)MB "
-                        + "vmIOS=\(vm.iosurfaceMB)MB "
-                        + "physFP=\(vm.physFootprintMB)MB "
-                } else {
-                    vmStr = ""
-                }
-
-                let mallocStr: String
-                if let m = Self.mallocZoneSummary() {
-                    mallocStr = "mallocBlocks=\(m.blocksInUse) mallocMB=\(m.sizeInUseMB) "
-                } else {
-                    mallocStr = ""
-                }
-
-                let line = "[AetherEngine] memprobe t=\(elapsed)s "
-                    + "rss=\(rssMB)MB "
-                    + vmStr
-                    + mallocStr
-                    + "avioFetchedMB=\(avioMB) "
-                    + "cacheCount=\(cacheCount) cacheMB=\(cacheMB) "
-                    + "packetsWritten=\(packetsWritten) "
-                    + "audioFifo=\(audioFifo) "
-                    + "abFifoKB=\(abFifoKB) abSwrKB=\(abSwrKB) abTotKB=\(abTotKB) "
-                    + "muxBytesMB=\(muxBytesMB) muxCuts=\(muxCuts) "
-                    + "srvConns=\(srvConns) srvBytesMB=\(srvBytesMB) srvSfMB=\(srvSfMB) "
-                    + "pktAlive=\(pktAlive) pktTotal=\(pktTotal) "
-                    + "subCues=\(cueCount) "
-                    + "audioTracks=\(self.audioTracks.count) "
-                    + "subTracks=\(self.subtitleTracks.count) "
-                    + "subActive=\(self.isSubtitleActive) "
-                    + "avBufAhead=\(String(format: "%.1f", bufferAheadSec))s "
-                    + "avBufBehind=\(String(format: "%.1f", bufferBehindSec))s"
-
-                EngineLog.emit(line, category: .engine)
-            }
-        }
-    }
-
-    /// Start the 1 Hz live-telemetry sampler. Cancels any prior sampler
-    /// so a fresh `load(url:)` cycle starts a clean timeline. Mirrors
-    /// `startMemoryProbe`'s lifecycle so the two diagnostic surfaces
-    /// share the same start + stop hooks.
-    private func startLiveTelemetrySampler() {
-        liveTelemetrySampler?.stop()
-        let sampler = LiveTelemetrySampler(engine: self)
-        liveTelemetrySampler = sampler
-        sampler.start()
-    }
-
-    /// Resident memory footprint of the current process in MB, read via
-    /// `mach_task_basic_info`. Returns 0 on error. Cheap to call (no
-    /// allocations) and safe from any thread.
-    static func residentMemoryMB() -> Int {
-        var info = mach_task_basic_info()
-        var count = mach_msg_type_number_t(
-            MemoryLayout<mach_task_basic_info>.size / MemoryLayout<integer_t>.size
-        )
-        let kr = withUnsafeMutablePointer(to: &info) {
-            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
-            }
-        }
-        guard kr == KERN_SUCCESS else { return 0 }
-        return Int(info.resident_size / 1024 / 1024)
-    }
-
-    /// Detailed VM breakdown via `task_vm_info`. Splits the process's
-    /// phys_footprint (jetsam-accounted bytes) into the buckets the
-    /// kernel tracks separately:
-    ///
-    ///   internal:   anonymous memory — heap, stack, NSData backing,
-    ///               anything malloc'd
-    ///   external:   file-backed memory — mmap'd files, dyld text/data,
-    ///               our SegmentCache reads via `.alwaysMapped`
-    ///   compressed: pages the kernel compressed under pressure (still
-    ///               counted against the process footprint)
-    ///   iosurfaces: IOSurface-backed device memory (decoded video
-    ///               frames, AVPlayer's HEVC reference pool)
-    ///
-    /// Surfaced in the 30 s memprobe line so memory-growth investigations
-    /// can see which bucket moved between samples.
-    static func vmBreakdownMB() -> (internalMB: Int,
-                                    externalMB: Int,
-                                    compressedMB: Int,
-                                    iosurfaceMB: Int,
-                                    physFootprintMB: Int)? {
-        var info = task_vm_info_data_t()
-        var count = mach_msg_type_number_t(
-            MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size
-        )
-        let kr = withUnsafeMutablePointer(to: &info) {
-            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
-            }
-        }
-        guard kr == KERN_SUCCESS else { return nil }
-        return (
-            internalMB: Int(info.internal / 1024 / 1024),
-            externalMB: Int(info.external / 1024 / 1024),
-            compressedMB: Int(info.compressed / 1024 / 1024),
-            iosurfaceMB: Int(info.device / 1024 / 1024),
-            physFootprintMB: Int(info.phys_footprint / 1024 / 1024)
-        )
-    }
-
-    /// Malloc-zone statistics for the default zone. `blocks_in_use`
-    /// counts how many distinct allocations currently exist;
-    /// `size_in_use` is their total bytes. Surfaced in the memprobe so
-    /// we can tell whether vmInt growth is many small allocations
-    /// leaking (block count climbs linearly) versus a single large
-    /// buffer growing (block count flat, size up). Passing `nil` to
-    /// malloc_zone_statistics asks libmalloc to sum across all zones
-    /// it manages — equivalent to iterating malloc_get_all_zones
-    /// without the pointer-cast gymnastics.
-    static func mallocZoneSummary() -> (blocksInUse: Int, sizeInUseMB: Int)? {
-        var stats = malloc_statistics_t()
-        malloc_zone_statistics(nil, &stats)
-        return (blocksInUse: Int(stats.blocks_in_use),
-                sizeInUseMB: Int(stats.size_in_use / 1024 / 1024))
-    }
-
-    // MARK: - Live telemetry bridge
-
-    /// Apply a fresh `LiveTelemetry` snapshot to the `@Published` mirror
-    /// on `diagnostics`. Kept as the single write-through point so the
-    /// sampler does not reach into `EngineDiagnostics` directly.
-    func applyLiveTelemetry(_ snapshot: LiveTelemetry) {
-        diagnostics.liveTelemetry = snapshot
-    }
-
-
-    /// Bytes the active demuxer has fetched from the source. Mirrors
-    /// `Demuxer.avioBytesFetched` via HLSVideoEngine's existing
-    /// diagnostic surface. Used by `LiveTelemetrySampler` for instant
-    /// + average bitrate. Returns 0 on the SW path or pre-start.
-    var demuxerBytesFetched: Int64 {
-        nativeVideoSession?.demuxerBytesFetched ?? 0
-    }
-
-    /// Total resident bytes in the loopback HLS segment cache, or `nil`
-    /// when no native session is active.
-    var cachedBytes: Int64? {
-        guard let bytes = nativeVideoSession?.segmentCacheTotalBytes else { return nil }
-        return Int64(bytes)
-    }
-
-    /// Authoritative on-disk byte footprint of the loopback HLS segment
-    /// cache (freshly stat-ed resident files), or `nil` when no native
-    /// session is active. Public so the `aetherctl live --report-cache-
-    /// bytes` harness can verify the live window keeps disk bounded.
-    public var segmentCacheDiskBytes: Int64? {
-        nativeVideoSession?.segmentCacheDiskBytes
-    }
-
-    /// Lifetime count of frames the SW host has enqueued into its
-    /// AVSampleBufferDisplayLayer. Zero on the native path or pre-start.
-    var softwareHostFramesEnqueued: Int {
-        softwareHost?.framesEnqueued ?? 0
-    }
-
-    /// Number of producer restart sessions in the current session. Zero
-    /// on the SW path or pre-start.
-    var producerRestartCount: Int {
-        nativeVideoSession?.producerRestartCount ?? 0
-    }
-
-    /// Lifetime bytes emitted by the active MP4SegmentMuxer.
-    var muxedBytesLifetime: Int64 {
-        Int64(nativeVideoSession?.muxedBytesLifetime ?? 0)
-    }
-
-    /// Lifetime bytes the loopback HLS server has written to AVPlayer.
-    var serverBytesSentLifetime: Int64 {
-        Int64(nativeVideoSession?.serverLifetimeBytesSent ?? 0)
-    }
-
-    /// Number of HTTP requests served by the loopback HLS server.
-    var serverRequestCount: Int {
-        nativeVideoSession?.serverRequestCount ?? 0
-    }
-
-    /// Bytes currently held in `AudioBridge`'s FIFO + swr-delay buffers.
-    /// Zero when the bridge isn't live (stream-copy audio path or
-    /// video-only source).
-    var audioBridgeLiveBytes: Int {
-        nativeVideoSession?.audioBridgeLiveBytes ?? 0
-    }
-
-    /// Most recently measured audio/video gate gap in source-clock
-    /// milliseconds. 0 until the first audio gate opens.
-    var lastAVGapMs: Double {
-        nativeVideoSession?.lastAVGapMs ?? 0
-    }
-
-    // MARK: - Decoder identity helpers
-
-    /// Build a user-facing label for the active video decoder. Native
-    /// dispatch goes through VideoToolbox on every Apple platform we
-    /// ship to, so the "HW" tag holds even on HW-AV1 capable devices;
-    /// the SW branch covers the dav1d-on-tvOS AV1 case and the libavcodec
-    /// VP9 path. Returns `nil` when the source had no video track
-    /// (AV_CODEC_ID_NONE) so the caller can hide the row instead of
-    /// printing a placeholder.
-    private static func videoDecoderLabel(codecID: AVCodecID, isSoftware: Bool) -> String? {
-        guard codecID != AV_CODEC_ID_NONE else { return nil }
-        let name: String = {
-            guard let cstr = avcodec_get_name(codecID) else { return "video" }
-            return String(cString: cstr).uppercased()
-        }()
-        if isSoftware {
-            // SW host paths: AV1 via dav1d, VP9 via libavcodec's vp9
-            // decoder, plus legacy codecs AVPlayer's HLS-fMP4 pipeline
-            // does not accept (MPEG-4 Part 2 / MPEG-2 / VC-1) via the
-            // matching libavcodec native decoder. SoftwareVideoDecoder
-            // resolves the actual decoder via `avcodec_find_decoder`.
-            switch codecID {
-            case AV_CODEC_ID_AV1: return "dav1d \(name) (SW)"
-            default:              return "libavcodec \(name) (SW)"
-            }
-        }
-        return "VideoToolbox \(name) (HW)"
-    }
-
-    /// Build a user-facing label for the active audio decoder on the
-    /// software path. The SW host always uses libavcodec for audio
-    /// decode then hands PCM to CoreAudio, so the label is uniform.
-    /// Returns `nil` when the source has no audio.
-    private static func softwareAudioDecoderLabel(
-        audioTracks: [TrackInfo],
-        activeIndex: Int32
-    ) -> String? {
-        guard activeIndex >= 0,
-              let track = audioTracks.first(where: { $0.id == Int(activeIndex) }) else {
-            return nil
-        }
-        return "libavcodec \(track.codec.uppercased()) → CoreAudio"
-    }
-
-    // MARK: - Format / frame-rate probing
-
-    private nonisolated static func detectVideoFormat(stream: UnsafeMutablePointer<AVStream>) -> VideoFormat {
-        let codecpar = stream.pointee.codecpar.pointee
-        // Dolby Vision side-data (the `dvcC` / `dvvC` box parsed out of
-        // the container) is the authoritative DV marker, independent of
-        // base-layer transfer characteristic. Profile 5 is non-backward-
-        // compatible (no HDR10/HLG base; ships with SMPTE2084 OR an
-        // unspecified trc depending on muxer); Profile 7 and 8.1 use
-        // SMPTE2084 base; Profile 8.4 uses HLG base. Branching on
-        // `color_trc` first mis-classifies the HLG-base case (P8.4
-        // reported as plain HLG) and any unspecified-trc case (P5 with
-        // an empty base-layer VUI reported as SDR) — both surface as
-        // criteria writes with `codec=hvc1` instead of `dvh1`, so the
-        // panel never enters DV mode even when it could. DrHurt#4
-        // (2026-05-26): on a DV-capable panel, only P8.1 was producing
-        // `format=dolbyvision codec=dvh1` pre-fix.
-        if Self.streamHasDV(stream: stream) {
-            return .dolbyVision
-        }
-        let transfer = codecpar.color_trc
-        if transfer == AVCOL_TRC_SMPTE2084 { return .hdr10 }
-        if transfer == AVCOL_TRC_ARIB_STD_B67 { return .hlg }
-        return .sdr
-    }
-
-    /// Clamp the source-detected format to what the active display can
-    /// actually present. AVPlayer renders DV's HDR10 (PQ) or HLG base
-    /// layer on a non-DV panel — HLSVideoEngine forces this by emitting
-    /// plain `hvc1` when `dvModeAvailable=false` — so the engine publishes
-    /// the base format the panel ends up showing, not the source's DV
-    /// claim. Picks the base from the source `color_trc`: PQ → hdr10,
-    /// HLG → hlg. SDR-base DV (P8.2) collapses to .sdr; HLSVideoEngine
-    /// refuses to serve it anyway so the badge never reaches the UI.
-    private static func effectiveVideoFormat(
-        detected: VideoFormat,
-        stream: UnsafeMutablePointer<AVStream>
-    ) -> VideoFormat {
-        guard detected == .dolbyVision else { return detected }
-        let caps = displayCapabilities
-        if caps.supportsDolbyVision { return .dolbyVision }
-        let trc = stream.pointee.codecpar.pointee.color_trc
-        if trc == AVCOL_TRC_ARIB_STD_B67 {
-            return caps.supportsHLG ? .hlg : .sdr
-        }
-        // SMPTE2084 base (P5 / P7 / P8.1) or an unspecified trc (P5
-        // sometimes ships with an empty base-layer VUI). Both are
-        // HDR-derived; AVPlayer tonemaps via the dvh1 sample entry on
-        // a non-DV panel. Map to HDR10 if the panel can present it.
-        return caps.supportsHDR10 ? .hdr10 : .sdr
-    }
-
-    /// Called (once per session) when either backend's HDR10+ scan
-    /// catches a T.35 metadata payload. The host's badge tracks
-    /// `videoFormat`, so flipping `.hdr10 → .hdr10Plus` here is what
-    /// gets the badge to read "HDR10+". Guarded against upgrading
-    /// non-HDR10 states: a DV / HLG / SDR-clamped session that also
-    /// happens to carry HDR10+ metadata stays on its current format
-    /// because we have no evidence the panel is rendering an HDR10
-    /// base layer in those cases.
-    @MainActor
-    private func handleHDR10PlusDetected() {
-        // Source upgrade runs independently of the panel guard below:
-        // a T.35 payload in the stream is a property of the file, so an
-        // HDR10 source that's currently clamped to .sdr for an SDR panel
-        // still has its sourceVideoFormat correctly bumped to .hdr10Plus.
-        if sourceVideoFormat == .hdr10 {
-            sourceVideoFormat = .hdr10Plus
-        }
-        guard videoFormat == .hdr10 else { return }
-        EngineLog.emit("[AetherEngine] HDR10+ T.35 detected, upgrading videoFormat .hdr10 → .hdr10Plus", category: .engine)
-        videoFormat = .hdr10Plus
-    }
-
-    private nonisolated static func streamHasDV(stream: UnsafeMutablePointer<AVStream>) -> Bool {
-        let nb = Int(stream.pointee.codecpar.pointee.nb_coded_side_data)
-        guard nb > 0, let sideData = stream.pointee.codecpar.pointee.coded_side_data else {
-            return false
-        }
-        for i in 0..<nb {
-            if sideData[i].type == AV_PKT_DATA_DOVI_CONF {
-                return true
-            }
-        }
-        return false
-    }
-
-    private nonisolated static func detectFrameRate(stream: UnsafeMutablePointer<AVStream>) -> Double? {
-        let avg = stream.pointee.avg_frame_rate
-        if avg.den > 0 && avg.num > 0 {
-            return Double(avg.num) / Double(avg.den)
-        }
-        let r = stream.pointee.r_frame_rate
-        if r.den > 0 && r.num > 0 {
-            return Double(r.num) / Double(r.den)
-        }
-        return nil
     }
 
     // MARK: - App Lifecycle
