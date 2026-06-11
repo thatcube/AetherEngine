@@ -700,7 +700,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             }
         }
 
-        return totalRead > 0 ? Int32(totalRead) : AVERROR_EOF_VALUE
+        return totalRead > 0 ? Int32(totalRead) : FFmpegErr.eof
     }
 
     // MARK: - Streaming Read (sequential GET)
@@ -752,7 +752,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             }
         }
 
-        return totalRead > 0 ? Int32(totalRead) : AVERROR_EOF_VALUE
+        return totalRead > 0 ? Int32(totalRead) : FFmpegErr.eof
     }
 
     // MARK: - Persistent Read (single forward-streaming connection)
@@ -831,7 +831,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // comparison.
             if !isLive && fileSize > 0 && curPosition >= fileSize {
                 winCond.unlock()
-                return totalRead > 0 ? Int32(totalRead) : AVERROR_EOF_VALUE
+                return totalRead > 0 ? Int32(totalRead) : FFmpegErr.eof
             }
 
             // Forward seek beyond the live stream's reach: reconnect at target.
@@ -1606,6 +1606,28 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     }
 }
 
+/// Shared redirect policy for every AVIOReader delegate: preserve the
+/// `Range` header + caller-supplied extra headers across cross-host
+/// redirects. URLSession's default behaviour strips custom request
+/// headers when a redirect changes host; without this the redirected
+/// origin (e.g. a Cloudflare CDN behind an AIOStreams proxy) sees a
+/// plain GET and either streams the whole body (busted memory) or
+/// 400s on proxies that require Range.
+private func redirectPreservingHeaders(
+    task: URLSessionTask,
+    newRequest request: URLRequest,
+    extraHeaders: [String: String]
+) -> URLRequest {
+    var updated = request
+    if let originalRange = task.originalRequest?.value(forHTTPHeaderField: "Range") {
+        updated.setValue(originalRange, forHTTPHeaderField: "Range")
+    }
+    for (name, value) in extraHeaders {
+        updated.setValue(value, forHTTPHeaderField: name)
+    }
+    return updated
+}
+
 // MARK: - Persistent Read Delegate
 
 /// Per-connection delegate for the persistent forward-streaming reader.
@@ -1628,9 +1650,7 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
         self.extraHeaders = extraHeaders
     }
 
-    /// Preserve the `Range` header + caller-supplied extra headers across
-    /// cross-host redirects (URLSession strips custom headers otherwise),
-    /// same as the chunk + probe delegates.
+    /// See `redirectPreservingHeaders`.
     func urlSession(
         _ session: URLSession,
         task: URLSessionTask,
@@ -1638,14 +1658,8 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
         newRequest request: URLRequest,
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
-        var updated = request
-        if let originalRange = task.originalRequest?.value(forHTTPHeaderField: "Range") {
-            updated.setValue(originalRange, forHTTPHeaderField: "Range")
-        }
-        for (name, value) in extraHeaders {
-            updated.setValue(value, forHTTPHeaderField: name)
-        }
-        completionHandler(updated)
+        completionHandler(redirectPreservingHeaders(
+            task: task, newRequest: request, extraHeaders: extraHeaders))
     }
 
     func urlSession(
@@ -1710,12 +1724,7 @@ private final class ChunkFetchDelegate: NSObject, URLSessionDataDelegate, @unche
         self.extraHeaders = extraHeaders
     }
 
-    /// Preserve the `Range` header + caller-supplied extra headers on
-    /// cross-host redirects. URLSession strips custom headers when a
-    /// redirect changes host; without this the CDN sees a plain GET
-    /// instead of a partial fetch and either streams the whole body
-    /// (busted memory) or 400s on proxies that require Range. See
-    /// the same hook on `ProbeDelegate` for the original incident.
+    /// See `redirectPreservingHeaders`.
     func urlSession(
         _ session: URLSession,
         task: URLSessionTask,
@@ -1723,14 +1732,8 @@ private final class ChunkFetchDelegate: NSObject, URLSessionDataDelegate, @unche
         newRequest request: URLRequest,
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
-        var updated = request
-        if let originalRange = task.originalRequest?.value(forHTTPHeaderField: "Range") {
-            updated.setValue(originalRange, forHTTPHeaderField: "Range")
-        }
-        for (name, value) in extraHeaders {
-            updated.setValue(value, forHTTPHeaderField: name)
-        }
-        completionHandler(updated)
+        completionHandler(redirectPreservingHeaders(
+            task: task, newRequest: request, extraHeaders: extraHeaders))
     }
 
     func urlSession(
@@ -1839,13 +1842,7 @@ private final class ProbeDelegate: NSObject, URLSessionDataDelegate, @unchecked 
         self.extraHeaders = extraHeaders
     }
 
-    /// Preserve the `Range` header (and the caller-supplied extra
-    /// headers) on cross-host redirects. URLSession's default
-    /// `willPerformHTTPRedirection` strips custom request headers when
-    /// the redirect changes host; without this, the redirected origin
-    /// (e.g. Cloudflare CDN behind an AIOStreams proxy) sees a regular
-    /// GET and either streams the full body or `400 Bad Request`s on
-    /// proxies that require Range.
+    /// See `redirectPreservingHeaders`.
     func urlSession(
         _ session: URLSession,
         task: URLSessionTask,
@@ -1853,14 +1850,8 @@ private final class ProbeDelegate: NSObject, URLSessionDataDelegate, @unchecked 
         newRequest request: URLRequest,
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
-        var updated = request
-        if let originalRange = task.originalRequest?.value(forHTTPHeaderField: "Range") {
-            updated.setValue(originalRange, forHTTPHeaderField: "Range")
-        }
-        for (name, value) in extraHeaders {
-            updated.setValue(value, forHTTPHeaderField: name)
-        }
-        completionHandler(updated)
+        completionHandler(redirectPreservingHeaders(
+            task: task, newRequest: request, extraHeaders: extraHeaders))
     }
 
     /// Capture Content-Range total size, then cancel so the body
@@ -1906,9 +1897,6 @@ private final class ProbeDelegate: NSObject, URLSessionDataDelegate, @unchecked 
 
 // MARK: - C Callbacks
 
-/// FFmpeg AVERROR_EOF, the C macro can't be imported into Swift.
-/// FFERRTAG(0xF8,'E','O','F') = -541478725
-private let AVERROR_EOF_VALUE: Int32 = -541478725
 
 /// FFmpeg AVERROR(EIO): input/output error. Used as the terminal error
 /// code when a live source's reconnect cap is hit, so the demuxer raises

@@ -352,12 +352,6 @@ final class MP4SegmentMuxer {
         }
         self.formatContext = ctx
 
-        // strict=-2 lets the mp4 muxer write Dolby Vision atoms (dvcC,
-        // dvvC) and other non-strict-ISOBMFF extensions when the source
-        // codecpar carries DV side data. Matches the prior hls-path
-        // setting; mp4 muxer respects the same compliance level.
-        ctx.pointee.strict_std_compliance = -2
-
         // Pre-attach the AVIO context routing through our
         // FragmentSplitter. The mp4 muxer writes directly to `s->pb`;
         // unlike hlsenc it does NOT call `s->io_open` to allocate one
@@ -373,79 +367,11 @@ final class MP4SegmentMuxer {
         self.pb = pb
         ctx.pointee.pb = pb
 
-        // Video stream.
-        guard let videoStream = avformat_new_stream(ctx, nil) else {
+        do {
+            try Self.configureStreamsAndWriteHeader(ctx: ctx, video: video, audio: audio)
+        } catch {
             cleanup()
-            throw MuxerError.streamCreationFailed
-        }
-        let vCopy = avcodec_parameters_copy(videoStream.pointee.codecpar, video.codecpar)
-        guard vCopy >= 0 else {
-            cleanup()
-            throw MuxerError.copyParametersFailed(code: vCopy)
-        }
-        videoStream.pointee.time_base = video.timeBase
-        if let override = video.codecTagOverride,
-           let tag = Self.mkTag(fromFourCC: override) {
-            videoStream.pointee.codecpar.pointee.codec_tag = tag
-        }
-        if video.stripDolbyVisionMetadata {
-            Self.stripDolbyVisionSideData(videoStream.pointee.codecpar)
-        }
-        if let co = video.colorOverride {
-            videoStream.pointee.codecpar.pointee.color_primaries = co.primaries
-            videoStream.pointee.codecpar.pointee.color_trc = co.trc
-            videoStream.pointee.codecpar.pointee.color_space = co.space
-            videoStream.pointee.codecpar.pointee.color_range = co.range
-        }
-        if let extradata = video.extradataOverride {
-            Self.replaceExtradata(videoStream.pointee.codecpar, with: extradata)
-        }
-
-        // Audio stream (optional).
-        if let audio = audio {
-            guard let audioStream = avformat_new_stream(ctx, nil) else {
-                cleanup()
-                throw MuxerError.streamCreationFailed
-            }
-            let aCopy = avcodec_parameters_copy(audioStream.pointee.codecpar, audio.codecpar)
-            guard aCopy >= 0 else {
-                cleanup()
-                throw MuxerError.copyParametersFailed(code: aCopy)
-            }
-            audioStream.pointee.time_base = audio.timeBase
-        }
-
-        // Movflags: the leak-free trio. See class docstring.
-        // +frag_custom puts fragment cuts under explicit caller control
-        // via av_write_frame(ctx, nil); packets enter through
-        // av_interleaved_write_frame and queue in libavformat's
-        // interleaver until cross-stream DTS ordering allows commit.
-        // Note that the cut bypasses that buffer — cutFragmentForNextSegment
-        // drains it via av_interleaved_write_frame(ctx, nil) first so
-        // the trailing packets land in the segment being cut, not the
-        // next one.
-        var opts: OpaquePointer? = nil
-        defer { av_dict_free(&opts) }
-        av_dict_set(&opts, "movflags", "+empty_moov+default_base_moof+frag_custom+delay_moov", 0)
-        // No edit lists in the moov. With delay_moov the mov muxer
-        // derives an empty-edit from the FIRST packet's timestamp,
-        // which on a producer restart is the restart anchor (field
-        // evidence: elst.segment_duration == 280280 after a seek to
-        // segment 28). That makes init.mp4 position-DEPENDENT, but
-        // AVPlayer fetches EXT-X-MAP exactly once per session, so
-        // every post-restart fragment then plays against a stale edit
-        // list: post-scrub lipsync drift and timeline jumps. Position
-        // belongs exclusively in the fragments' tfdt (absolute output
-        // timeline, both tracks), which also preserves the relative
-        // head-of-stream A/V offset. With edit lists off, the moov is
-        // restart-invariant, matching the SegmentCache's pinned-init
-        // assumption.
-        av_dict_set(&opts, "use_editlist", "0", 0)
-
-        let ret = avformat_write_header(ctx, &opts)
-        guard ret >= 0 else {
-            cleanup()
-            throw MuxerError.writeHeaderFailed(code: ret)
+            throw error
         }
         self.headerWritten = true
 
@@ -519,8 +445,6 @@ final class MP4SegmentMuxer {
         }
         defer { avformat_free_context(ctx) }
 
-        ctx.pointee.strict_std_compliance = -2
-
         // In-memory AVIO sink. avio_open_dyn_buf returns a context
         // whose write callback appends to an internal buffer; we
         // discard the buffer at the end so no bytes survive the probe.
@@ -538,12 +462,42 @@ final class MP4SegmentMuxer {
             }
         }
 
-        // Video stream.
-        guard let videoStream = avformat_new_stream(ctx, nil) else {
+        do {
+            try Self.configureStreamsAndWriteHeader(ctx: ctx, video: video, audio: audio)
+            return 0
+        } catch MuxerError.copyParametersFailed(let code) {
+            return code
+        } catch MuxerError.writeHeaderFailed(let code) {
+            return code
+        } catch {
             return -1
         }
+    }
+
+    /// Stream setup + header write shared by the session muxer init and
+    /// `probeWriteHeader`. Single source of truth on purpose: any drift
+    /// between the two would let the probe pass while the real muxer
+    /// fails (or vice versa), which is exactly the failure mode the
+    /// probe exists to prevent.
+    private static func configureStreamsAndWriteHeader(
+        ctx: UnsafeMutablePointer<AVFormatContext>,
+        video: VideoConfig,
+        audio: AudioConfig?
+    ) throws {
+        // strict=-2 lets the mp4 muxer write Dolby Vision atoms (dvcC,
+        // dvvC) and other non-strict-ISOBMFF extensions when the source
+        // codecpar carries DV side data. Matches the prior hls-path
+        // setting; mp4 muxer respects the same compliance level.
+        ctx.pointee.strict_std_compliance = -2
+
+        // Video stream.
+        guard let videoStream = avformat_new_stream(ctx, nil) else {
+            throw MuxerError.streamCreationFailed
+        }
         let vCopy = avcodec_parameters_copy(videoStream.pointee.codecpar, video.codecpar)
-        guard vCopy >= 0 else { return vCopy }
+        guard vCopy >= 0 else {
+            throw MuxerError.copyParametersFailed(code: vCopy)
+        }
         videoStream.pointee.time_base = video.timeBase
         if let override = video.codecTagOverride,
            let tag = Self.mkTag(fromFourCC: override) {
@@ -565,20 +519,46 @@ final class MP4SegmentMuxer {
         // Audio stream (optional).
         if let audio = audio {
             guard let audioStream = avformat_new_stream(ctx, nil) else {
-                return -1
+                throw MuxerError.streamCreationFailed
             }
             let aCopy = avcodec_parameters_copy(audioStream.pointee.codecpar, audio.codecpar)
-            guard aCopy >= 0 else { return aCopy }
+            guard aCopy >= 0 else {
+                throw MuxerError.copyParametersFailed(code: aCopy)
+            }
             audioStream.pointee.time_base = audio.timeBase
         }
 
+        // Movflags: the leak-free trio. See class docstring.
+        // +frag_custom puts fragment cuts under explicit caller control
+        // via av_write_frame(ctx, nil); packets enter through
+        // av_interleaved_write_frame and queue in libavformat's
+        // interleaver until cross-stream DTS ordering allows commit.
+        // Note that the cut bypasses that buffer — cutFragmentForNextSegment
+        // drains it via av_interleaved_write_frame(ctx, nil) first so
+        // the trailing packets land in the segment being cut, not the
+        // next one.
         var opts: OpaquePointer? = nil
         defer { av_dict_free(&opts) }
         av_dict_set(&opts, "movflags", "+empty_moov+default_base_moof+frag_custom+delay_moov", 0)
-        // Mirror the session muxer: no edit lists (see openSession).
+        // No edit lists in the moov. With delay_moov the mov muxer
+        // derives an empty-edit from the FIRST packet's timestamp,
+        // which on a producer restart is the restart anchor (field
+        // evidence: elst.segment_duration == 280280 after a seek to
+        // segment 28). That makes init.mp4 position-DEPENDENT, but
+        // AVPlayer fetches EXT-X-MAP exactly once per session, so
+        // every post-restart fragment then plays against a stale edit
+        // list: post-scrub lipsync drift and timeline jumps. Position
+        // belongs exclusively in the fragments' tfdt (absolute output
+        // timeline, both tracks), which also preserves the relative
+        // head-of-stream A/V offset. With edit lists off, the moov is
+        // restart-invariant, matching the SegmentCache's pinned-init
+        // assumption.
         av_dict_set(&opts, "use_editlist", "0", 0)
 
-        return avformat_write_header(ctx, &opts)
+        let ret = avformat_write_header(ctx, &opts)
+        guard ret >= 0 else {
+            throw MuxerError.writeHeaderFailed(code: ret)
+        }
     }
 
     // MARK: - Pump-side API

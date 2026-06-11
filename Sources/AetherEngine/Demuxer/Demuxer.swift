@@ -3,9 +3,6 @@ import Libavformat
 import Libavcodec
 import Libavutil
 
-/// AVERROR_EOF, FFmpeg's end-of-file sentinel. The C macro can't be
-/// imported into Swift, so we define it inline: FFERRTAG(0xF8,'E','O','F').
-private let AVERROR_EOF_VALUE: Int32 = -541478725
 
 /// Open-time tuning for the demuxer + its AVIO reader. `.playback` is
 /// the default everywhere; `.stillExtraction` switches AVIO to a
@@ -598,7 +595,7 @@ public final class Demuxer: @unchecked Sendable {
         let ret = av_read_frame(ctx, packet)
         if ret < 0 {
             trackedPacketFree(&packet)
-            let isEOF = (ret == AVERROR_EOF_VALUE)
+            let isEOF = (ret == FFmpegErr.eof)
             if isEOF {
                 return nil
             }

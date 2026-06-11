@@ -614,6 +614,13 @@ final class NativeAVPlayerHost {
         avPlayer.rate = value
     }
 
+    /// Forwarded AVPlayer volume so the host satisfies
+    /// `TransportControllable` like the other three hosts.
+    var volume: Float {
+        get { avPlayer.volume }
+        set { avPlayer.volume = newValue }
+    }
+
     /// Stage the metadata items the host wants on the current and any
     /// future `AVPlayerItem` of this session. The system Now Playing
     /// surface reads from `AVPlayerItem.externalMetadata` when an

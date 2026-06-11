@@ -675,7 +675,7 @@ final class AudioBridge: @unchecked Sendable {
         }
 
         var sendRet = avcodec_send_packet(dec, packet)
-        if sendRet == AVERROR_EAGAIN_VALUE {
+        if sendRet == FFmpegErr.eagain {
             // Standard FFmpeg contract: EAGAIN from send_packet means the
             // decoder's output queue is full (possible on multi-frame
             // packets, e.g. TrueHD bursts) and frames must be received
@@ -684,7 +684,7 @@ final class AudioBridge: @unchecked Sendable {
             try receiveDecodedFrames()
             sendRet = avcodec_send_packet(dec, packet)
         }
-        if sendRet == AVERROR_INVALIDDATA_VALUE {
+        if sendRet == FFmpegErr.invalidData {
             // Corrupt source packet (glitchy live MPEG-TS, broken mp2
             // header). The decoder stays usable for the next valid packet,
             // so skip this one rather than throwing. Throwing per-packet on
@@ -692,7 +692,7 @@ final class AudioBridge: @unchecked Sendable {
             // errors (hundreds per second on a bad feed) for no benefit.
             return results
         }
-        if sendRet < 0 && sendRet != AVERROR_EOF_VALUE {
+        if sendRet < 0 && sendRet != FFmpegErr.eof {
             throw AudioBridgeError.sendPacketFailed(code: sendRet)
         }
 
@@ -846,7 +846,7 @@ final class AudioBridge: @unchecked Sendable {
             _ = nChannels
 
             let sendFrameRet = avcodec_send_frame(enc, of)
-            if sendFrameRet < 0 && sendFrameRet != AVERROR_EOF_VALUE {
+            if sendFrameRet < 0 && sendFrameRet != FFmpegErr.eof {
                 throw AudioBridgeError.sendFrameFailed(code: sendFrameRet)
             }
 
@@ -854,7 +854,7 @@ final class AudioBridge: @unchecked Sendable {
             while true {
                 guard let outPkt = trackedPacketAlloc() else { break }
                 let recvRet = avcodec_receive_packet(enc, outPkt)
-                if recvRet == AVERROR_EAGAIN_VALUE || recvRet == AVERROR_EOF_VALUE {
+                if recvRet == FFmpegErr.eagain || recvRet == FFmpegErr.eof {
                     var p: UnsafeMutablePointer<AVPacket>? = outPkt
                     trackedPacketFree(&p)
                     break
@@ -870,15 +870,3 @@ final class AudioBridge: @unchecked Sendable {
     }
 }
 
-/// `AVERROR(EAGAIN)` and `AVERROR_EOF` are macros Swift can't import,
-/// so we rederive them. EAGAIN is POSIX 35 on Apple platforms, and
-/// FFmpeg's macro is `-(35)` after the FFERRTAG transform; but in
-/// practice the constant FFmpeg returns is the negated POSIX value
-/// for EAGAIN and a tagged sentinel for EOF.
-private let AVERROR_EAGAIN_VALUE: Int32 = -35
-private let AVERROR_EOF_VALUE: Int32 = -0x20464F45  // FFERRTAG('E','O','F',' ')
-/// `AVERROR_INVALIDDATA` = `FFERRTAG('I','N','D','A')`. Returned by a
-/// decoder fed a corrupt elementary-stream packet (e.g. a broken MPEG
-/// audio frame with a missing header, common on a glitchy live MPEG-TS
-/// source). Treated as "skip this packet", not fatal.
-private let AVERROR_INVALIDDATA_VALUE: Int32 = -0x41444E49

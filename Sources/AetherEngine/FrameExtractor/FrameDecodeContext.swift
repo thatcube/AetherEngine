@@ -6,12 +6,6 @@ import Libavcodec
 import Libavutil
 import Libswscale
 
-/// avcodec_receive_frame "needs more input" sentinel. AVERROR(EAGAIN);
-/// the EAGAIN errno is 35 on Darwin and FFmpeg negates it.
-private let AVERROR_EAGAIN_VALUE: Int32 = -35
-/// FFmpeg AVERROR_EOF: FFERRTAG(0xF8,'E','O','F') = -541478725.
-private let AVERROR_FRAMEDECODE_EOF_VALUE: Int32 = -541478725
-
 /// Isolated, single-threaded FFmpeg decode context for still-image
 /// extraction. Owns its own `Demuxer`, `AVCodecContext` (forced
 /// software), and `SwsContext`, strictly separate from playback. Lazy:
@@ -229,8 +223,8 @@ final class FrameDecodeContext: @unchecked Sendable {
             while true {
                 if isCancelled() { return nil }
                 let recvRet = avcodec_receive_frame(ctx, frame)
-                if recvRet == AVERROR_EAGAIN_VALUE { break }           // need another packet
-                if recvRet == AVERROR_FRAMEDECODE_EOF_VALUE { return nil } // decoder drained
+                if recvRet == FFmpegErr.eagain { break }           // need another packet
+                if recvRet == FFmpegErr.eof { return nil } // decoder drained
                 guard recvRet >= 0, let f = frame else { break }       // real error: try next packet
 
                 // Skip frames before the requested PTS for frame-accuracy.

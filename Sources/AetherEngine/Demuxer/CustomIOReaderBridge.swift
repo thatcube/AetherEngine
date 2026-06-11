@@ -94,7 +94,7 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
         let n = reader.read(buf, size: size)
         // IOReader's contract uses 0 for EOF; FFmpeg's avio expects
         // AVERROR_EOF and can spin on a literal 0. Map it.
-        if n == 0 { return AVERROR_EOF_BRIDGE }
+        if n == 0 { return FFmpegErr.eof }
         return n
     }
 
@@ -106,9 +106,6 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
 
 // MARK: - C Callbacks
 
-/// FFmpeg AVERROR_EOF, FFERRTAG(0xF8,'E','O','F') = -541478725. The C macro
-/// cannot be imported into Swift; mirrors AVIOReader's private constant.
-private let AVERROR_EOF_BRIDGE: Int32 = -541478725
 
 private func customBridgeReadCallback(
     opaque: UnsafeMutableRawPointer?,

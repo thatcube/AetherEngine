@@ -2305,16 +2305,19 @@ public final class AetherEngine: ObservableObject {
 
     // MARK: - Transport
 
+    /// The host that currently owns transport, in the canonical
+    /// priority order (audio-AVPlayer -> FFmpeg audio -> software ->
+    /// native). Every transport entry point dispatches through this so
+    /// the priority can't drift between call sites.
+    private var activeTransportHost: (any TransportControllable)? {
+        if audioAVPlayerActive, let host = audioAVPlayerHost { return host }
+        if let host = audioHost { return host }
+        if let host = softwareHost { return host }
+        return nativeHost
+    }
+
     public func play() {
-        if audioAVPlayerActive, let host = audioAVPlayerHost {
-            host.play()
-        } else if let host = audioHost {
-            host.play()
-        } else if let host = softwareHost {
-            host.play()
-        } else {
-            nativeHost?.play()
-        }
+        activeTransportHost?.play()
         if state == .paused || state == .loading {
             state = .playing
         }
@@ -2357,15 +2360,7 @@ public final class AetherEngine: ObservableObject {
     }
 
     public func pause() {
-        if audioAVPlayerActive, let host = audioAVPlayerHost {
-            host.pause()
-        } else if let host = audioHost {
-            host.pause()
-        } else if let host = softwareHost {
-            host.pause()
-        } else {
-            nativeHost?.pause()
-        }
+        activeTransportHost?.pause()
         if state == .playing {
             state = .paused
         }
@@ -2518,10 +2513,7 @@ public final class AetherEngine: ObservableObject {
         // sidecar SRT is active (it pre-decoded the whole file).
         if activeEmbeddedSubtitleStreamIndex >= 0, let url = loadedURL {
             let streamIdx = activeEmbeddedSubtitleStreamIndex
-            embeddedSubtitleTask?.cancel()
-            embeddedSubtitleTask = nil
-            activeSubtitleSideDemuxer?.markClosed()
-            activeSubtitleSideDemuxer = nil
+            cancelEmbeddedSubtitleReader()
             subtitleCues = []
             // Side-demuxer seeks in source PTS, which is the seek target.
             // For custom sources, request a fresh clone; skip re-arm if the
@@ -2675,15 +2667,14 @@ public final class AetherEngine: ObservableObject {
         audioAVPlayerHost?.setExternalMetadata(items)
     }
 
-    /// Set playback volume (0.0 = mute, 1.0 = full).
+    /// Set playback volume (0.0 = mute, 1.0 = full). Routed through the
+    /// ACTIVE host only: the previous setter wrote into every host,
+    /// including the engine-lifetime audio host, so a volume change
+    /// during a video session silently changed the next music
+    /// session's volume.
     public var volume: Float {
-        get { (audioAVPlayerActive ? audioAVPlayerHost?.volume : nil) ?? audioHost?.volume ?? softwareHost?.volume ?? nativeHost?.avPlayer.volume ?? 1.0 }
-        set {
-            audioAVPlayerHost?.volume = newValue
-            audioHost?.volume = newValue
-            softwareHost?.volume = newValue
-            nativeHost?.avPlayer.volume = newValue
-        }
+        get { activeTransportHost?.volume ?? 1.0 }
+        set { activeTransportHost?.volume = newValue }
     }
 
     /// Set playback speed (0.5-2.0). On the native AVPlayer path audio
@@ -2691,15 +2682,7 @@ public final class AetherEngine: ObservableObject {
     /// rate goes through the synchronizer and audio plays at the
     /// changed rate without pitch correction.
     public func setRate(_ rate: Float) {
-        if audioAVPlayerActive, let host = audioAVPlayerHost {
-            host.setRate(rate)
-        } else if let host = audioHost {
-            host.setRate(rate)
-        } else if let host = softwareHost {
-            host.setRate(rate)
-        } else {
-            nativeHost?.setRate(rate)
-        }
+        activeTransportHost?.setRate(rate)
     }
 
     // MARK: - Audio / subtitle track selection
@@ -2992,12 +2975,7 @@ public final class AetherEngine: ObservableObject {
             customClone = clone
         }
         cancelSidecarTask()
-        embeddedSubtitleTask?.cancel()
-        embeddedSubtitleTask = nil
-        // Unblock a side demuxer parked in a network read; cancel alone
-        // is only observed between reads (see runEmbeddedSubtitleReader).
-        activeSubtitleSideDemuxer?.markClosed()
-        activeSubtitleSideDemuxer = nil
+        cancelEmbeddedSubtitleReader()
 
         isSubtitleActive = true
         subtitleCues = []
@@ -3370,6 +3348,18 @@ public final class AetherEngine: ObservableObject {
         subtitleCues.removeAll { $0.endTime < cutoff }
     }
 
+    /// Cancel the embedded-subtitle side reader: cancel the task AND
+    /// abort its demuxer. The markClosed matters because Task.cancel()
+    /// is only observed between reads; a side demuxer parked in a
+    /// network read (or the AVIO reconnect loop) would otherwise
+    /// survive the teardown (see runEmbeddedSubtitleReader).
+    private func cancelEmbeddedSubtitleReader() {
+        embeddedSubtitleTask?.cancel()
+        embeddedSubtitleTask = nil
+        activeSubtitleSideDemuxer?.markClosed()
+        activeSubtitleSideDemuxer = nil
+    }
+
     /// Decode a sidecar subtitle file (`.srt` / `.ass` / `.vtt` /
     /// `.ssa` served alongside the media). The whole file is fetched
     /// and decoded up-front via `SubtitleDecoder.decodeFile`, then the
@@ -3386,12 +3376,7 @@ public final class AetherEngine: ObservableObject {
     public func selectSidecarSubtitle(url: URL, httpHeaders: [String: String]? = nil) {
         cancelSidecarTask()
         // Sidecar replaces any active embedded stream.
-        embeddedSubtitleTask?.cancel()
-        embeddedSubtitleTask = nil
-        // Unblock a side demuxer parked in a network read; cancel alone
-        // is only observed between reads (see runEmbeddedSubtitleReader).
-        activeSubtitleSideDemuxer?.markClosed()
-        activeSubtitleSideDemuxer = nil
+        cancelEmbeddedSubtitleReader()
         activeEmbeddedSubtitleStreamIndex = -1
 
         loadedSidecarURL = url
@@ -3439,12 +3424,7 @@ public final class AetherEngine: ObservableObject {
     /// sidecar SRT decode task and the side-demuxer embedded reader.
     public func clearSubtitle() {
         cancelSidecarTask()
-        embeddedSubtitleTask?.cancel()
-        embeddedSubtitleTask = nil
-        // Unblock a side demuxer parked in a network read; cancel alone
-        // is only observed between reads (see runEmbeddedSubtitleReader).
-        activeSubtitleSideDemuxer?.markClosed()
-        activeSubtitleSideDemuxer = nil
+        cancelEmbeddedSubtitleReader()
         activeEmbeddedSubtitleStreamIndex = -1
         loadedSidecarURL = nil
         isSubtitleActive = false
@@ -3617,12 +3597,7 @@ public final class AetherEngine: ObservableObject {
         liveWindowTimerTask = nil
 
         cancelSidecarTask()
-        embeddedSubtitleTask?.cancel()
-        embeddedSubtitleTask = nil
-        // Unblock a side demuxer parked in a network read; cancel alone
-        // is only observed between reads (see runEmbeddedSubtitleReader).
-        activeSubtitleSideDemuxer?.markClosed()
-        activeSubtitleSideDemuxer = nil
+        cancelEmbeddedSubtitleReader()
         activeEmbeddedSubtitleStreamIndex = -1
         loadedSidecarURL = nil
         isSubtitleActive = false
