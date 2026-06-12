@@ -1391,13 +1391,19 @@ public final class AetherEngine: ObservableObject {
             guard customSourceIsSeekable, let placeholderURL = loadedURL else { return }
             await reloadWithAudioOverride(
                 url: placeholderURL,
-                audioStreamIndex: activeAudioTrackIndex.map { Int32($0) }
+                audioStreamIndex: activeAudioTrackIndex.map { Int32($0) },
+                expectedGeneration: loadGeneration
             )
             return
         }
         guard let url = loadedURL else { return }
         let pos = currentTime
-        try await load(url: url, startPosition: pos > 1 ? pos : nil, options: loadedOptions)
+        // Live rejoins at the live edge: the pre-suspend playhead is
+        // stale by the suspension duration and may already have slid
+        // out of the window (reloadWithAudioOverride nils it for live
+        // for the same reason).
+        let resume: Double? = loadedOptions.isLive ? nil : (pos > 1 ? pos : nil)
+        try await load(url: url, startPosition: resume, options: loadedOptions)
     }
 
     public func seek(to seconds: Double) async {
@@ -1473,6 +1479,7 @@ public final class AetherEngine: ObservableObject {
         // so convert before driving the host. The SW / audio hosts already
         // run on source time (shift 0), making this a no-op there.
         let clockTarget = target - playlistShiftSeconds
+        let gen = loadGeneration
         if audioAVPlayerActive, let host = audioAVPlayerHost {
             await host.seek(to: clockTarget)
         } else if let host = audioHost {
@@ -1482,6 +1489,10 @@ public final class AetherEngine: ObservableObject {
         } else {
             nativeHost?.seek(to: clockTarget)
         }
+        // A stop()/load() landing during the await above already tore
+        // the session down; writing clock state + .playing into the
+        // singleton afterwards would publish a phantom session.
+        guard loadGeneration == gen else { return }
         nativeClockSeconds = clockTarget
         clock.currentTime = target
         clock.sourceTime = target
@@ -1602,13 +1613,26 @@ public final class AetherEngine: ObservableObject {
     }
 
     /// Set playback volume (0.0 = mute, 1.0 = full). Routed through the
-    /// ACTIVE host only: the previous setter wrote into every host,
-    /// including the engine-lifetime audio host, so a volume change
-    /// during a video session silently changed the next music
-    /// session's volume.
+    /// ACTIVE host only: writing into every host changed the next music
+    /// session's volume. The engine additionally remembers the host's
+    /// desired volume so a write BEFORE any session exists (e.g. a
+    /// restore-persisted-volume call at app init) isn't a silent no-op;
+    /// the loaders apply it to each freshly activated host.
     public var volume: Float {
-        get { activeTransportHost?.volume ?? 1.0 }
-        set { activeTransportHost?.volume = newValue }
+        get { activeTransportHost?.volume ?? desiredVolume ?? 1.0 }
+        set {
+            desiredVolume = newValue
+            activeTransportHost?.volume = newValue
+        }
+    }
+
+    /// Last volume the host asked for, nil until the first write.
+    /// Applied by the loaders when a host is (re)activated.
+    var desiredVolume: Float?
+
+    /// Apply the remembered volume to a freshly activated host.
+    func applyDesiredVolume(to host: any TransportControllable) {
+        if let v = desiredVolume { host.volume = v }
     }
 
     /// Set playback speed (0.5-2.0). On the native AVPlayer path audio
@@ -1654,11 +1678,13 @@ public final class AetherEngine: ObservableObject {
             category: .engine
         )
 
+        let gen = loadGeneration
         Task { @MainActor [weak self] in
             guard let self = self else { return }
             await self.reloadWithAudioOverride(
                 url: url,
-                audioStreamIndex: Int32(index)
+                audioStreamIndex: Int32(index),
+                expectedGeneration: gen
             )
         }
     }

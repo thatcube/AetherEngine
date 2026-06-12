@@ -436,7 +436,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         audioSourceStreamIndexOverride: Int32? = nil,
-        initialPositionSeconds: Double? = nil,
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         isLiveSession: Bool = false,
         dvrWindowSeconds: Double? = nil,
@@ -452,7 +451,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
         self.audioSourceStreamIndexOverride = audioSourceStreamIndexOverride
-        self.initialPositionSeconds = initialPositionSeconds
         self.audioBridgeMode = audioBridgeMode
         self.isLiveSession = isLiveSession
         self.dvrWindowSeconds = dvrWindowSeconds
@@ -534,12 +532,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// linger after the engine is torn down.
     private var preopenedDemuxer: Demuxer?
 
-    /// Resume position used to seed the sliding-window playlist so its
-    /// initial visible range covers the segment AVPlayer will seek to.
-    /// Without this seed, a resume at e.g. 4368 s lands AVPlayer on a
-    /// playlist that only lists segs 0-29, and the seek either fails
-    /// outright or stalls waiting for the playlist to grow past 4368 s.
-    private let initialPositionSeconds: Double?
 
     // MARK: - Public API
 

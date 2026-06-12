@@ -77,6 +77,7 @@ extension AetherEngine {
             host.setExternalMetadata(pendingExternalMetadata)
         }
         self.nativeHost = host
+        applyDesiredVolume(to: host)
         // No producer on this path, so the playhead carries the AVPlayer
         // clock directly (no source-PTS fold). Keep the shift at 0.
         self.playlistShiftSeconds = 0
@@ -216,7 +217,6 @@ extension AetherEngine {
             matchContentEnabled: matchContentEnabled,
             panelIsInHDRMode: panelIsInHDRMode,
             audioSourceStreamIndexOverride: audioSourceStreamIndex,
-            initialPositionSeconds: startPosition,
             audioBridgeMode: audioBridgeMode,
             isLiveSession: isLive,
             dvrWindowSeconds: dvrWindowSeconds,
@@ -317,6 +317,7 @@ extension AetherEngine {
             host.setExternalMetadata(pendingExternalMetadata)
         }
         self.nativeHost = host
+        applyDesiredVolume(to: host)
         // Publish before wiring up the @Published mirrors below so any host
         // that subscribes via the same Combine sink sees the AVPlayer
         // instance before the first time / state update lands. Only emit
@@ -472,6 +473,7 @@ extension AetherEngine {
             self?.publishLiveWindow(edgeSessionTime: edge)
         }
         self.softwareHost = host
+        applyDesiredVolume(to: host)
         // SW path's currentTime tracks source PTS directly, so the
         // AVPlayer-clock shift is 0 and sourceTime mirrors currentTime.
         self.playlistShiftSeconds = 0
@@ -540,6 +542,7 @@ extension AetherEngine {
         activateRendererAudioSession()
         let host = AudioPlaybackHost()
         self.audioHost = host
+        applyDesiredVolume(to: host)
         // Audio path tracks source PTS directly: no AVPlayer-clock shift.
         self.playlistShiftSeconds = 0
         self.liveShiftSeams.removeAll()
@@ -605,6 +608,7 @@ extension AetherEngine {
         activateRendererAudioSession()
         let host = audioAVPlayerHost ?? AudioAVPlayerHost()
         self.audioAVPlayerHost = host
+        applyDesiredVolume(to: host)
         self.audioAVPlayerActive = true
         self.playlistShiftSeconds = 0
         self.liveShiftSeams.removeAll()
@@ -642,9 +646,16 @@ extension AetherEngine {
         // breaking the system Now-Playing badge and the Siri Remote routing.
         // timeControlStatus is advisory display state, not a command source.
 
-        try await Task.detached(priority: .userInitiated) { [host] in
-            try await host.load(url: url, startPosition: startPosition, httpHeaders: httpHeaders)
-        }.value
+        // No detached hop here, deliberately: AudioAVPlayerHost.load has
+        // no blocking work (all MainActor, replaceCurrentItem-based), and
+        // the host is SHARED across loads. Detaching opened a reorder
+        // window where a superseded load A's detached body ran after its
+        // successor B had already loaded, putting A's item back on the
+        // shared AVPlayer while the engine published B's state. Staying
+        // in the same MainActor slice makes the generation check below
+        // and the load atomic with respect to other loads.
+        try checkLoadCurrent(generation)
+        try await host.load(url: url, startPosition: startPosition, httpHeaders: httpHeaders)
         // Superseded while the (persistent, shared) host was loading?
         // Don't tear the host down, the successor may be using it; just
         // unwind before play()/state writes.
@@ -670,8 +681,21 @@ extension AetherEngine {
     /// the post-reload state never actually re-armed.
     func reloadWithAudioOverride(
         url: URL,
-        audioStreamIndex: Int32?
+        audioStreamIndex: Int32?,
+        expectedGeneration: UInt64
     ) async {
+        // Liveness guard: this runs from a scheduled Task, so a stop()
+        // (player dismissed) or a fresh load() can land between the
+        // scheduling site and here. Without the check the reload
+        // resurrected the stopped session (state/.loadedURL restored,
+        // pipeline rebuilt, audio playing after dismiss) or killed the
+        // successor load at its first suspension point and played the
+        // OLD url instead. The generation is captured at scheduling
+        // time; stop()/load() both invalidate it.
+        guard loadGeneration == expectedGeneration, loadedURL != nil else {
+            EngineLog.emit("[AetherEngine] reload superseded before start; ignored", category: .engine)
+            return
+        }
         let resumeAt = currentTime
         let embeddedStreamToResume: Int32 = activeEmbeddedSubtitleStreamIndex
         let sidecarToResume: URL? = isSubtitleActive && activeEmbeddedSubtitleStreamIndex < 0
