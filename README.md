@@ -519,13 +519,13 @@ Sources/AetherEngine/
 │   ├── IOReader.swift                       Public custom byte-source protocol + MediaSource (load(source:) input)
 │   ├── DataIOReader.swift                   Ready-made in-memory IOReader over an immutable Data buffer
 │   └── HLSIngest/
-│       ├── HLSLiveIngestReader.swift        Public forward-only IOReader ingesting a live HLS upstream (resolver, playlist poller, segment fetcher)
+│       ├── HLSLiveIngestReader.swift        Public forward-only IOReader ingesting a live HLS upstream (resolver, playlist poller, segment fetcher, companion audio-rendition reader)
 │       ├── HLSPlaylist.swift                Line-oriented RFC 8216 subset parser (master / media playlists)
 │       ├── HLSPlaylistTracker.swift         Pure segment cursor: duration-capped edge join, window-slide rejoin, stall budget
 │       ├── PackedAudioSegments.swift        Packed-audio rendition support: LiveSegmentFormat classification + ID3 PRIV timestamp parser (raw ADTS segments)
 │       ├── ByteFIFO.swift                   Bounded blocking byte queue between the fetch loop and the demux thread
 │       ├── HLSIngestError.swift             Typed terminal errors (encrypted, fMP4, unreachable, invalid, stalled)
-│       └── LiveIngestSourceInfo.swift       Internal seam: the reader reports the upstream segment cadence so the loopback playlist can shape TARGETDURATION + blocking-reload eligibility
+│       └── LiveIngestSourceInfo.swift       Internal seam: upstream segment cadence (shapes TARGETDURATION + blocking-reload eligibility) and DualSourceMergeOrder for the dual-source DTS merge
 ├── Native/
 │   ├── NativeAVPlayerHost.swift             Native path: AVPlayer host bound to the loopback HLS-fMP4 URL
 │   └── SoftwarePlaybackHost.swift           SW path: demux loop + decoders + renderer + synchronizer orchestration
@@ -665,7 +665,9 @@ timestamps. Flags simulate the failure modes the live path hardens
 against: `--drop-after N` (mid-stream connection drop + reconnect),
 `--discontinuity-at N` (program-boundary PTS / PCR jump),
 `--realtime` (1x wall-clock pacing), `--dvr-window N` (timeshift),
-`--measure-rss` (sliding-window retention). `dvr` runs the rewind
+`--measure-rss` (sliding-window retention), `--reload-test` (live
+rejoin end to end, including the full-backlog replay shape some
+origins serve on reconnect). `dvr` runs the rewind
 matrix across the native and SW paths (`--path native|sw|both`).
 
 For repeatable runs, `Scripts/fetch-fixtures.sh` generates a small
