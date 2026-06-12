@@ -669,6 +669,48 @@ extension AetherEngine {
         try checkLoadCurrent(generation)
     }
 
+    /// Align the published audio surface with what the native session
+    /// ACTUALLY plays. The load-time publish came from the main probe,
+    /// which diverges from the session in two live shapes:
+    ///
+    /// - Demuxed-audio sources: the audio lives in the SIDE demuxer, so
+    ///   the probe saw no audio stream at all (`audioTracks` empty,
+    ///   `activeAudioTrackIndex` nil) while the session plays the side
+    ///   rendition.
+    /// - Live TS probes with empty audio codecpar: av_find_best_stream
+    ///   skips those streams, so the probe's default pick came back
+    ///   "none" while the engine's by-type fallback + codecpar repair
+    ///   picked (and plays) the stream.
+    ///
+    /// A host that compares its preferred track against
+    /// `activeAudioTrackIndex` after load must see the engine's real
+    /// pick, or it calls `selectAudioTrack` for the very track that is
+    /// already on air and triggers a pointless (and for live,
+    /// stall-prone) pipeline reload. Also the truth source after an
+    /// audio-switch reload: an invalid override falls back to the auto
+    /// pick inside the engine, and the published index must follow.
+    func syncPublishedAudioStateFromNativeSession() {
+        guard let session = nativeVideoSession else { return }
+        // Demuxed-audio: publish the side demuxer's track list so the
+        // host's picker and the active index share one stream numbering
+        // (the main probe contributed no audio tracks by precondition).
+        let sideTracks = session.companionAudioTracks
+        if !sideTracks.isEmpty {
+            audioTracks = sideTracks
+        }
+        let active = session.activeAudioSourceStreamIndex
+        let resolved: Int? = active >= 0 ? Int(active) : nil
+        if activeAudioTrackIndex != resolved {
+            EngineLog.emit(
+                "[AetherEngine] published active audio reconciled to the session's real pick: "
+                + "\(resolved.map(String.init) ?? "nil") "
+                + "(was \(activeAudioTrackIndex.map(String.init) ?? "nil"))",
+                category: .engine
+            )
+            activeAudioTrackIndex = resolved
+        }
+    }
+
     /// Perform a pipeline rebuild at the current playhead. Tears the current
     /// session down, brings a fresh pipeline up with an optional audio source
     /// stream override (nil keeps the auto-picked track), resumes at the
@@ -841,7 +883,12 @@ extension AetherEngine {
                 )
                 EngineLog.emit("[AetherEngine] reload: loadNative done (\(elapsedMs(since: loadStart))ms)", category: .engine)
                 playbackBackend = .native
-                activeAudioTrackIndex = audioStreamIndex.map { Int($0) }
+                // Publish what the rebuilt session ACTUALLY plays, not
+                // the requested override: an invalid override falls back
+                // to the engine's auto pick (see HLSVideoEngine.start),
+                // and demuxed-audio sessions resolve in side-demuxer
+                // stream numbering.
+                syncPublishedAudioStateFromNativeSession()
                 activeVideoDecoder = Self.videoDecoderLabel(
                     codecID: preservedVideoCodec, isSoftware: false
                 )

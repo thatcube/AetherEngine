@@ -133,6 +133,26 @@ public final class HLSVideoEngine: @unchecked Sendable {
     private var packedSideAudioStartPts: Int64?
     private var packedSideAudioFallbackDurationPts: Int64 = 0
 
+    /// Source stream index of the audio stream this session's pipeline
+    /// ACTUALLY muxes (post override-validation, auto-pick fallback,
+    /// and the stream-copy/bridge cascade), or -1 when the session is
+    /// video-only. For demuxed-audio sessions the index numbers a
+    /// stream in the SIDE demuxer. Set once in `start()`; the engine
+    /// host reads it after load to publish an `activeAudioTrackIndex`
+    /// that matches what is really playing (a host comparing its
+    /// preferred track against a stale published value otherwise
+    /// triggers a pointless, stall-prone live reload of the very track
+    /// already on air).
+    public private(set) var activeAudioSourceStreamIndex: Int32 = -1
+
+    /// Audio `TrackInfo`s of the demuxed-audio companion (side
+    /// demuxer), snapshotted at `start()` while the side demuxer is
+    /// open. Empty for muxed-audio sessions. The engine host publishes
+    /// these when the main probe saw no audio at all, so the host's
+    /// track list and `activeAudioTrackIndex` describe the same stream
+    /// numbering.
+    public private(set) var companionAudioTracks: [TrackInfo] = []
+
     /// Captured at `start()` so the restart path can spin up a fresh
     /// producer at any segment index without re-running the full
     /// DV-classification / codec-pick logic.
@@ -956,6 +976,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             sideAudioDemuxer = side
             restartLock.unlock()
             audioDem = side
+            companionAudioTracks = side.audioTrackInfos()
             EngineLog.emit(
                 "[HLSVideoEngine] demuxed-audio companion opened: format=\(formatHint) "
                 + "side demuxer audioStreamIndex=\(side.audioStreamIndex)"
@@ -983,7 +1004,29 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // previous title can't strand playback without audio. All
         // audio-side reads go through `audioDem`, which is the side
         // demuxer for demuxed-audio sessions and `dem` otherwise.
-        let autoAudioStreamIndex = audioDem.audioStreamIndex
+        var autoAudioStreamIndex = audioDem.audioStreamIndex
+        // Live empty-codecpar escape: av_find_best_stream SKIPS audio
+        // streams whose codecpar has no channels / sample_rate, which is
+        // exactly what a live TS probe leaves behind when
+        // find_stream_info gives up before decoding an audio frame (the
+        // shape the AAC repair below exists for; it used to surface in
+        // the override log as the AVERROR_STREAM_NOT_FOUND garbage value
+        // -1381258232). Fall back to the first stream that IS audio by
+        // codec type, matching the track list the host was shown, so the
+        // auto pick reaches the repair instead of silently going
+        // video-only. VOD keeps the strict best-stream pick.
+        if autoAudioStreamIndex < 0, isLiveSession {
+            let byType = audioDem.firstAudioStreamIndexByType
+            if byType >= 0 {
+                EngineLog.emit(
+                    "[HLSVideoEngine] audio: av_find_best_stream found no usable audio "
+                    + "(live probe left empty codecpar?); falling back to first "
+                    + "audio-type stream \(byType)",
+                    category: .session
+                )
+                autoAudioStreamIndex = byType
+            }
+        }
         let audioStreamIndex: Int32
         if let override = audioSourceStreamIndexOverride {
             if Self.isAudioStream(demuxer: audioDem, index: override) {
@@ -1211,6 +1254,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
             audioHLSCodecs: &audioHLSCodecs
         )
         self.producer = prod
+        // What the session ACTUALLY plays: the cascade can still fall
+        // back to video-only (savedAudioConfig nil), in which case no
+        // audio stream is muxed regardless of the pick above.
+        self.activeAudioSourceStreamIndex = savedAudioConfig != nil ? audioStreamIndex : -1
 
         // 7. Wire the provider, the server, and serve the URL.
         let manifestCodecs = audioHLSCodecs.map { "\(primaryCodecs),\($0)" } ?? primaryCodecs

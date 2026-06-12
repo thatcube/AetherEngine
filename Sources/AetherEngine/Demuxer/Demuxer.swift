@@ -316,15 +316,46 @@ public final class Demuxer: @unchecked Sendable {
     }
 
     /// Index of the best video stream, or -1 if none.
+    ///
+    /// Clamped: on failure `av_find_best_stream` returns the error code
+    /// `AVERROR_STREAM_NOT_FOUND` (-1381258232, FFERRTAG 0xF8 "STR"),
+    /// not -1. Callers compare against and log this value, so normalize
+    /// to the documented -1 instead of leaking what reads like garbage.
     var videoStreamIndex: Int32 {
         guard let ctx = formatContext else { return -1 }
-        return av_find_best_stream(ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0)
+        return max(-1, av_find_best_stream(ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0))
     }
 
-    /// Index of the best audio stream, or -1 if none.
+    /// Index of the best audio stream, or -1 if none. Same
+    /// `AVERROR_STREAM_NOT_FOUND` clamp as `videoStreamIndex`.
+    ///
+    /// Beware: `av_find_best_stream` SKIPS audio streams whose codecpar
+    /// has no channels or no sample_rate, which is exactly the state a
+    /// live MPEG-TS probe leaves behind when `find_stream_info` gives
+    /// up before decoding an audio frame. Such a stream still appears
+    /// in `audioTrackInfos()` (codec_type-based); use
+    /// `firstAudioStreamIndexByType` as the fallback pick for that
+    /// shape.
     var audioStreamIndex: Int32 {
         guard let ctx = formatContext else { return -1 }
-        return av_find_best_stream(ctx, AVMEDIA_TYPE_AUDIO, -1, -1, nil, 0)
+        return max(-1, av_find_best_stream(ctx, AVMEDIA_TYPE_AUDIO, -1, -1, nil, 0))
+    }
+
+    /// First stream whose codec_type is audio, regardless of codecpar
+    /// completeness, or -1 if none. Fallback for the live-TS shape
+    /// described on `audioStreamIndex`: the stream exists and is listed
+    /// in `audioTrackInfos()`, but `av_find_best_stream` refuses it
+    /// because its codec parameters are empty; the engine's live AAC
+    /// codecpar repair fills them downstream.
+    var firstAudioStreamIndexByType: Int32 {
+        guard let ctx = formatContext else { return -1 }
+        for i in 0..<Int(ctx.pointee.nb_streams) {
+            guard let stream = ctx.pointee.streams[i],
+                  let codecpar = stream.pointee.codecpar,
+                  codecpar.pointee.codec_type == AVMEDIA_TYPE_AUDIO else { continue }
+            return Int32(i)
+        }
+        return -1
     }
 
     /// Extract metadata for all audio streams.

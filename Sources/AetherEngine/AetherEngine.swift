@@ -76,7 +76,10 @@ public final class AetherEngine: ObservableObject {
     /// Forwarder; see `clock.progress`.
     public var progress: Float { clock.progress }
 
-    @Published public private(set) var audioTracks: [TrackInfo] = []
+    // internal(set): AetherEngine+Loading's post-load reconciliation
+    // (syncPublishedAudioStateFromNativeSession) replaces the probe-derived
+    // list with the side demuxer's tracks for demuxed-audio live sources.
+    @Published public internal(set) var audioTracks: [TrackInfo] = []
     @Published public private(set) var subtitleTracks: [TrackInfo] = []
     /// Container metadata (tags + embedded cover) for the loaded source.
     /// nil while idle or when the source carries no metadata. Populated
@@ -1302,6 +1305,14 @@ public final class AetherEngine: ObservableObject {
                 // label, FLAC bridge re-labels with the source codec,
                 // video-only leaves the field nil.
                 activeAudioDecoder = nativeVideoSession?.audioPipelineDescription
+                // Reconcile the published audio surface with the
+                // session's REAL pick (side-demuxer tracks for
+                // demuxed-audio sources, by-type fallback for live TS
+                // probes with empty audio codecpar). Without this a
+                // host's post-load preferred-language check compares
+                // against the probe-derived value and reloads the very
+                // track that is already playing.
+                syncPublishedAudioStateFromNativeSession()
                 presentCurrentLayer()
                 // Gate play() on panel handshake completion. With the
                 // host's `appliesPreferredDisplayCriteriaAutomatically`
