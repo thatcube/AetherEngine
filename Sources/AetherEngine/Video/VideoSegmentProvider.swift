@@ -117,7 +117,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// every session starts with an initial producer at baseIndex 0
     /// or the host's resume target, with the engine updating this
     /// after the first explicit restart it triggers via the public
-    /// `restartProducer(at:)` path.
+    /// `requestRestart(at:)` path.
     ///
     /// Guarded by `stateLock`: the server's workQueue is concurrent, so
     /// `mediaSegment(at:)` / `handleTargetChange(to:)` can race on this
