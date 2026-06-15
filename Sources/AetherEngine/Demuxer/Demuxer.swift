@@ -97,6 +97,15 @@ public final class Demuxer: @unchecked Sendable {
         if isHTTP {
             try openHTTP(url: url, extraHeaders: extraHeaders, isLive: isLive)
         } else {
+            // Route a local DVD ISO through the disc adapter (FileIOReader keeps it
+            // out of RAM). Falls back to the normal local open when not a disc.
+            if url.isFileURL, let fileReader = FileIOReader(url: url),
+               let (discReader, discHint) = try DiscReader.wrap(fileReader) {
+                let bridge = CustomIOReaderBridge(reader: discReader)
+                let inputFormat = av_find_input_format(discHint)
+                try openWithProvider(bridge, inputFormat: inputFormat, isLive: isLive)
+                return
+            }
             try openLocal(url: url)
         }
     }
@@ -132,6 +141,18 @@ public final class Demuxer: @unchecked Sendable {
     /// fix as the URL live path, 38ad60b, now for custom sources).
     func open(reader: IOReader, formatHint: String? = nil, profile: DemuxerOpenProfile = .playback, isLive: Bool = false) throws {
         self.openProfile = profile
+        // DVD ISO detection (AetherEngine #36). An ISO is a filesystem image,
+        // not a demuxable container; DiscReader adapts it to the main title's
+        // concatenated VOB stream demuxed as MPEG-PS. Non-disc sources return
+        // nil from wrap and fall through to the normal custom-reader open.
+        // The synthetic reader's bytes are the VOB stream (no "CD001"), so this
+        // cannot re-trigger detection.
+        if let (discReader, discHint) = try DiscReader.wrap(reader) {
+            let bridge = CustomIOReaderBridge(reader: discReader)
+            let inputFormat = av_find_input_format(discHint)
+            try openWithProvider(bridge, inputFormat: inputFormat, isLive: isLive)
+            return
+        }
         let bridge = CustomIOReaderBridge(reader: reader)
         let inputFormat: UnsafePointer<AVInputFormat>? = formatHint.flatMap { av_find_input_format($0) }
         try openWithProvider(bridge, inputFormat: inputFormat, isLive: isLive)
