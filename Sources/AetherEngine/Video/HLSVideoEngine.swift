@@ -315,6 +315,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// only other restarts contend on it.
     private let restartGate = NSLock()
 
+    /// Coalesces rapid restart requests (burst seeks). Mutated only under
+    /// `restartLock`. See `RestartCoalescer` and AetherEngine#35.
+    private var restartCoalescer = RestartCoalescer()
+
     /// Bumped by `stop()` under `restartLock`. A restart that dropped the
     /// lock for its waits re-validates the epoch before installing the
     /// new producer, so a stop() that landed mid-restart wins and the
@@ -1235,7 +1239,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             blockingReloadEnabled: liveBlockingReloadEnabled,
             targetDurationFloorSeconds: liveTargetDurationFloorSeconds,
             restartHandler: isLiveSession ? nil : { [weak self] idx in
-                self?.restartProducer(at: idx)
+                self?.requestRestart(at: idx)
             }
         )
         self.provider = prov
@@ -1465,7 +1469,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     // return zero when the relevant subsystem isn't built yet.
     //
     // Every forwarder snapshots its subsystem ref under `restartLock`
-    // first: stop(), restartProducer(at:), and the live-reopen path
+    // first: stop(), performRestart(at:), and the live-reopen path
     // replace/nil these strong refs under that lock, so a lock-free read
     // from the sampler/memprobe thread was an ARC data race (a read
     // interleaved with the final release in stop() can retain a freed
@@ -1883,7 +1887,42 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// from the original session bring-up and never re-fetches it, so
     /// the cache.setInit overwrite during restart is a no-op from
     /// AVPlayer's perspective.
-    private func restartProducer(at idx: Int) {
+    /// Public restart entry wired to the segment provider's restart
+    /// handler. Coalesces a burst of restart requests so only the
+    /// in-flight restart plus one final restart at the settled target run,
+    /// instead of serializing one full teardown per intermediate scrub
+    /// position (the cascade that wedged the pipeline in #35).
+    func requestRestart(at idx: Int) {
+        restartLock.lock()
+        let shouldRun = restartCoalescer.begin(idx)
+        restartLock.unlock()
+        guard shouldRun else {
+            EngineLog.emit(
+                "[HLSVideoEngine] restart at idx=\(idx) coalesced behind in-flight restart",
+                category: .session
+            )
+            return
+        }
+        var target = idx
+        while true {
+            performRestart(at: target)
+            restartLock.lock()
+            let nextTarget = restartCoalescer.next(justRan: target)
+            restartLock.unlock()
+            guard let nextTarget else { break }
+            EngineLog.emit(
+                "[HLSVideoEngine] coalesced restart advancing to settled target idx=\(nextTarget)",
+                category: .session
+            )
+            target = nextTarget
+        }
+    }
+
+    // Renamed from restartProducer(at:). Now driven exclusively through
+    // requestRestart(at:) so bursts coalesce (#35). The body (restartGate
+    // serialization, sessionEpoch abort guard, demuxer seek, rebuild) is
+    // unchanged.
+    private func performRestart(at idx: Int) {
         // Restarts serialize among themselves on restartGate (held across
         // the waits below). restartLock is only taken for the brief state
         // snapshots/mutations, so a stop() landing mid-restart (SwiftUI
