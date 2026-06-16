@@ -262,6 +262,10 @@ struct HLSFixtureConfig {
     let dropSegment: Int?
     let encrypted: Bool
     let fmp4: Bool
+    /// Slice indices (modulo slice count) that carry an EXT-X-DISCONTINUITY
+    /// before them. Used by the SSAI repro (`hlslive`) to mark the
+    /// content→ad and ad→content seams. Empty for the default fixture.
+    var discontinuityIndices: Set<Int> = []
 }
 
 // MARK: - HTTP server
@@ -482,8 +486,10 @@ final class HLSFixtureServer: @unchecked Sendable {
             lines.append("#EXT-X-MAP:URI=\"init.mp4\"")
         }
 
+        let sliceCount = max(1, config.slices.count)
         for n in start...seq {
-            if let disc = config.discontinuityAt, disc == n {
+            if config.discontinuityAt == n
+                || config.discontinuityIndices.contains(n % sliceCount) {
                 lines.append("#EXT-X-DISCONTINUITY")
             }
             lines.append("#EXTINF:\(config.segmentSeconds).0,")

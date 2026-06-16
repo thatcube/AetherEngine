@@ -237,6 +237,13 @@ if first == "hlsfixture" {
     exit(runHLSFixture(args: rest))
 }
 
+// SSAI repro: serve real content+ad .ts segments through the actual
+// HLSLiveIngestReader → engine direct path.
+if first == "hlslive" {
+    let rest = Array(args.dropFirst(2))
+    exit(runHLSLiveRepro(args: rest))
+}
+
 // Live subcommand: no URL positional (the fixture supplies its own URL).
 if first == "live" {
     var rest = Array(args.dropFirst(2))

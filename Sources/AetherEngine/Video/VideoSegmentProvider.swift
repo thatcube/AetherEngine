@@ -367,6 +367,18 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         return cache.fetchInit(timeout: 30.0)
     }
 
+    func initVersionID(forSegment index: Int) -> Int {
+        cache.initVersionID(forSegment: index)
+    }
+
+    func initSegment(versionID: Int) -> Data? {
+        // Version 0 may not be captured yet at startup; keep the blocking
+        // fetch for it so AVPlayer's first /init.mp4 waits. Higher versions
+        // are captured synchronously at the switch, so a plain lookup is fine.
+        if versionID == 0 { return cache.fetchInit(timeout: 30.0) }
+        return cache.initData(versionID: versionID)
+    }
+
     /// File URL for a cached segment without materializing any bytes.
     /// Used by `HLSLocalServer` to take the `sendfile(2)` fast path
     /// (file → socket entirely kernel-side, no Foundation `Data`

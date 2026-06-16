@@ -61,6 +61,16 @@ final class SegmentCache {
     /// moov / track IDs).
     private var initSegment: Data?
 
+    /// Additional init segments captured mid-session at an SSAI program
+    /// switch, where an ad creative changes the video codec params
+    /// (SPS/resolution) so its segments need a FRESH init. Each entry is
+    /// `(versionID, firstSegmentIndex, data)`: segments at index >=
+    /// firstSegmentIndex (until the next version) decode against this init,
+    /// and the playlist emits a per-version `#EXT-X-MAP:URI="initV.mp4"`.
+    /// Version 0 is `initSegment` (firstSegmentIndex 0). Tiny (~1.3 KB
+    /// each), never evicted.
+    private var initVersions: [(versionID: Int, fromSegment: Int, data: Data)] = []
+
     /// True once `close()` has been called. Pending `fetch` calls
     /// wake up and return nil instead of looping forever.
     private var closed = false
@@ -164,6 +174,39 @@ final class SegmentCache {
         condition.unlock()
     }
 
+    /// Register a fresh init captured at an SSAI program switch, valid for
+    /// segments at index >= `fromSegment`. Assigns the next version ID.
+    /// Idempotent on (fromSegment): a re-registration for the same start
+    /// replaces it (a retried muxer alloc).
+    func addInitVersion(_ data: Data, fromSegment: Int) {
+        condition.lock()
+        defer { condition.unlock() }
+        if let i = initVersions.firstIndex(where: { $0.fromSegment == fromSegment }) {
+            initVersions[i].data = data
+        } else {
+            let nextID = (initVersions.map { $0.versionID }.max() ?? 0) + 1
+            initVersions.append((versionID: nextID, fromSegment: fromSegment, data: data))
+            initVersions.sort { $0.fromSegment < $1.fromSegment }
+        }
+        condition.broadcast()
+    }
+
+    /// The init version ID a given segment decodes against: the highest
+    /// version whose `fromSegment` is <= `index`, or 0 (the session init).
+    func initVersionID(forSegment index: Int) -> Int {
+        condition.lock(); defer { condition.unlock() }
+        var id = 0
+        for v in initVersions where v.fromSegment <= index { id = v.versionID }
+        return id
+    }
+
+    /// The init bytes for a version ID (0 = session init). nil if unknown.
+    func initData(versionID: Int) -> Data? {
+        condition.lock(); defer { condition.unlock() }
+        if versionID == 0 { return initSegment }
+        return initVersions.first(where: { $0.versionID == versionID })?.data
+    }
+
     func store(index: Int, data: Data) {
         let fileURL = sessionDir.appendingPathComponent("seg-\(index).m4s")
         let writeOK: Bool
@@ -263,6 +306,7 @@ final class SegmentCache {
         entries.removeAll(keepingCapacity: false)
         entryBytes.removeAll(keepingCapacity: false)
         initSegment = nil
+        initVersions.removeAll(keepingCapacity: false)
         _totalBytes = 0
         _highestStoredIndex = -1
         condition.broadcast()

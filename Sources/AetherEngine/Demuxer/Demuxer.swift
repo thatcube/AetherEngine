@@ -347,6 +347,19 @@ public final class Demuxer: @unchecked Sendable {
         return max(-1, av_find_best_stream(ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0))
     }
 
+    /// True if `index` names an existing VIDEO stream. Used by the live
+    /// producer to detect an SSAI program change that introduces a new
+    /// video PID mid-stream (the ad creative is authored with a different
+    /// video PID than the program; libavformat creates a fresh stream for
+    /// it, so the producer's cached videoStreamIndex stops matching).
+    func isVideoStream(_ index: Int32) -> Bool {
+        accessLock.lock(); defer { accessLock.unlock() }
+        guard let ctx = formatContext, index >= 0, index < ctx.pointee.nb_streams,
+              let stream = ctx.pointee.streams[Int(index)] else { return false }
+        return stream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_VIDEO
+    }
+
+
     /// Index of the best audio stream, or -1 if none. Same
     /// `AVERROR_STREAM_NOT_FOUND` clamp as `videoStreamIndex`.
     ///

@@ -47,6 +47,18 @@ protocol HLSSegmentProvider: AnyObject {
     /// audio-append path.
     func segmentIsDiscontinuous(at index: Int) -> Bool
 
+    /// Init version a segment decodes against. 0 is the session init
+    /// (`initSegment()` / `/init.mp4`); a higher ID is a fresh init
+    /// captured at an SSAI program switch (the ad creative changed video
+    /// codec params). The playlist emits a `#EXT-X-MAP:URI="initV.mp4"`
+    /// whenever this changes between consecutive segments. Always 0 for
+    /// VOD / audio-append / single-program live.
+    func initVersionID(forSegment index: Int) -> Int
+
+    /// Init bytes for a version ID (0 = session init). Served at
+    /// `/initV.mp4`. nil if unknown.
+    func initSegment(versionID: Int) -> Data?
+
     /// Apple HLS playlist type. `.event` for live appended audio,
     /// `.vod` for the fully-known video case.
     var playlistType: HLSPlaylistType { get }
@@ -175,6 +187,13 @@ extension HLSSegmentProvider {
     /// Default: no discontinuities. Only the live video provider tracks
     /// program-boundary segments; every other provider returns false.
     func segmentIsDiscontinuous(at index: Int) -> Bool { false }
+
+    /// Default: single init version (0). Only the live video provider with
+    /// SSAI program switches returns higher IDs.
+    func initVersionID(forSegment index: Int) -> Int { 0 }
+
+    /// Default: version 0 is the session init; nothing else exists.
+    func initSegment(versionID: Int) -> Data? { versionID == 0 ? initSegment() : nil }
 
     var masterCodecs: String? { nil }
     var masterResolution: (width: Int, height: Int)? { nil }
@@ -847,6 +866,20 @@ final class HLSLocalServer: @unchecked Sendable {
                            contentType: "video/mp4")
 
         default:
+            // Versioned init for SSAI program switches: /init<N>.mp4 (N>0).
+            if normalizedPath.hasPrefix("/init"),
+               normalizedPath.hasSuffix(".mp4") {
+                let vStr = normalizedPath.dropFirst("/init".count).dropLast(".mp4".count)
+                if let v = Int(vStr), v > 0 {
+                    let data = provider?.initSegment(versionID: v) ?? Data()
+                    if data.isEmpty {
+                        return send404(fd: fd, path: normalizedPath,
+                                       reason: "init\(v).mp4 not available")
+                    }
+                    return send200(fd: fd, path: normalizedPath, data: data,
+                                   contentType: "video/mp4")
+                }
+            }
             if normalizedPath.hasPrefix("/seg"),
                normalizedPath.hasSuffix(".mp4") {
                 let indexStr = normalizedPath.dropFirst(4).dropLast(4)
@@ -1315,27 +1348,37 @@ final class HLSLocalServer: @unchecked Sendable {
         // Sodalite resource-loader path. Absolute URLs in the playlist
         // are how AVPlayer knows to route a sub-resource through the
         // delegate instead of CFNetwork.
-        let initURI: String
+        let initURI: (Int) -> String
         let segURI: (Int) -> String
         if let base = subResourceBaseURL {
             let baseStr = base.absoluteString
             let baseWithSlash = baseStr.hasSuffix("/") ? baseStr : baseStr + "/"
-            initURI = "\(baseWithSlash)init.mp4"
+            initURI = { v in v == 0 ? "\(baseWithSlash)init.mp4" : "\(baseWithSlash)init\(v).mp4" }
             segURI = { idx in "\(baseWithSlash)seg\(idx).mp4" }
         } else {
-            initURI = "init.mp4"
+            initURI = { v in v == 0 ? "init.mp4" : "init\(v).mp4" }
             segURI = { idx in "seg\(idx).mp4" }
         }
-        lines.append("#EXT-X-MAP:URI=\"\(initURI)\"")
+        // Initial EXT-X-MAP for the first visible segment's init version,
+        // emitted BEFORE the loop so a discontinuity on seg0 still lands
+        // directly before its #EXTINF (RFC/Apple: the session map precedes
+        // the first segment's tags).
+        var lastInitVersion = provider.initVersionID(forSegment: firstVisible)
+        lines.append("#EXT-X-MAP:URI=\"\(initURI(lastInitVersion))\"")
         for i in firstVisible..<count {
-            // A segment that opened at a live program-boundary PTS jump is
-            // prefixed with #EXT-X-DISCONTINUITY (RFC 8216 §4.3.2.3): the tag
-            // applies to the segment that FOLLOWS it, so it goes immediately
-            // before that segment's #EXTINF. AVPlayer resets its media-
-            // sequence timeline at the tag, which keeps seekableEnd (and the
-            // engine's native session edge) monotonic across the source jump.
+            // #EXT-X-DISCONTINUITY (RFC 8216 §4.3.2.3) applies to the segment
+            // that FOLLOWS it.
             if provider.segmentIsDiscontinuous(at: i) {
                 lines.append("#EXT-X-DISCONTINUITY")
+            }
+            // SSAI mid-stream init change: the ad creative's segments need a
+            // fresh init, so emit a new EXT-X-MAP right after the
+            // discontinuity and before the #EXTINF (verified order AVPlayer
+            // accepts a mid-stream init + resolution change with).
+            let v = provider.initVersionID(forSegment: i)
+            if v != lastInitVersion {
+                lines.append("#EXT-X-MAP:URI=\"\(initURI(v))\"")
+                lastInitVersion = v
             }
             let dur = provider.segmentDuration(at: i)
             lines.append("#EXTINF:\(String(format: "%.3f", dur)),")
