@@ -121,7 +121,12 @@ extension AetherEngine {
         let w = sourceVideoWidth > 0 ? sourceVideoWidth : 1920
         let h = sourceVideoHeight > 0 ? sourceVideoHeight : 1080
         let headers = loadedOptions.httpHeaders
-        let preserveASS = loadedOptions.preserveASSMarkup
+        // The secondary channel is always rendered as plain text by the host
+        // (it never drives libass), so it must never preserve ASS markup,
+        // even when the session enabled it for a styled primary ASS track.
+        // Otherwise the secondary cues arrive as raw ASS event lines
+        // ("0,,Default,0,0,0,...") and leak into the overlay (issue #47).
+        let preserveASS = (channel == .primary) ? loadedOptions.preserveASSMarkup : false
         let task = Task.detached(priority: .userInitiated) { [weak self] () -> Void in
             await self?.runEmbeddedSubtitleReader(
                 url: url, reader: reader, formatHint: formatHint,
