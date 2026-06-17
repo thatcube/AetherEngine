@@ -231,6 +231,19 @@ if first == "seektest" {
     exit(runSeekTest(url: parseSourceURL(urlArg), seeks: seeks, gapMs: gapMs, settleSeconds: settle))
 }
 
+// SMB2/3 throughput + random-seek correctness harness.
+if first == "smbtest" {
+    var rest = Array(args.dropFirst(2))
+    let reads = takeIntFlag("--reads", from: &rest) ?? 64
+    guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
+        print("ERROR: smbtest requires a <smb-url> argument")
+        exit(64)
+    }
+    rest.removeAll { $0 == urlArg }
+    rejectStrayFlags(rest, subcommand: "smbtest")
+    exit(runSMBTest([urlArg, "--reads", "\(reads)"]))
+}
+
 // HLS live fixture subcommand.
 if first == "hlsfixture" {
     let rest = Array(args.dropFirst(2))
