@@ -158,6 +158,18 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     ///     the segment-server side.
     private static let forwardWaitWindow = 8
 
+    /// #50: re-asserting reposition wait. When a restart is needed, the
+    /// request waits in `repositionWaitSlice` slices up to `repositionMaxWaits`
+    /// times, re-firing the reposition only when another request has steered
+    /// the producer off `index` in the meantime (the orphan signature: the
+    /// #35 coalescer keeps a single pending slot, so a newer scrub position
+    /// overwrites this one's restart and the single producer settles
+    /// elsewhere, leaving this in-range fetch waiting on bytes that never
+    /// come). A slice generous enough to cover a cold 4K-HDR first-GOP decode
+    /// so a healthy reposition resolves on the first slice without churn.
+    private static let repositionWaitSlice: TimeInterval = 8.0
+    private static let repositionMaxWaits = 3
+
     // MARK: - Playlist state
 
     /// Guards `segments`, the live window fields, and `refreshCounter`.
@@ -616,28 +628,51 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         }
 
         if needsRestart, let restart = restartHandler {
-            EngineLog.emit(
-                "[HLSVideoEngine] seg\(index): out-of-range fetch (cache.range=\(range.map { "\($0.0)..\($0.1)" } ?? "empty") highWater=\(highWater)), restarting producer",
-                category: .session
-            )
-            lastRestartIndex = index
-            restart(index)
-            // Reset cache's high-water AFTER `restart(index)` returns.
-            // restart() is synchronous: it calls `old.stop()` then
-            // `waitForFinish` so the old producer has fully exited
-            // (or been abandoned after 5 s) before returning. The
-            // new producer was just `start()`-ed but its pump loop
-            // is async and hasn't stored anything yet. Resetting
-            // here closes the race where the old producer's final
-            // segment write (e.g. seg-21 captured immediately after
-            // we triggered the restart at 11) re-bumps `highWater`
-            // *after* a pre-restart reset would have cleared it,
-            // re-arming the producerPassedAndPruned gate and
-            // cascading into a per-segment restart storm. With the
-            // reset positioned post-restart, only the new producer's
-            // forward writes feed the high-water and the gate stays
-            // inert for forward-march fetches.
-            cache.resetHighWaterForRestart()
+            // #50: re-asserting reposition wait. Fire a reposition to `index`,
+            // then wait for the producer's bytes in bounded slices. A single
+            // `restart(index)` is coalesced (#35) and can be orphaned when a
+            // newer scrub position overwrites the coalescer's one pending
+            // slot, so the producer settles elsewhere and a plain 30 s wait on
+            // `index` never resolves, then 404s (the rrgomes device repro:
+            // every 404 index was N < segmentCount, evicted from the live
+            // window, producer positioned away). On each missed slice re-fire
+            // the reposition ONLY when another request has since steered the
+            // producer off `index` (`lastRestartIndex != index`); re-firing at
+            // an index the producer is already heading to would churn the
+            // cold first-GOP decode and never converge on a slow 4K source.
+            // If every slice misses, fall through to return nil so the server
+            // answers a retriable 503 for this in-range segment instead of a
+            // fatal 404.
+            for attempt in 0..<Self.repositionMaxWaits {
+                if attempt == 0 || lastRestartIndex != index {
+                    EngineLog.emit(
+                        "[HLSVideoEngine] seg\(index): out-of-range fetch (cache.range=\(range.map { "\($0.0)..\($0.1)" } ?? "empty") highWater=\(highWater) attempt=\(attempt + 1)/\(Self.repositionMaxWaits)), restarting producer",
+                        category: .session
+                    )
+                    lastRestartIndex = index
+                    restart(index)
+                    // Reset cache's high-water AFTER `restart(index)` returns.
+                    // restart() is synchronous: it calls `old.stop()` then
+                    // `waitForFinish` so the old producer has fully exited
+                    // (or been abandoned after 5 s) before returning. The
+                    // new producer was just `start()`-ed but its pump loop
+                    // is async and hasn't stored anything yet. Resetting
+                    // here closes the race where the old producer's final
+                    // segment write (e.g. seg-21 captured immediately after
+                    // we triggered the restart at 11) re-bumps `highWater`
+                    // *after* a pre-restart reset would have cleared it,
+                    // re-arming the producerPassedAndPruned gate and
+                    // cascading into a per-segment restart storm. With the
+                    // reset positioned post-restart, only the new producer's
+                    // forward writes feed the high-water and the gate stays
+                    // inert for forward-march fetches.
+                    cache.resetHighWaterForRestart()
+                }
+                if let bytes = cache.fetch(index: index, timeout: Self.repositionWaitSlice) {
+                    return logServed(index: index, bytes: bytes, totalStart: totalStart, restarted: true)
+                }
+            }
+            return logServed(index: index, bytes: nil, totalStart: totalStart, restarted: true)
         }
 
         let bytes = cache.fetch(index: index, timeout: 30.0)

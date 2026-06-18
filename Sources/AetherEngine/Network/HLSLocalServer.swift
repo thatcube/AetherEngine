@@ -907,8 +907,17 @@ final class HLSLocalServer: @unchecked Sendable {
                                        contentType: "video/mp4")
                     }
                     let providerCount = provider?.segmentCount ?? -1
-                    return send404(fd: fd, path: normalizedPath,
-                                   reason: "segment[\(index)] empty (segmentCount=\(providerCount))")
+                    let reason = "segment[\(index)] empty (segmentCount=\(providerCount))"
+                    switch Self.classifySegmentResponse(
+                        index: index, segmentCount: providerCount, hasData: false) {
+                    case .serve:
+                        // Unreachable: hasData is false here.
+                        return send404(fd: fd, path: normalizedPath, reason: reason)
+                    case .retryLater:
+                        return send503(fd: fd, path: normalizedPath, reason: reason)
+                    case .notFound:
+                        return send404(fd: fd, path: normalizedPath, reason: reason)
+                    }
                 }
                 return send404(fd: fd, path: normalizedPath,
                                reason: "unparseable seg index '\(indexStr)'")
@@ -992,6 +1001,48 @@ final class HLSLocalServer: @unchecked Sendable {
         EngineLog.emit("[HLSLocalServer] -> 404 \(path) reason=\(reason)",
                        category: .hlsServer)
         return writeAll(fd: fd, data: response, path: path)
+    }
+
+    /// 503 for an in-range segment that simply isn't produced yet (#50).
+    /// A VOD segment whose index is inside the advertised `segmentCount`
+    /// always exists in the source and is regenerable; it must never be
+    /// reported as 404. AVPlayer treats a 404 on a VOD segment as terminal
+    /// `loadFailed` and aborts the session, which is exactly the wedge
+    /// rrgomes captured (every 404 index was N < segmentCount, evicted from
+    /// the ~16-19-segment rolling window while the single producer was
+    /// positioned elsewhere). 503 + `Retry-After` keeps the failure
+    /// recoverable: AVPlayer re-issues the GET, the re-asserting wait in
+    /// `VideoSegmentProvider.serveSegment` nudges the producer back to this
+    /// index, and the retry lands a 200.
+    private func send503(fd: Int32, path: String, reason: String) -> Bool {
+        var header = "HTTP/1.1 503 Service Unavailable\r\n"
+        header += "Content-Length: 0\r\n"
+        header += "Retry-After: 1\r\n"
+        header += "Cache-Control: no-cache\r\n"
+        header += "Connection: keep-alive\r\n\r\n"
+        EngineLog.emit("[HLSLocalServer] -> 503 \(path) reason=\(reason)",
+                       category: .hlsServer)
+        return writeAll(fd: fd, data: Data(header.utf8), path: path)
+    }
+
+    /// How to answer a `/seg{N}.mp4` request, given whether the provider
+    /// produced bytes and the currently advertised segment count. Pure so
+    /// the #50 in-range-is-never-404 rule is unit-testable without sockets.
+    enum SegmentResponseKind: Equatable {
+        /// Bytes are in hand; serve 200.
+        case serve
+        /// In-range (0 ..< segmentCount) but not produced yet; serve a
+        /// retriable 503, never a 404.
+        case retryLater
+        /// Index is out of range (past the advertised count) or the count
+        /// is unknown; a genuine 404.
+        case notFound
+    }
+
+    static func classifySegmentResponse(index: Int, segmentCount: Int, hasData: Bool) -> SegmentResponseKind {
+        if hasData { return .serve }
+        if index >= 0, segmentCount > 0, index < segmentCount { return .retryLater }
+        return .notFound
     }
 
     /// Blocking send loop. Reads `data` via `withUnsafeBytes` so
