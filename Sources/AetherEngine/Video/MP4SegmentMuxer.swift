@@ -135,13 +135,21 @@ final class MP4SegmentMuxer {
         /// Drop `AV_PKT_DATA_DOVI_CONF` from the output stream's
         /// codecpar before `avformat_write_header`. Set when the
         /// engine is intentionally routing a Dolby Vision source as
-        /// plain HEVC HDR10 (currently P7 only) so the mp4 muxer
-        /// doesn't emit a `dvcC` box inside an `hvc1` sample entry.
-        /// VideoToolbox's HEVC decoder selection rejects that combo
-        /// with `kVTVideoDecoderUnsupportedDataFormatErr` (-12906)
-        /// because the dvcC advertises a DV profile the dvh1-less
-        /// sample entry contradicts.
+        /// plain HEVC HDR10 (P7 on a non-DV panel; P8.2) so the mp4
+        /// muxer doesn't emit a `dvcC` box inside an `hvc1` sample
+        /// entry. VideoToolbox's HEVC decoder selection rejects that
+        /// combo with `kVTVideoDecoderUnsupportedDataFormatErr`
+        /// (-12906) because the dvcC advertises a DV profile the
+        /// dvh1-less sample entry contradicts.
+        /// Mutually exclusive with `convertP7ToProfile81`.
         let stripDolbyVisionMetadata: Bool
+        /// Rewrite the `dvcC` config record to Profile 8.1 instead of
+        /// stripping it. True only for HEVC P7 on a DV-capable panel
+        /// (the P7-to-8.1 live conversion path). The muxer calls
+        /// `rewriteDoviConfigToProfile81` in place before
+        /// `avformat_write_header` so the container header carries a
+        /// valid P8.1 `dvvC` box rather than a P7 `dvcC`.
+        let convertP7ToProfile81: Bool
         /// Optional color-signaling override. See `ColorOverride`.
         let colorOverride: ColorOverride?
         /// Optional replacement for the output stream's
@@ -161,6 +169,7 @@ final class MP4SegmentMuxer {
             timeBase: AVRational,
             codecTagOverride: String?,
             stripDolbyVisionMetadata: Bool = false,
+            convertP7ToProfile81: Bool = false,
             colorOverride: ColorOverride? = nil,
             extradataOverride: [UInt8]? = nil
         ) {
@@ -168,6 +177,7 @@ final class MP4SegmentMuxer {
             self.timeBase = timeBase
             self.codecTagOverride = codecTagOverride
             self.stripDolbyVisionMetadata = stripDolbyVisionMetadata
+            self.convertP7ToProfile81 = convertP7ToProfile81
             self.colorOverride = colorOverride
             self.extradataOverride = extradataOverride
         }
@@ -508,7 +518,9 @@ final class MP4SegmentMuxer {
            let tag = Self.mkTag(fromFourCC: override) {
             videoStream.pointee.codecpar.pointee.codec_tag = tag
         }
-        if video.stripDolbyVisionMetadata {
+        if video.convertP7ToProfile81 {
+            Self.rewriteDoviConfigToProfile81(videoStream.pointee.codecpar)
+        } else if video.stripDolbyVisionMetadata {
             Self.stripDolbyVisionSideData(videoStream.pointee.codecpar)
         }
         if let co = video.colorOverride {
@@ -885,6 +897,41 @@ final class MP4SegmentMuxer {
             tag |= UInt32(ascii) << (i * 8)
         }
         return tag
+    }
+
+    /// Rewrite the `AV_PKT_DATA_DOVI_CONF` side data on a codecpar in
+    /// place so the container's `dvvC` / `dvcC` box advertises Profile
+    /// 8.1 instead of Profile 7. Called when the engine converts a P7
+    /// source to P8.1 for a DV-capable panel before writing the muxer
+    /// header; the per-packet RPU rewrite is done separately in the
+    /// producer pump. No-op when the DOVI side data is absent.
+    ///
+    /// Fields mutated:
+    ///   `dv_profile`               → 8
+    ///   `dv_bl_signal_compatibility_id` → 1   (HDR10-compat, matching P8.1)
+    ///   `el_present_flag`          → 0   (no EL; the converter drops EL NALs)
+    /// All other fields (level, rpu/bl flags, etc.) are left intact.
+    private static func rewriteDoviConfigToProfile81(
+        _ codecpar: UnsafeMutablePointer<AVCodecParameters>
+    ) {
+        let count = Int(codecpar.pointee.nb_coded_side_data)
+        guard count > 0, let sideData = codecpar.pointee.coded_side_data else { return }
+        for i in 0..<count {
+            let item = sideData.advanced(by: i)
+            guard item.pointee.type == AV_PKT_DATA_DOVI_CONF else { continue }
+            guard let raw = item.pointee.data,
+                  item.pointee.size >= MemoryLayout<AVDOVIDecoderConfigurationRecord>.size
+            else { return }
+            raw.withMemoryRebound(
+                to: AVDOVIDecoderConfigurationRecord.self,
+                capacity: 1
+            ) { rec in
+                rec.pointee.dv_profile = 8
+                rec.pointee.dv_bl_signal_compatibility_id = 1
+                rec.pointee.el_present_flag = 0
+            }
+            return
+        }
     }
 
     /// Remove the Dolby Vision configuration record from a codecpar's

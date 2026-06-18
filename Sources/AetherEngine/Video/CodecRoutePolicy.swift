@@ -110,8 +110,14 @@ extension HLSVideoEngine {
         /// HEVC P7 (BL routed as plain HDR10, VT rejects dvcC with
         /// -12906) and for HEVC P8.1 / P8.4 on non-DV panels (tvOS 26
         /// master-level codec filter rejects dvvC + plain hvc1 with
-        /// -11868).
+        /// -11868). Mutually exclusive with `convertP7ToProfile81`.
         let stripDolbyVisionMetadata: Bool
+        /// Rewrite the `dvcC` config record to Profile 8.1 in the
+        /// container header (muxer init.mp4) AND convert every video
+        /// packet's RPU in place via `DoviRpuConverter`. True only for
+        /// HEVC P7 on a DV-capable panel; false on all other routes
+        /// (including P7 on a non-DV panel, which still strips).
+        let convertP7ToProfile81: Bool
         let dvVariant: DVVariant
     }
 
@@ -190,6 +196,7 @@ extension HLSVideoEngine {
                 primaryCodecs: String(format: "avc1.%02X%02X%02X", safeProfile, 0, safeLevel),
                 supplementalCodecs: nil,
                 stripDolbyVisionMetadata: hasDV,
+                convertP7ToProfile81: false,
                 dvVariant: .none
             )
         }
@@ -240,6 +247,7 @@ extension HLSVideoEngine {
                     primaryCodecs: "dav1.10.\(dvLevelStr)",
                     supplementalCodecs: nil,
                     stripDolbyVisionMetadata: false,
+                    convertP7ToProfile81: false,
                     dvVariant: dvVariant
                 )
             case .av1Profile101:
@@ -253,6 +261,7 @@ extension HLSVideoEngine {
                     primaryCodecs: "dav1.10.\(dvLevelStr)",
                     supplementalCodecs: nil,
                     stripDolbyVisionMetadata: false,
+                    convertP7ToProfile81: false,
                     dvVariant: dvVariant
                 )
             case .av1Profile104:
@@ -271,6 +280,7 @@ extension HLSVideoEngine {
                     primaryCodecs: primary,
                     supplementalCodecs: "dav1.10.\(dvLevelStr)/db4h",
                     stripDolbyVisionMetadata: false,
+                    convertP7ToProfile81: false,
                     dvVariant: dvVariant
                 )
             case .unknown:
@@ -318,6 +328,7 @@ extension HLSVideoEngine {
                     primaryCodecs: primary,
                     supplementalCodecs: nil,
                     stripDolbyVisionMetadata: dvVariant == .av1Profile102,
+                    convertP7ToProfile81: false,
                     dvVariant: dvVariant
                 )
             // HEVC DV variants can't reach this switch (classifyDVVariant
@@ -396,6 +407,7 @@ extension HLSVideoEngine {
                 primaryCodecs: "dvh1.05.\(dvLevelStr)",
                 supplementalCodecs: nil,
                 stripDolbyVisionMetadata: false,
+                convertP7ToProfile81: false,
                 dvVariant: dvVariant
             )
         case .profile81:
@@ -450,6 +462,7 @@ extension HLSVideoEngine {
                 primaryCodecs: "hvc1.2.4.L\(hevcLevel)",
                 supplementalCodecs: supplemental,
                 stripDolbyVisionMetadata: strip,
+                convertP7ToProfile81: false,
                 dvVariant: dvVariant
             )
         case .profile84:
@@ -493,33 +506,47 @@ extension HLSVideoEngine {
                 primaryCodecs: "hvc1.2.4.L\(hevcLevel)",
                 supplementalCodecs: supplemental,
                 stripDolbyVisionMetadata: strip,
+                convertP7ToProfile81: false,
                 dvVariant: dvVariant
             )
         case .profile7:
             // P7 dual-layer (UHD-BD remux territory). The bitstream
             // carries an HEVC Main10 base layer + an enhancement
-            // layer + RPU; Apple has no system-level P7 decoder, so
-            // the only legal path on tvOS is to play the base layer
-            // as plain HEVC HDR10. AVPlayer's Main10 decoder ignores
-            // NAL units with `nuh_layer_id != 0` per the HEVC spec
-            // (Annex F multi-layer extension), which leaves just
-            // the BL frames going through the video pipeline. The
-            // EL NALs ride along in the fMP4 samples (modest
-            // bandwidth cost on a local segment cache), the panel
-            // sees HDR10 PQ, no DV mode is requested.
+            // layer + RPU.
+            //
+            // On a DV-capable panel: convert each packet's RPU from
+            // P7 to P8.1 in place via `DoviRpuConverter` and rewrite
+            // the container `dvcC` record to Profile 8.1, then route
+            // identically to P8.1 (`hvc1` + `dvvC`, SUPPLEMENTAL
+            // `dvh1.08.XX/db1p`). The enhancement layer is dropped
+            // per-packet by the converter (Apple has no EL decoder),
+            // the base layer + converted RPU remain.
+            //
+            // On a non-DV panel: no P7 decoder exists on any Apple TV
+            // chip, so strip `dvcC` and route as plain HEVC HDR10
+            // (unchanged from the prior behaviour). The BL is always
+            // PQ HEVC Main10 by construction (UHD-BD requires HDR10
+            // backwards-compat), so AVPlayer plays PQ correctly.
             //
             // `dv_bl_signal_compatibility_id` is typically 6 for P7
-            // sources. The spec uses 6 as a P7-specific marker
-            // rather than a formal HDR10 backwards-compat flag, but
-            // the BL is always PQ HEVC Main10 by construction since
-            // UHD-BD requires HDR10 backwards-compat. We don't read
-            // compat here because all P7 routes the same way.
+            // sources (P7-specific marker, not a formal HDR10 flag).
+            // We don't read compat here; all P7 routes the same way.
+            let supplemental: String?
+            let strip: Bool
+            if effectiveDvMode {
+                supplemental = "dvh1.08.\(dvLevelStr)/db1p"
+                strip = false
+            } else {
+                supplemental = nil
+                strip = true
+            }
             return CodecRoute(
                 codecTagOverride: "hvc1",
                 videoRange: .pq,
                 primaryCodecs: "hvc1.2.4.L\(hevcLevel)",
-                supplementalCodecs: nil,
-                stripDolbyVisionMetadata: true,
+                supplementalCodecs: supplemental,
+                stripDolbyVisionMetadata: strip,
+                convertP7ToProfile81: effectiveDvMode,
                 dvVariant: dvVariant
             )
         case .unknown:
@@ -550,6 +577,7 @@ extension HLSVideoEngine {
                 primaryCodecs: "hvc1.2.4.L\(hevcLevel)",
                 supplementalCodecs: nil,
                 stripDolbyVisionMetadata: dvVariant == .profile82,
+                convertP7ToProfile81: false,
                 dvVariant: dvVariant
             )
         // AV1 DV variants unreachable here (classify was called with

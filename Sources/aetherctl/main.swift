@@ -78,6 +78,7 @@ func printUsage() {
       aetherctl serve [--no-dv] <url>
       aetherctl validate [--no-dv] <url>
       aetherctl swdecode [--frames N] <url>
+      aetherctl dovitest <file>
       aetherctl extract [--at <sec>] [--snapshot] [--width <px>] [--loops <n>] <url>
       aetherctl audio [--seconds N] <url>
       aetherctl customio [--memory] [--forward-only] [--audio-only] [--reload] [--switch-audio] [--select-subs] [--extract] <file>
@@ -131,6 +132,14 @@ func printUsage() {
       validate  Spin up the engine, run Apple's `mediastreamvalidator`
                 against the loopback manifest, print the report, tear
                 down. Requires Xcode (xcrun) on the PATH.
+
+      dovitest  Walk the source's HEVC video stream, convert each
+                packet's Dolby Vision RPU from Profile 7 to Profile
+                8.1 (and drop the enhancement layer) via
+                DoviRpuConverter, and write the result to
+                /tmp/aetherctl-dovitest.hevc in Annex-B form. Feed
+                that to `dovi_tool extract-rpu` + `info` to validate
+                the rewritten RPU against ground truth.
 
       swdecode  Open SoftwareVideoDecoder for the source's video
                 stream, feed packets, report counters + first-frame
@@ -269,6 +278,19 @@ if first == "dualsubs" {
     }
     rejectStrayFlags(rest, subcommand: "dualsubs")
     exit(runDualSubs(path: urlArg, primaryIndex: primary, secondaryIndex: secondary, seekTo: seekTo))
+}
+
+// Dolby Vision P7 -> 8.1 converter validation harness.
+if first == "dovitest" {
+    var rest = Array(args.dropFirst(2))
+    guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
+        print("ERROR: dovitest requires a <file> argument")
+        print("Usage: aetherctl dovitest <file>")
+        exit(64)
+    }
+    rest.removeAll { $0 == urlArg }
+    rejectStrayFlags(rest, subcommand: "dovitest")
+    exit(runDoviTest(url: parseSourceURL(urlArg)))
 }
 
 // HLS live fixture subcommand.

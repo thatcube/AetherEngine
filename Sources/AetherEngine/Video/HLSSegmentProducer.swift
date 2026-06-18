@@ -56,9 +56,15 @@ final class HLSSegmentProducer: @unchecked Sendable {
         /// Strip the source's Dolby Vision configuration record before
         /// `avformat_write_header`. Forwarded to the muxer for paths
         /// where the engine has chosen to play a DV source as plain
-        /// HEVC HDR10 (P7 today). See
+        /// HEVC HDR10 (P7 on non-DV panel, P8.2). See
         /// `MP4SegmentMuxer.VideoConfig.stripDolbyVisionMetadata`.
+        /// Mutually exclusive with `convertP7ToProfile81`.
         let stripDolbyVisionMetadata: Bool
+        /// Rewrite the `dvcC` config to Profile 8.1 and convert each
+        /// video packet's RPU from P7 to 8.1 in the pump loop. True
+        /// only for HEVC P7 on a DV-capable panel. See
+        /// `MP4SegmentMuxer.VideoConfig.convertP7ToProfile81`.
+        let convertP7ToProfile81: Bool
         /// Optional color-signaling override forwarded to the muxer.
         /// See `MP4SegmentMuxer.ColorOverride`.
         let colorOverride: MP4SegmentMuxer.ColorOverride?
@@ -72,6 +78,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             timeBase: AVRational,
             codecTagOverride: String?,
             stripDolbyVisionMetadata: Bool = false,
+            convertP7ToProfile81: Bool = false,
             colorOverride: MP4SegmentMuxer.ColorOverride? = nil,
             extradataOverride: [UInt8]? = nil
         ) {
@@ -79,6 +86,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             self.timeBase = timeBase
             self.codecTagOverride = codecTagOverride
             self.stripDolbyVisionMetadata = stripDolbyVisionMetadata
+            self.convertP7ToProfile81 = convertP7ToProfile81
             self.colorOverride = colorOverride
             self.extradataOverride = extradataOverride
         }
@@ -548,6 +556,16 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var pendingAudioSegIndex: Int = 0
 
     private var loggedFirstVideoPktInfo = false
+    /// One-shot latch: suppress repeated P7->8.1 conversion-failure
+    /// log lines; only the first failure per session is emitted.
+    private var loggedP7ConversionFailure = false
+    /// Mirrors `videoConfig.convertP7ToProfile81` but is latched to
+    /// `false` at an SSAI program switch (ad creatives are H.264; DV
+    /// NAL types 62/63 cannot appear in valid H.264, so the converter
+    /// would be a no-op, but the gating must stay consistent with the
+    /// muxer's `isReinit ? false : videoConfig.convertP7ToProfile81`
+    /// so correctness never rests on that coincidence).
+    private var convertP7Active: Bool = false
     /// One-shot log latches for the monotonic-dts repair. Bumps and
     /// drops both fire once per producer instance so the log shows
     /// the first occurrence without going noisy.
@@ -959,6 +977,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
         self.videoStreamIndex = videoStreamIndex
         self.videoConfig = video
+        self.convertP7Active = video.convertP7ToProfile81
         self.audioConfig = audio
         self.cache = cache
         self.baseIndex = baseIndex
@@ -1269,6 +1288,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             // own codecpar carries its signaling, so don't force the
             // program's values onto it.
             stripDolbyVisionMetadata: isReinit ? false : videoConfig.stripDolbyVisionMetadata,
+            convertP7ToProfile81: isReinit ? false : videoConfig.convertP7ToProfile81,
             colorOverride: isReinit ? nil : videoConfig.colorOverride,
             extradataOverride: isReinit ? nil : videoConfig.extradataOverride
         )
@@ -1841,6 +1861,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     lastSeenVideoExtradata = nil
                     pendingVideoProgramSwitch = true
                     pendingAdVideoConfig = adConfig
+                    // Ad creatives are H.264; disable P7 conversion for
+                    // the ad stream (mirrors muxer's isReinit ? false :
+                    // videoConfig.convertP7ToProfile81 gating).
+                    convertP7Active = false
                     // A program switch is active boundary work, not a wedge:
                     // give the next cut a fresh watchdog window so the no-cut
                     // stall doesn't trip mid-ad-pod and force a needless
@@ -2786,6 +2810,26 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             + "(fallback=\(videoFallbackDurationPts) in srcVideoTb)",
                             category: .session
                         )
+                    }
+                    // P7->8.1 live RPU conversion. Mirrors the ADTS-strip
+                    // pattern for audio: mutate the packet in place before
+                    // it enters the look-behind stash. Failures log at most
+                    // once per session; the unconverted packet is muxed
+                    // unchanged (HDR10 BL still plays; RPU carries wrong
+                    // profile but the video is not lost).
+                    // convertP7Active is latched false on an SSAI program
+                    // switch (ad creatives are H.264, not HEVC P7), keeping
+                    // this gating consistent with the muxer config gating.
+                    if convertP7Active {
+                        if !DoviRpuConverter.convertPacketToProfile81(packet) {
+                            if !loggedP7ConversionFailure {
+                                loggedP7ConversionFailure = true
+                                EngineLog.emit(
+                                    "[HLSSegmentProducer] DV P7->8.1 conversion failed for a packet; muxing unconverted",
+                                    category: .session
+                                )
+                            }
+                        }
                     }
                     // Compute THIS packet's segment index now. Live: the
                     // keyframe cutter advances on a keyframe past the
