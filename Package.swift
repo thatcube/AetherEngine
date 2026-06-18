@@ -34,7 +34,7 @@ let package = Package(
         // libdovi (Dolby Vision RPU parser/converter). Resolved over Git like
         // FFmpegBuild so consumers (and Xcode Cloud) build without a sibling
         // LibDovi checkout; the prebuilt xcframework needs no Rust at build time.
-        .package(url: "https://github.com/superuser404notfound/LibDovi", from: "1.0.1"),  // 1.0.0 lacked iOS slices
+        .package(url: "https://github.com/superuser404notfound/LibDovi", from: "1.0.2"),  // 1.0.2: iOS slices + x86_64 (Intel Macs)
     ],
     targets: [
         .target(

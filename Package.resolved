@@ -1,5 +1,5 @@
 {
-  "originHash" : "2c28091996c29a63f226e66c31e169d2465835c9e709223f018a818d02de37fc",
+  "originHash" : "32b415b1dfe2c7e0e22df65da8825f520196b64cddf5f20474f7491fe8d0d95e",
   "pins" : [
     {
       "identity" : "amsmb2",
@@ -24,8 +24,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/superuser404notfound/LibDovi",
       "state" : {
-        "revision" : "3681a5a88adb9faa07e7dd745c0cdbddf465ac3a",
-        "version" : "1.0.1"
+        "revision" : "bebab0af0e3633b0002fcc7106ea6fc7ceea8277",
+        "version" : "1.0.2"
       }
     }
   ],
