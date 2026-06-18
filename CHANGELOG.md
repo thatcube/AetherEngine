@@ -10,6 +10,14 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [3.11.1] — 2026-06-18
+
+### Fixed
+
+- **System-wide `mediaserverd` wedge after a long background suspension.** A paused native session left running into a multi-hour tvOS suspension kept its AVPlayer decode session, the in-process loopback HLS server sockets, and the upstream AVIO connection all allocated. On resume that wedged the shared `mediaserverd` system-wide: every app (including unrelated ones) could only paint the first frame until the device was rebooted. The `didEnterBackground` handler now tears the video pipeline down instead of merely pausing, releasing the decode session synchronously before suspension. The native host shell and `currentAVPlayer` are kept so Now-Playing survives, and the clock / loaded URL / options are preserved so the host's foreground `reloadAtCurrentPosition()` resumes at the paused position.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.11.1))
+
 ## [3.11.0] — 2026-06-18
 
 ### Added
