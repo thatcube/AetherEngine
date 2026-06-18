@@ -561,6 +561,32 @@ public final class AetherEngine: ObservableObject {
     /// next periodic time tick. Unused on the SW / audio paths (shift 0).
     var nativeClockSeconds: Double = 0
 
+    /// Diagnostics-only ground truth for the native-path shift, read
+    /// straight off the active video producer (`HLSVideoEngine`'s own
+    /// `videoShiftPts`) rather than the host-folded `playlistShiftSeconds`.
+    /// The two normally track, but the host value is updated across an
+    /// async main-actor hop (the `onPlaylistShiftChanged` relay) and a
+    /// seam-history resolution, while this reads the producer's value
+    /// synchronously. A persistent gap between this and
+    /// `playlistShiftSeconds` means the published clock is folding the
+    /// on-screen frame with a stale shift, i.e. the "decoded frame ahead
+    /// of the reported clock" divergence (AetherEngine#49). 0 on the
+    /// SW / audio paths. Not for production playback logic; poll it
+    /// alongside `frameAhead` when capturing a divergence trace.
+    public var activeProducerShiftSeconds: Double {
+        nativeVideoSession?.playlistShiftSeconds ?? 0
+    }
+
+    /// `activeProducerShiftSeconds - playlistShiftSeconds`: how far the
+    /// producer's true shift leads the host-folded shift the clock is
+    /// publishing with. Positive means the decoded frame is ahead of the
+    /// reported `currentTime` by this many seconds. Stays ~0 when the
+    /// fold keeps up; a value that grows with seek count and does not
+    /// reconcile is the AetherEngine#49 accumulation. Diagnostics only.
+    public var frameAhead: Double {
+        activeProducerShiftSeconds - playlistShiftSeconds
+    }
+
     /// Monotonic load/stop generation. Bumped by every `stopInternal`
     /// (which runs at the head of every `load()`, `stop()`, and audio
     /// reload), captured by `load()`/`reloadWithAudioOverride` after
