@@ -752,7 +752,15 @@ final class HLSLocalServer: @unchecked Sendable {
         }
         let normalizedPath = (path == "/audio.m3u8") ? "/media.m3u8" : path
 
-        EngineLog.emit("[HLSLocalServer] \(firstLine)", category: .hlsServer, level: .verbose)
+        // #50 diag: request arrivals normally log at .verbose (per-segment
+        // noise, OSLog .debug only, not mirrored to the host handler). On
+        // 3.11.1 a plain-playback DV-P7 title still dies with loadFailed(404)
+        // yet rrgomes' .info host mirror shows neither a -> 404 nor a -> 503
+        // line, so the fatal request is not reaching our guarded seg paths and
+        // we are blind to which path AVPlayer actually requested last. Promote
+        // arrivals to .info so the existing host mirror names the failing path
+        // without a custom verbose build. Revert once #50 is root-caused.
+        EngineLog.emit("[HLSLocalServer] \(firstLine)", category: .hlsServer)
         // Dump full request headers on first request per session.
         // AVPlayer's HLS pipeline may send capability headers
         // (Accept, Range, X-Playback-Session-Id) that influence its
@@ -766,7 +774,10 @@ final class HLSLocalServer: @unchecked Sendable {
         if dumpHeaders {
             let allLines = text.components(separatedBy: "\r\n")
             let headers = allLines.dropFirst().prefix(while: { !$0.isEmpty }).joined(separator: " | ")
-            EngineLog.emit("[HLSLocalServer] first request headers fd=\(fd): \(headers)", category: .hlsServer, level: .verbose)
+            // #50 diag: once-per-session, promoted to .info to surface any
+            // Range / capability header that explains the 404. Revert with the
+            // arrival-line promotion above once #50 is root-caused.
+            EngineLog.emit("[HLSLocalServer] first request headers fd=\(fd): \(headers)", category: .hlsServer)
         }
 
         switch normalizedPath {
