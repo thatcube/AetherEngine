@@ -43,6 +43,15 @@ final class NativeAVPlayerHost {
     /// later transition (a new failure, item swap) cancels an in-flight
     /// confirmation.
     private var failureConfirmToken: Int = 0
+    /// #50: latched true on the first `.playing` transition of this session.
+    /// Discriminates a genuine startup failure (never played, surface the
+    /// `.failed` promptly) from a mid-playback transient (played, then a
+    /// self-healing `.failed`). The instantaneous `timeControlStatus` at the
+    /// `.failed` KVO instant is unreliable for this: the `.failed` and
+    /// `timeControlStatus` KVOs are not synchronized, so a transient error
+    /// fired while the clock is still advancing can momentarily read
+    /// non-`.playing`. Reset with the item on a reused host.
+    private var hasEverPlayed = false
     /// True after the AVPlayer item reaches the end of its stream.
     /// Engine flips state to .idle so host end-of-content flows
     /// (auto-dismiss, next-episode countdown if no marker) fire.
@@ -446,6 +455,7 @@ final class NativeAVPlayerHost {
                 // Dolby) only once playback actually starts, so this is the
                 // first point the route reflects the true steady state. The
                 // downmix warnings run here, not at readyToPlay (issue #24).
+                if status == .playing { self.hasEverPlayed = true }
                 if status == .playing, !self.didSampleSettledRoute {
                     self.didSampleSettledRoute = true
                     Task { @MainActor [weak self] in
@@ -659,13 +669,28 @@ final class NativeAVPlayerHost {
     /// demonstrably still playing (rrgomes' device capture: `tcs=playing`,
     /// `rate=1.0` at the `.failed` transition).
     ///
-    /// A genuine fatal failure leaves the player stopped, so gate on
-    /// `timeControlStatus`: if the player is not playing, surface immediately;
-    /// if it is still playing, defer and confirm after a short settle. If it
-    /// is still playing at confirmation it has recovered (suppress); if it has
-    /// since stopped the failure was real (surface). This is the engine-side
-    /// fix for the spurious-`.failed`-while-playing state-machine inconsistency
-    /// rrgomes flagged, so hosts no longer need to suppress it themselves.
+    /// A genuine fatal failure leaves the player stopped. 426b45c gated the
+    /// publish on the *instantaneous* `timeControlStatus` at the `.failed`
+    /// instant: surface immediately when not `.playing`, defer-and-confirm
+    /// when still `.playing`. rrgomes' `426b45c` retest showed that single
+    /// sample is unreliable - the engine still published a terminal failure at
+    /// avpClock=27.3s while the AVPlayer kept playing smoothly, and the
+    /// "deferring" log never fired, meaning the immediate-surface branch ran
+    /// (`timeControlStatus != .playing` at that instant) even though playback
+    /// was demonstrably advancing. The `.failed` KVO and the `timeControlStatus`
+    /// KVO are not synchronized: a self-healing transient (in-range loopback
+    /// 404, AVIOReader range-read reconnect) can fire `.failed` during a brief
+    /// `.waitingToPlayAtSpecifiedRate` blip while the clock never stops.
+    ///
+    /// So discriminate on *whether playback was ever established*, not on an
+    /// instantaneous transport sample. Before the first `.playing` transition a
+    /// `.failed` is a genuine startup failure (no recovery expected) and
+    /// surfaces promptly. Once playback has established, every `.failed` is
+    /// treated as possibly-spurious and deferred; at confirmation a recovered
+    /// player is one that is `.playing` *or* whose clock advanced past the
+    /// failure point (clock progress is immune to the same instantaneous-sample
+    /// race on the confirmation side). Only a player that is both stopped and
+    /// has not advanced after the settle surfaces the failure.
     @MainActor
     private func handleItemFailed(_ desc: String, item: AVPlayerItem) {
         // Ignore a late `.failed` KVO from an item we have already replaced.
@@ -674,13 +699,16 @@ final class NativeAVPlayerHost {
         failureConfirmToken &+= 1
         let token = failureConfirmToken
 
-        if avPlayer.timeControlStatus != .playing {
+        // Startup failure: never reached .playing, so nothing to recover.
+        if !hasEverPlayed {
             failureMessage = desc
             return
         }
 
+        let clockAtFailure = renderedTime
         EngineLog.emit(
-            "[NativeAVPlayerHost] #\(sessionID) item.status=.failed while player still .playing; "
+            "[NativeAVPlayerHost] #\(sessionID) item.status=.failed after playback established "
+            + "(tcs=\(avPlayer.timeControlStatus.rawValue) clock=\(String(format: "%.2f", clockAtFailure))); "
             + "deferring possibly-spurious failure: \(desc)",
             category: .engine
         )
@@ -689,16 +717,19 @@ final class NativeAVPlayerHost {
             guard let self = self,
                   self.failureConfirmToken == token,
                   self.playerItem === item else { return }
-            if self.avPlayer.timeControlStatus == .playing {
+            let advanced = self.renderedTime > clockAtFailure + 0.5
+            if self.avPlayer.timeControlStatus == .playing || advanced {
                 EngineLog.emit(
-                    "[NativeAVPlayerHost] #\(self.sessionID) deferred failure cleared: "
-                    + "player recovered and is still playing",
+                    "[NativeAVPlayerHost] #\(self.sessionID) deferred failure cleared: player recovered "
+                    + "(tcs=\(self.avPlayer.timeControlStatus.rawValue) "
+                    + "clock=\(String(format: "%.2f", self.renderedTime)) advanced=\(advanced))",
                     category: .engine
                 )
             } else {
                 EngineLog.emit(
-                    "[NativeAVPlayerHost] #\(self.sessionID) deferred failure confirmed: "
-                    + "player stopped (tcs=\(self.avPlayer.timeControlStatus.rawValue))",
+                    "[NativeAVPlayerHost] #\(self.sessionID) deferred failure confirmed: player stopped "
+                    + "(tcs=\(self.avPlayer.timeControlStatus.rawValue) "
+                    + "clock=\(String(format: "%.2f", self.renderedTime)))",
                     category: .engine
                 )
                 self.failureMessage = desc
@@ -864,6 +895,11 @@ final class NativeAVPlayerHost {
         // this reused host (episode 2+ of a binge otherwise silently
         // lost the issue-24 downmix warnings).
         didSampleSettledRoute = false
+        // Re-arm the #50 startup-vs-established discriminator: a reused host
+        // must treat the next session's pre-playback failures as startup
+        // failures (surface promptly), not inherit the prior session's
+        // established state.
+        hasEverPlayed = false
         // Force the player rate to 0 before swapping the item. On a
         // native->native reload the host (and its AVPlayer) is reused to
         // keep AVKit's system Now-Playing registration alive (issue #15),
