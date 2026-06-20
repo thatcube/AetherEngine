@@ -10,9 +10,13 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [3.11.5] — 2026-06-20
+
 ### Fixed
 
 - **Long delay to first subtitle cue when a track is activated mid-playback (no pause) on a slow/remote source (#52).** `selectSubtitleTrack(index:)` mid-playback on a large/remote (high-latency) source showed the first on-screen cue tens of seconds late instead of the ~1-2s the API promises. The side demuxer captured the playhead (`startAt`) before `demuxer.open` and the `duration*0.5` prewarm seek; on a slow source those steps cost several seconds of wall-clock during which unpaused playback advanced, so the reader then seeked to a now-stale position behind the live playhead and paged forward over already-played content. Those cues arrived behind the playhead and were dropped by the current-cue lookup until the read caught up. The reader now re-samples the live playhead after the open + prewarm and re-targets the single existing seek to it (no extra network seek), keeping the bitmap SETUP lead-in and seeding the read-ahead snapshot from the re-sampled value. It is a no-op when paused, on a fast/local open, and on the seek re-arm path.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.11.5))
 
 ## [3.11.4] — 2026-06-20
 
