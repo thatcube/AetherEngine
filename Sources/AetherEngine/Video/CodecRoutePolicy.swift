@@ -110,15 +110,45 @@ extension HLSVideoEngine {
         /// HEVC P7 (BL routed as plain HDR10, VT rejects dvcC with
         /// -12906) and for HEVC P8.1 / P8.4 on non-DV panels (tvOS 26
         /// master-level codec filter rejects dvvC + plain hvc1 with
-        /// -11868). Mutually exclusive with `convertP7ToProfile81`.
+        /// -11868). Mutually exclusive with `rewriteDoviConfigTo81`.
         let stripDolbyVisionMetadata: Bool
-        /// Rewrite the `dvcC` config record to Profile 8.1 in the
-        /// container header (muxer init.mp4) AND convert every video
-        /// packet's RPU in place via `DoviRpuConverter`. True only for
-        /// HEVC P7 on a DV-capable panel; false on all other routes
-        /// (including P7 on a non-DV panel, which still strips).
+        /// Convert every video packet's RPU from P7 to 8.1 in place via
+        /// `DoviRpuConverter`. True only for HEVC P7 on a DV-capable
+        /// panel; false on all other routes (including P7 on a non-DV
+        /// panel, which strips instead). Drives only the per-packet work;
+        /// the matching container `dvcC` rewrite rides on
+        /// `rewriteDoviConfigTo81`.
         let convertP7ToProfile81: Bool
+        /// Rewrite the container `dvcC` record to a valid P8.1 in the
+        /// muxer's init.mp4 (no packet rewrite implied). True for two
+        /// DV-capable-panel routes: HEVC P7 (alongside
+        /// `convertP7ToProfile81`) and the malformed "P8.6" case, where
+        /// the bitstream is already a single-layer HDR10-base P8 stream
+        /// but the source `dvcC` carries an invalid compat id that
+        /// AVPlayer rejects. Mutually exclusive with
+        /// `stripDolbyVisionMetadata`.
+        let rewriteDoviConfigTo81: Bool
         let dvVariant: DVVariant
+
+        init(
+            codecTagOverride: String?,
+            videoRange: HLSVideoRange,
+            primaryCodecs: String,
+            supplementalCodecs: String?,
+            stripDolbyVisionMetadata: Bool,
+            convertP7ToProfile81: Bool,
+            rewriteDoviConfigTo81: Bool = false,
+            dvVariant: DVVariant
+        ) {
+            self.codecTagOverride = codecTagOverride
+            self.videoRange = videoRange
+            self.primaryCodecs = primaryCodecs
+            self.supplementalCodecs = supplementalCodecs
+            self.stripDolbyVisionMetadata = stripDolbyVisionMetadata
+            self.convertP7ToProfile81 = convertP7ToProfile81
+            self.rewriteDoviConfigTo81 = rewriteDoviConfigTo81
+            self.dvVariant = dvVariant
+        }
     }
 
     /// Classify the source video's codec + DV profile and decide the
@@ -447,6 +477,22 @@ extension HLSVideoEngine {
             // decoder); for P8.1 we strip conditionally based on
             // display capability since DV-capable panels need the
             // dvvC for the upgrade path.
+            //
+            // Malformed "P8.6": some files are tagged profile 8 with an
+            // invalid `dv_bl_signal_compatibility_id` (often 6, borrowed
+            // from P7's marker, when an old tool confused the profile
+            // with the `dvhe08.06` level field). The bitstream is really
+            // a single-layer HDR10-base P8.1 stream, but a `dvvC` whose
+            // compat id contradicts the `db1p` brand makes AVPlayer reject
+            // the variant outright (issue #53, DrHurt). On a DV panel,
+            // normalize the container record to a clean compat==1 (the
+            // muxer's `rewriteDoviConfigToProfile81` also pins profile=8 /
+            // el=0) so the dvvC and db1p agree; no per-packet RPU work is
+            // needed since the elementary stream is already P8.1. On a
+            // non-DV panel the strip path already forces HDR10 fallback,
+            // matching the server's DOVIInvalid remux behaviour.
+            let compat = Int(dvRecord?.dv_bl_signal_compatibility_id ?? 1)
+            let needsCompatRewrite = compat != 1
             let supplemental: String?
             let strip: Bool
             if effectiveDvMode {
@@ -456,6 +502,14 @@ extension HLSVideoEngine {
                 supplemental = nil
                 strip = true
             }
+            if needsCompatRewrite && effectiveDvMode {
+                EngineLog.emit(
+                    "[HLSVideoEngine] HEVC DV Profile 8 with invalid compat="
+                    + "\(compat) (\"P8.6\"); normalizing container dvcC to "
+                    + "P8.1 (compat=1) for AVPlayer on DV panel",
+                    category: .session
+                )
+            }
             return CodecRoute(
                 codecTagOverride: "hvc1",
                 videoRange: .pq,
@@ -463,6 +517,7 @@ extension HLSVideoEngine {
                 supplementalCodecs: supplemental,
                 stripDolbyVisionMetadata: strip,
                 convertP7ToProfile81: false,
+                rewriteDoviConfigTo81: needsCompatRewrite && effectiveDvMode,
                 dvVariant: dvVariant
             )
         case .profile84:
@@ -547,6 +602,7 @@ extension HLSVideoEngine {
                 supplementalCodecs: supplemental,
                 stripDolbyVisionMetadata: strip,
                 convertP7ToProfile81: effectiveDvMode,
+                rewriteDoviConfigTo81: effectiveDvMode,
                 dvVariant: dvVariant
             )
         case .unknown:

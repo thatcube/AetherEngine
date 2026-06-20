@@ -58,13 +58,19 @@ final class HLSSegmentProducer: @unchecked Sendable {
         /// where the engine has chosen to play a DV source as plain
         /// HEVC HDR10 (P7 on non-DV panel, P8.2). See
         /// `MP4SegmentMuxer.VideoConfig.stripDolbyVisionMetadata`.
-        /// Mutually exclusive with `convertP7ToProfile81`.
+        /// Mutually exclusive with `rewriteDoviConfigTo81`.
         let stripDolbyVisionMetadata: Bool
-        /// Rewrite the `dvcC` config to Profile 8.1 and convert each
-        /// video packet's RPU from P7 to 8.1 in the pump loop. True
-        /// only for HEVC P7 on a DV-capable panel. See
-        /// `MP4SegmentMuxer.VideoConfig.convertP7ToProfile81`.
+        /// Convert each video packet's RPU from P7 to 8.1 in the pump
+        /// loop. True only for HEVC P7 on a DV-capable panel. Gates the
+        /// per-packet `DoviRpuConverter` work only; the container `dvcC`
+        /// rewrite is a separate concern driven by `rewriteDoviConfigTo81`
+        /// (P7 sets both, the malformed-P8.6 route sets only the latter).
         let convertP7ToProfile81: Bool
+        /// Rewrite the container `dvcC` config record to a valid P8.1 in
+        /// `init.mp4`. Forwarded to
+        /// `MP4SegmentMuxer.VideoConfig.rewriteDoviConfigTo81`. True for
+        /// the P7-on-DV-panel and malformed-P8.6-on-DV-panel routes.
+        let rewriteDoviConfigTo81: Bool
         /// Optional color-signaling override forwarded to the muxer.
         /// See `MP4SegmentMuxer.ColorOverride`.
         let colorOverride: MP4SegmentMuxer.ColorOverride?
@@ -79,6 +85,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             codecTagOverride: String?,
             stripDolbyVisionMetadata: Bool = false,
             convertP7ToProfile81: Bool = false,
+            rewriteDoviConfigTo81: Bool = false,
             colorOverride: MP4SegmentMuxer.ColorOverride? = nil,
             extradataOverride: [UInt8]? = nil
         ) {
@@ -87,6 +94,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             self.codecTagOverride = codecTagOverride
             self.stripDolbyVisionMetadata = stripDolbyVisionMetadata
             self.convertP7ToProfile81 = convertP7ToProfile81
+            self.rewriteDoviConfigTo81 = rewriteDoviConfigTo81
             self.colorOverride = colorOverride
             self.extradataOverride = extradataOverride
         }
@@ -1288,7 +1296,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             // own codecpar carries its signaling, so don't force the
             // program's values onto it.
             stripDolbyVisionMetadata: isReinit ? false : videoConfig.stripDolbyVisionMetadata,
-            convertP7ToProfile81: isReinit ? false : videoConfig.convertP7ToProfile81,
+            rewriteDoviConfigTo81: isReinit ? false : videoConfig.rewriteDoviConfigTo81,
             colorOverride: isReinit ? nil : videoConfig.colorOverride,
             extradataOverride: isReinit ? nil : videoConfig.extradataOverride
         )

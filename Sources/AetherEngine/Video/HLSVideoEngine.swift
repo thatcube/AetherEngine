@@ -753,6 +753,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let supplementalCodecs = route.supplementalCodecs
         let stripDolbyVisionMetadata = route.stripDolbyVisionMetadata
         let convertP7ToProfile81 = route.convertP7ToProfile81
+        let rewriteDoviConfigTo81 = route.rewriteDoviConfigTo81
         let dvVariant = route.dvVariant
 
         let resolution = (Int(codecpar.pointee.width), Int(codecpar.pointee.height))
@@ -870,6 +871,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             codecTagOverride: codecTagOverride,
             stripDolbyVisionMetadata: stripDolbyVisionMetadata,
             convertP7ToProfile81: convertP7ToProfile81,
+            rewriteDoviConfigTo81: rewriteDoviConfigTo81,
             colorOverride: p5ColorOverride,
             extradataOverride: hevcExtradataOverride
         )
