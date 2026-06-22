@@ -332,6 +332,27 @@ extension AetherEngine {
         var parkLogged = false
         var timeBaseCache: [Int32: AVRational] = [:]
 
+        // Event batching (#56). Publishing one decoded event per awaited
+        // MainActor hop collapses demux throughput on packet-dense ASS tracks,
+        // because the hops serialise against the host's on-MainActor ASS
+        // renderer. Accumulate events and flush them in a single hop once the
+        // batch spans `embeddedSubtitleFlushWindowSeconds` of source time
+        // (tracked off the monotonically advancing demux clock) or hits the
+        // count cap. `batchStartSeconds` is the demux position when the batch's
+        // first event landed; the span is the current demux position minus it.
+        var pendingEvents: [EmbeddedSubtitleDecoder.SubtitleEvent] = []
+        var batchStartSeconds: Double?
+        func flushPendingSubtitleEvents() async {
+            guard !pendingEvents.isEmpty else { return }
+            let batch = pendingEvents
+            pendingEvents.removeAll(keepingCapacity: true)
+            batchStartSeconds = nil
+            await MainActor.run { [weak self] in
+                guard !Task.isCancelled else { return }
+                for ev in batch { self?.applySubtitleEvent(ev, channel: channel) }
+            }
+        }
+
         readLoop: while !Task.isCancelled {
             guard let pkt = try? demuxer.readPacket() else {
                 break
@@ -378,14 +399,22 @@ extension AetherEngine {
                         )
                         firstCueLogged = true
                     }
-                    await MainActor.run { [weak self] in
-                        guard !Task.isCancelled else { return }
-                        self?.applySubtitleEvent(event, channel: channel)
-                    }
+                    if pendingEvents.isEmpty { batchStartSeconds = pktSeconds }
+                    pendingEvents.append(event)
                 }
             } else {
                 var p: UnsafeMutablePointer<AVPacket>? = pkt
                 trackedPacketFree(&p)
+            }
+
+            // Flush the batch once it covers a window of source time (or the
+            // count cap trips on a same-timestamp burst). The span is measured
+            // off the current demux clock, which advances on every stream's
+            // packets, so even a same-region ASS cluster flushes as the reader
+            // streams past it.
+            let batchSpan: Double? = batchStartSeconds.flatMap { start in pktSeconds.map { $0 - start } }
+            if Self.shouldFlushSubtitleBatch(pendingCount: pendingEvents.count, batchSpanSeconds: batchSpan) {
+                await flushPendingSubtitleEvents()
             }
 
             // Park until the playhead catches up to within the read-
@@ -393,6 +422,10 @@ extension AetherEngine {
             // stop) is observed by Task.sleep, which throws
             // immediately on a cancelled task.
             if let pktSeconds, pktSeconds > playheadSnapshot + Self.embeddedSubtitleReadAheadSeconds {
+                // Publish everything decoded so far before sleeping at the read-
+                // ahead horizon; otherwise a tail batch would sit unpublished
+                // for up to the park interval.
+                await flushPendingSubtitleEvents()
                 while !Task.isCancelled {
                     guard let fresh = await MainActor.run(body: { [weak self] in self?.sourceTime }) else {
                         break readLoop
@@ -419,6 +452,10 @@ extension AetherEngine {
                 }
             }
         }
+
+        // Publish the trailing batch (EOF, or a non-cancel break). On a real
+        // cancel the MainActor hop self-guards and drops the batch.
+        await flushPendingSubtitleEvents()
 
         EngineLog.emit(
             "[AetherEngine] embedded subtitle reader exited (cancelled=\(Task.isCancelled)) " +

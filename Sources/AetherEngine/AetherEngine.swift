@@ -849,6 +849,51 @@ public final class AetherEngine: ObservableObject {
     /// this constraint is maintained.
     nonisolated static let embeddedSubtitleReadAheadSeconds: Double = 90
 
+    /// Source-time span (seconds) a pending embedded-subtitle event batch may
+    /// cover before it is flushed to the MainActor. The embedded ASS reader
+    /// (#56) used to publish one decoded event per awaited `MainActor.run`
+    /// hop; on packet-dense tracks (hundreds of events clustered over a few
+    /// source seconds) those hops serialise the demux loop against the host's
+    /// on-MainActor ASS renderer, collapsing throughput so the published cues
+    /// fall far behind the playhead. Coalescing events that fall within this
+    /// window into a single hop decouples demux speed from MainActor pressure.
+    /// Kept small so a sparse track (one cue every few source seconds) still
+    /// flushes per event with no added latency, and well under the 2s seek
+    /// pre-roll so the first cue lands before the playhead reaches it.
+    nonisolated static let embeddedSubtitleFlushWindowSeconds: Double = 0.5
+
+    /// Hard cap on pending events per flush. The decisive throttle for the
+    /// pathological same-timestamp burst (span stays 0, so the window rule
+    /// never trips) and for NOPTS packets that yield no demux clock at all.
+    /// The #56 sample stacks 1534 ASS events on a single pts (5.207s); at this
+    /// cap that cluster publishes in ~12 hops instead of 1534. Sized large
+    /// because a same-pts burst is read far ahead of the playhead, so a bigger
+    /// batch costs no display latency, only fewer (cheaper) MainActor hops.
+    nonisolated static let embeddedSubtitleFlushCountCap = 128
+
+    /// Decide whether the pending embedded-subtitle event batch should be
+    /// flushed to the MainActor. Pure so the boundary behaviour is unit-tested
+    /// (`SubtitleBatchFlushTests`) without standing up a demuxer.
+    ///
+    /// - `batchSpanSeconds`: demux position minus the source time of the
+    ///   batch's first event, or nil when no usable clock exists yet (NOPTS).
+    ///
+    /// Flushes when the batch spans at least `windowSeconds` of source time
+    /// (the common case: the demux clock advances past the window as the reader
+    /// streams forward) or reaches `countCap` (the same-timestamp / NOPTS
+    /// fallback). An empty batch never flushes.
+    nonisolated static func shouldFlushSubtitleBatch(
+        pendingCount: Int,
+        batchSpanSeconds: Double?,
+        windowSeconds: Double = AetherEngine.embeddedSubtitleFlushWindowSeconds,
+        countCap: Int = AetherEngine.embeddedSubtitleFlushCountCap
+    ) -> Bool {
+        guard pendingCount > 0 else { return false }
+        if pendingCount >= countCap { return true }
+        if let span = batchSpanSeconds, span >= windowSeconds { return true }
+        return false
+    }
+
     // MARK: - Init
 
     /// Lifecycle notification observers. Block-based observers are NOT
