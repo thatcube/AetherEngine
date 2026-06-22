@@ -72,7 +72,6 @@ func runHLSFixture(args: [String]) -> Int32 {
     }
     let inputPath = rest.removeFirst()
 
-    // Flags.
     let port          = takeIntFlag("--port", from: &rest) ?? 8090
     let segSeconds    = takeIntFlag("--segment-seconds", from: &rest) ?? 4
     // 0 made currentSequence() divide by zero (Int(inf) traps on the
@@ -93,7 +92,6 @@ func runHLSFixture(args: [String]) -> Int32 {
         print("WARNING: unknown arguments: \(rest.joined(separator: " "))")
     }
 
-    // Load + slice the input file.
     let slices: [[UInt8]]
     do {
         slices = try loadAndSlice(path: inputPath)

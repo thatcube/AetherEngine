@@ -80,7 +80,6 @@ final class FileHandleIOReader: IOReader, @unchecked Sendable {
 
     func seek(offset: Int64, whence: Int32) -> Int64 {
         lock.lock(); defer { lock.unlock() }
-        // AVSEEK_SIZE: query total size only, no reposition. Always answerable.
         if whence == Self.avSeekSize { return totalSize }
         if forwardOnly { return -1 }
         switch whence {
@@ -198,7 +197,6 @@ private func customIOSmokeTest(path: String, inMemory: Bool, forwardOnly: Bool, 
         }
     }
 
-    // Feature checks follow. Engine is in .playing state here.
     if reload {
         do { try await engine.reloadAtCurrentPosition() } catch {
             print("VERDICT: reload threw: \(error.localizedDescription)"); engine.stop(); return 5

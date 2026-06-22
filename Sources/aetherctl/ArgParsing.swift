@@ -1,5 +1,4 @@
 // Shared CLI argument helpers for every aetherctl subcommand.
-// (Previously duplicated between main.swift and HLSFixture.swift.)
 
 import Foundation
 
