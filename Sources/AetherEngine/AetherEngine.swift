@@ -806,6 +806,17 @@ public final class AetherEngine: ObservableObject {
     /// and TCP backpressure (the 16 MB window high-water) pauses the
     /// transfer server-side, so the second connection throttles to
     /// playback rate instead of line rate.
+    ///
+    /// CRITICAL INVARIANT for native tx3g subtitle track (#55): this value
+    /// MUST remain greater than the producer's buffer-ahead distance
+    /// (bufferAheadSegments * targetSegmentDurationSeconds, currently 10 * 6 = 60s).
+    /// The embedded subtitle reader parks at this horizon, and the producer
+    /// drains decoded cues from the store when cutting each segment. If the
+    /// buffer-ahead distance ever exceeds this value, segments cut beyond
+    /// the park horizon would have no decoded cues, causing gaps in the native
+    /// subtitle track (inline host rendering is unaffected). Raising
+    /// bufferAheadSegments or targetSegmentDurationSeconds requires verifying
+    /// this constraint is maintained.
     nonisolated static let embeddedSubtitleReadAheadSeconds: Double = 90
 
     // MARK: - Init
