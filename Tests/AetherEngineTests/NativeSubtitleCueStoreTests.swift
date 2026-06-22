@@ -1,10 +1,18 @@
 // Tests/AetherEngineTests/NativeSubtitleCueStoreTests.swift
+import CoreGraphics
 import XCTest
 @testable import AetherEngine
 
 final class NativeSubtitleCueStoreTests: XCTestCase {
     private func cue(_ id: Int, _ a: Double, _ b: Double, _ s: String) -> SubtitleCue {
         SubtitleCue(id: id, startTime: a, endTime: b, body: .text(s))
+    }
+
+    private static func onePixel() -> CGImage {
+        let ctx = CGContext(data: nil, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+                            space: CGColorSpaceCreateDeviceRGB(),
+                            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        return ctx.makeImage()!
     }
 
     func test_windowReturnsOverlappingCuesOnAVPlayerAxis() {
@@ -23,5 +31,15 @@ final class NativeSubtitleCueStoreTests: XCTestCase {
         XCTAssertEqual(store.cueCount, 1)
         store.clear()
         XCTAssertEqual(store.cueCount, 0)
+    }
+
+    func test_imageCuesAreExcluded() {
+        let store = NativeSubtitleCueStore()
+        store.appendCues([
+            SubtitleCue(id: 1, startTime: 0, endTime: 1, body: .text("t")),
+            SubtitleCue(id: 2, startTime: 0, endTime: 1,
+                        body: .image(SubtitleImage(cgImage: Self.onePixel(), position: .zero)))
+        ])
+        XCTAssertEqual(store.cueCount, 1)
     }
 }
