@@ -98,7 +98,7 @@ extension AetherEngine {
             // audio-switch restart (#55). Also wire the current producer
             // immediately so it can drain cues before the first restart.
             nativeVideoSession?.nativeSubtitleCueStoreForSession = store
-            nativeVideoSession?.producer?.subtitleCueStore = store
+            nativeVideoSession?.producer?.subtitleCueStores = [store]
         }
 
         // Side-demuxer seeks in source PTS. sourceTime is the unified
@@ -674,7 +674,7 @@ extension AetherEngine {
         isLoadingSubtitles = false
         nativeSubtitleCueStore = nil
         nativeVideoSession?.nativeSubtitleCueStoreForSession = nil
-        nativeVideoSession?.producer?.subtitleCueStore = nil
+        nativeVideoSession?.producer?.subtitleCueStores = []
         nativeSubtitleRenditionAvailable = false
     }
 

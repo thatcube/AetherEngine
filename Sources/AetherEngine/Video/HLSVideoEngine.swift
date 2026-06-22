@@ -197,7 +197,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     public func attachNativeSubtitleStore() {
         let store = NativeSubtitleCueStore()
         nativeSubtitleCueStoreForSession = store
-        producer?.subtitleCueStore = store
+        producer?.subtitleCueStores = [store]
     }
 
     /// Per-frame fallback durations (in the respective source
@@ -1887,7 +1887,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // subtitle track is active; the nil path is byte-identical to
         // sessions without native subtitle support (no-op in advanceMuxer).
         prod.enableNativeSubtitleTrack = enableNativeSubtitleTrackForSession
-        prod.subtitleCueStore = nativeSubtitleCueStoreForSession
+        if let store = nativeSubtitleCueStoreForSession {
+            prod.subtitleCueStores = [store]
+        }
         return prod
     }
 
