@@ -218,6 +218,16 @@ public struct LoadOptions: Sendable, Equatable {
     /// bitmap tracks are untouched. Default `false` (AetherEngine#30).
     public var preserveASSMarkup: Bool
 
+    /// When set and the title has text subtitles, the engine declares a
+    /// mov_text track in the init moov so subtitles can survive
+    /// PiP / AirPlay / external display selection via native AVMediaSelection.
+    /// The side demuxer's decoded cues flow into both `subtitleCues` (for
+    /// the host overlay) and the `NativeSubtitleCueStore` that the
+    /// segment producer drains per cut (for the muxed mov_text track).
+    /// Bitmap subtitle codecs (PGS / DVB / DVD) are excluded from the
+    /// native track automatically. Default `false` (#55).
+    public var prepareNativeSubtitles: Bool = false
+
     /// ENGINE-INTERNAL: marks this load as a live REJOIN (a reload of
     /// an already-running live session: background-return reopen via
     /// `reloadAtCurrentPosition`). Not part of the public API and not
@@ -247,7 +257,8 @@ public struct LoadOptions: Sendable, Equatable {
         audioOnly: Bool = false,
         dvrWindowSeconds: Double? = nil,
         nativeRemoteHLS: Bool = false,
-        preserveASSMarkup: Bool = false
+        preserveASSMarkup: Bool = false,
+        prepareNativeSubtitles: Bool = false
     ) {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
         self.suppressDisplayCriteria = suppressDisplayCriteria
@@ -261,6 +272,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.dvrWindowSeconds = dvrWindowSeconds
         self.nativeRemoteHLS = nativeRemoteHLS
         self.preserveASSMarkup = preserveASSMarkup
+        self.prepareNativeSubtitles = prepareNativeSubtitles
     }
 }
 

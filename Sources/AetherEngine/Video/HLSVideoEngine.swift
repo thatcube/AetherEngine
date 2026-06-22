@@ -160,6 +160,46 @@ public final class HLSVideoEngine: @unchecked Sendable {
     var savedVideoConfig: HLSSegmentProducer.StreamConfig?
     var savedAudioConfig: HLSSegmentProducer.AudioConfig?
 
+    /// Mirror of `LoadOptions.prepareNativeSubtitles` + a text-subtitle
+    /// guard. When true, `makeProducer` sets `enableNativeSubtitleTrack`
+    /// on every producer it creates (initial + restart) so the muxer
+    /// always declares the mov_text track in the init moov (#55).
+    /// Set by `AetherEngine.loadNative` after the probe, before `start()`.
+    /// Also settable via the public `enableNativeSubtitles()` affordance.
+    var enableNativeSubtitleTrackForSession: Bool = false
+
+    /// Session-persistent cue store for the native mov_text subtitle track
+    /// (#55). Mirrors `enableNativeSubtitleTrackForSession`: set by
+    /// `AetherEngine.selectSubtitleTrack` when a text track is activated
+    /// and cleared by `clearSubtitle` / `stopInternal`. `makeProducer`
+    /// re-threads it onto every fresh producer (initial + restart) so the
+    /// producer can drain cues per segment cut even after a seek or
+    /// audio-switch restart. Nil when no text subtitle track is active;
+    /// the nil path is byte-identical to pre-#55 output.
+    var nativeSubtitleCueStoreForSession: NativeSubtitleCueStore?
+
+    /// Diagnostics affordance (#55): request the native mov_text track
+    /// in the init moov. Call BEFORE `start()` so `makeProducer` picks
+    /// up the flag when allocating the first muxer. Then call
+    /// `attachNativeSubtitleStore()` after `start()` to wire the cue
+    /// store to the already-running producer.
+    /// In a full `AetherEngine` session this is wired automatically;
+    /// these methods exist so `aetherctl serve --native-subs N` can
+    /// confirm the plumbing at the HLS-engine level.
+    public func requestNativeSubtitleTrack() {
+        enableNativeSubtitleTrackForSession = true
+    }
+
+    /// Attach a fresh `NativeSubtitleCueStore` to the current producer.
+    /// Call AFTER `start()`. The store starts empty; cues arrive once
+    /// `selectSubtitleTrack` on an `AetherEngine` instance feeds the
+    /// side demuxer.
+    public func attachNativeSubtitleStore() {
+        let store = NativeSubtitleCueStore()
+        nativeSubtitleCueStoreForSession = store
+        producer?.subtitleCueStore = store
+    }
+
     /// Per-frame fallback durations (in the respective source
     /// time_base) so the producer can backfill `pkt->duration` when
     /// the matroska demuxer doesn't supply per-block durations.
@@ -1840,6 +1880,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
             guard let self, let prod else { return }
             self.handlePumpFinished(prod, reason: reason)
         }
+        // Native mov_text track: propagate both the session-level flag and
+        // the cue store onto every producer (initial + restart) so the muxer
+        // init moov is consistent and the per-segment cue drain works across
+        // scrub-driven producer restarts (#55). The store is nil when no text
+        // subtitle track is active; the nil path is byte-identical to
+        // sessions without native subtitle support (no-op in advanceMuxer).
+        prod.enableNativeSubtitleTrack = enableNativeSubtitleTrackForSession
+        prod.subtitleCueStore = nativeSubtitleCueStoreForSession
         return prod
     }
 
@@ -1877,6 +1925,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
     private func handleVideoShiftKnown(_ shiftPts: Int64) {
         let seconds = shiftPts == Int64.min ? 0 : Double(shiftPts) * sourceVideoTbSeconds
         setPlaylistShiftSeconds(seconds)
+        // Refresh the cue store's shift so cuesInWindow maps source-PTS
+        // cue timestamps onto the updated AVPlayer axis after a restart
+        // (the shift can change when matroska seek lands past the planned
+        // keyframe). No-op when no text subtitle track is active (#55).
+        nativeSubtitleCueStoreForSession?.setShiftSeconds(seconds)
         onPlaylistShiftChanged?(seconds)
     }
 

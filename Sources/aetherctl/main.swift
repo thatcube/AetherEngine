@@ -374,6 +374,9 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     let selectSubsFlag = takeFlag("--select-subs", from: &rest)
     let extractFlag = takeFlag("--extract", from: &rest)
     let audioSeconds = takeDoubleFlag("--seconds", from: &rest) ?? 10
+    // Diagnostics affordance for native mov_text subtitle track (#55).
+    // Serve only; ignored by other subcommands.
+    let nativeSubsIndex = takeIntFlag("--native-subs", from: &rest)
     rejectStrayFlags(rest, subcommand: first)
     guard let urlArg = rest.first else {
         print("ERROR: \(first) requires a <url> argument")
@@ -387,7 +390,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     case "probe":
         exit(runProbe(url: url))
     case "serve":
-        runServe(url: url, dvModeAvailable: dvModeAvailable)
+        runServe(url: url, dvModeAvailable: dvModeAvailable, nativeSubsIndex: nativeSubsIndex)
     case "validate":
         exit(runValidate(url: url, dvModeAvailable: dvModeAvailable))
     case "swdecode":

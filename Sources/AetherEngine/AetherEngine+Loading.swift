@@ -325,6 +325,19 @@ extension AetherEngine {
                 self.liveSourceReset.send()
             }
         }
+        // Enable the native mov_text track when the session was loaded with
+        // prepareNativeSubtitles and the source has at least one non-bitmap
+        // subtitle stream (#55). The flag gates whether allocateMuxer injects
+        // a SubtitleConfig; it must be set before start() allocates the first
+        // muxer instance. TrackInfo.codec is the lower-case libavcodec name
+        // string (e.g. "subrip", "ass", "mov_text"). Bitmap codecs are
+        // "hdmv_pgs_subtitle", "dvb_subtitle", "dvd_subtitle", "xsub".
+        let bitmapCodecNames: Set<String> = [
+            "hdmv_pgs_subtitle", "dvb_subtitle", "dvd_subtitle", "xsub"
+        ]
+        let hasTextSubtitleTrack = subtitleTracks.contains { !bitmapCodecNames.contains($0.codec) }
+        session.enableNativeSubtitleTrackForSession = loadedOptions.prepareNativeSubtitles && hasTextSubtitleTrack
+
         // AVPlayer HLS playback over the loopback HTTP server. Detach
         // the synchronous network I/O inside `session.start()` (opens
         // its own Demuxer + prewarm seek = another ~1-3 s on slow CDN)

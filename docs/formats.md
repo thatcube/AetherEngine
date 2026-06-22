@@ -74,6 +74,49 @@ A single packet that carries multiple rects (PGS often emits signs/songs at the 
 
 Subtitle cues land in raw source PTS. On the native path, AVPlayer's HLS clock sits at `source_pts - producer.videoShiftPts` (the producer applies a per-session shift to align the first segment's tfdt with the playlist origin, and the shift can change on every restart). Render the overlay against `player.sourceTime` so cues match the spoken audio regardless of which producer session is active.
 
+### Native subtitle track (tx3g / mov_text for PiP, AirPlay, and external display)
+
+Host-rendered subtitle overlays are invisible in Picture-in-Picture, AirPlay, and external-display sessions because those paths render the `AVPlayerLayer` content only; the SwiftUI / UIKit view tree is not composited. The native subtitle track feature solves this by muxing the active text subtitle as a `mov_text` (tx3g) track directly into the fragmented-MP4 stream so AVFoundation exposes it as a standard legible `AVMediaSelection` group that travels with the stream everywhere `AVPlayer` goes.
+
+**Opt-in.** The feature is off by default (`LoadOptions.prepareNativeSubtitles = false`). When disabled, the muxer output is byte-identical to the prior behavior and `AVPlayerViewController` shows no subtitle menu.
+
+When `prepareNativeSubtitles` is `true` and the title has a text subtitle track (embedded or sidecar), the engine declares a `mov_text` track in the `init.mp4` moov with `disposition:default=0`. AVFoundation's legible group exposes the track as a selectable option, but the `defaultOption` is `nil`: the track is **not** auto-displayed. The host chooses when to engage it.
+
+**Scope and format coverage.** Works on VOD with embedded text subtitles and sidecar files (SRT / VTT / ASS). Covers all SDR, HDR10, HLG, and Dolby Vision sources uniformly, including DV Profile 5 (which has no HLS master playlist, ruling out WebVTT in-manifest tracks). Bitmap subtitles (PGS / DVB / DVD) cannot become a native text track; they remain host-rendered only. Live sources are out of scope for this release.
+
+**Rich ASS styling note.** The native track carries plain text. Rich ASS styling (positions, speaker colours, karaoke) is still host-rendered inline via `LoadOptions.preserveASSMarkup`; the native track in PiP / AirPlay falls back to the system caption style.
+
+**Timing.** Cue PTS values written to the `mov_text` track are on the AVPlayer clock axis (`source_pts - producer.videoShiftPts`), so they stay in sync with the displayed frame regardless of producer restarts or seeks.
+
+**Selection API.** Two members on `AetherEngine` drive the native track:
+
+```swift
+// true once cues from the active subtitle track are decoded into the native store
+engine.$nativeSubtitleRenditionAvailable   // @Published var Bool
+
+// select or deselect the in-band legible option on the current AVPlayerItem
+engine.setNativeSubtitleSelected(_ on: Bool)
+```
+
+The recommended host pattern:
+
+1. Observe `$nativeSubtitleRenditionAvailable` (waits for the first cues to be ready before activating).
+2. On entering PiP / AirPlay / external display: call `setNativeSubtitleSelected(true)` and hide the host overlay.
+3. On leaving: call `setNativeSubtitleSelected(false)` and re-enable the host overlay.
+
+This avoids double subtitles during inline playback (where the host overlay is already painting them) and ensures the user sees subtitles the moment the stream is mirrored or sent to PiP.
+
+**Device-verification checklist** (required before tagging a release):
+
+- Inline host ASS rendering unchanged: rich styling intact, no regression.
+- Enter PiP: subtitles remain visible (native track), no double subtitles while inline.
+- Enter AirPlay / external display: same as PiP.
+- Leave PiP / AirPlay: host overlay resumes, native track deselected, no double subtitles.
+- Timing: no constant offset between audio and subtitle cues.
+- SDR, HDR10, and Dolby Vision picture behavior byte-identical to a session with `prepareNativeSubtitles = false` (the tx3g track must not perturb video or audio).
+- DV Profile 5 source with a text subtitle: subtitle works via the native track.
+- Long VOD (60+ min): memory footprint bounded by cue count (store prunes history outside the active window).
+
 ### Authored ASS styling
 
 Hosts that render authored ASS styling themselves (positioning, speaker colours, karaoke) opt out of the stripping with `LoadOptions(preserveASSMarkup: true)`: cues then carry the raw event line (override tags, style references, escapes intact), the script header (`[Script Info]` + `[V4+ Styles]`) is surfaced, and `engine.fontAttachments` carries the container's embedded fonts (TTF / OTF) for the renderer's font directory. `ASSScriptBuilder` reassembles raw event cues + header into a complete script for whole-file renderers such as swift-ass-renderer's `loadTrack(content:)`, hardened against real-world Matroska tracks (synthesized `[Events]` section, NUL stripping, content-keyed dedupe since real files hardcode `ReadOrder: 0`).

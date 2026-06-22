@@ -236,11 +236,11 @@ public final class AetherEngine: ObservableObject {
     @Published public internal(set) var activeAudioDecoder: String?
 
     /// Decoded subtitle cues for the active subtitle source. Populated
-    /// by `selectSidecarSubtitle(url:)` only — embedded subtitle
-    /// streams in the source travel through HLSVideoEngine into the
-    /// fMP4 wrapper but aren't decoded back to text on this side yet
-    /// (AVMediaSelection wiring is a tracked follow-up). Sidecar SRT
-    /// works end-to-end.
+    /// by `selectSidecarSubtitle(url:)` and `selectSubtitleTrack(index:)`
+    /// (embedded streams via a side demuxer). When `LoadOptions.prepareNativeSubtitles`
+    /// is set, cues also flow into the `NativeSubtitleCueStore` so the
+    /// muxer can inject them into the mov_text track. Native text-subtitle
+    /// selection is available via `setNativeSubtitleSelected(_:)`.
     @Published public internal(set) var subtitleCues: [SubtitleCue] = []
     /// True while a sidecar file is being downloaded + decoded.
     @Published public internal(set) var isLoadingSubtitles: Bool = false
@@ -268,6 +268,14 @@ public final class AetherEngine: ObservableObject {
     @Published public internal(set) var isLoadingSecondarySubtitles: Bool = false
     /// True when a secondary subtitle source is active.
     @Published public internal(set) var isSecondarySubtitleActive: Bool = false
+
+    /// True once the native mov_text subtitle track has at least one
+    /// cue available in the `NativeSubtitleCueStore` (#55). Meaningful
+    /// only when `LoadOptions.prepareNativeSubtitles` was set and a
+    /// text subtitle track was selected. Hosts can use this to decide
+    /// whether to surface the native AVMediaSelection picker (PiP /
+    /// AirPlay). Cleared by `clearSubtitle` and `stopInternal`.
+    @Published public internal(set) var nativeSubtitleRenditionAvailable: Bool = false
 
     /// True while the active session is a live stream (the host set
     /// `LoadOptions.isLive = true` at load time). Hosts use this to
@@ -753,6 +761,14 @@ public final class AetherEngine: ObservableObject {
     /// reconnect loop otherwise survives stop()/track switches.
     var activeSubtitleSideDemuxer: Demuxer?
 
+    /// Cue store backing the native mov_text track (#55). Non-nil only
+    /// when `LoadOptions.prepareNativeSubtitles` is set and a text
+    /// subtitle track has been selected. The side-demuxer reader
+    /// appends decoded cues here concurrently with `subtitleCues`;
+    /// the segment producer drains it per cut via `cuesInWindow`.
+    /// Cleared by `clearSubtitle` and `stopInternal`.
+    var nativeSubtitleCueStore: NativeSubtitleCueStore?
+
     /// Cap the per-session subtitle event diagnostic logs so the in-
     /// app overlay stays readable. Reset on `load()` so each new
     /// session gets a fresh budget.
@@ -790,6 +806,17 @@ public final class AetherEngine: ObservableObject {
     /// and TCP backpressure (the 16 MB window high-water) pauses the
     /// transfer server-side, so the second connection throttles to
     /// playback rate instead of line rate.
+    ///
+    /// CRITICAL INVARIANT for native tx3g subtitle track (#55): this value
+    /// MUST remain greater than the producer's buffer-ahead distance
+    /// (bufferAheadSegments * targetSegmentDurationSeconds, currently 10 * 4 = 40s).
+    /// The embedded subtitle reader parks at this horizon, and the producer
+    /// drains decoded cues from the store when cutting each segment. If the
+    /// buffer-ahead distance ever exceeds this value, segments cut beyond
+    /// the park horizon would have no decoded cues, causing gaps in the native
+    /// subtitle track (inline host rendering is unaffected). Raising
+    /// bufferAheadSegments or targetSegmentDurationSeconds requires verifying
+    /// this constraint is maintained.
     nonisolated static let embeddedSubtitleReadAheadSeconds: Double = 90
 
     // MARK: - Init
@@ -2135,6 +2162,8 @@ public final class AetherEngine: ObservableObject {
         subtitleCues = []
         sidecarASSHeader = nil
         isLoadingSubtitles = false
+        nativeSubtitleCueStore = nil
+        nativeSubtitleRenditionAvailable = false
         cancelSidecarTask(channel: .secondary)
         cancelEmbeddedSubtitleReader(channel: .secondary)
         activeSecondaryEmbeddedSubtitleStreamIndex = -1

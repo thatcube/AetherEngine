@@ -81,6 +81,26 @@ extension AetherEngine {
         isLoadingSubtitles = true
         activeEmbeddedSubtitleStreamIndex = Int32(index)
 
+        // Wire the native mov_text cue store when requested (#55).
+        // The store is created fresh on each track selection so a
+        // track switch does not carry stale cues into the new stream.
+        // The producer drains it per segment cut; only text cues land
+        // there (NativeSubtitleCueStore filters out bitmap bodies).
+        if loadedOptions.prepareNativeSubtitles {
+            let store = NativeSubtitleCueStore()
+            // playlistShiftSeconds is the AVPlayer-axis offset that
+            // NativeSubtitleCueStore.cuesInWindow must subtract from
+            // source-PTS cue timestamps to map them onto AVPlayer time.
+            store.setShiftSeconds(playlistShiftSeconds)
+            nativeSubtitleCueStore = store
+            // Persist the store on the video session so makeProducer can
+            // re-thread it onto every subsequent producer after a seek or
+            // audio-switch restart (#55). Also wire the current producer
+            // immediately so it can drain cues before the first restart.
+            nativeVideoSession?.nativeSubtitleCueStoreForSession = store
+            nativeVideoSession?.producer?.subtitleCueStore = store
+        }
+
         // Side-demuxer seeks in source PTS. sourceTime is the unified
         // source-PTS playhead (equal to currentTime now that the native
         // clock folds in playlistShiftSeconds), so it hands the demuxer
@@ -445,16 +465,18 @@ extension AetherEngine {
 
         switch channel {
         case .primary:
-            applyEventMutations(event, to: &subtitleCues)
+            applyEventMutations(event, to: &subtitleCues, channel: .primary)
         case .secondary:
-            applyEventMutations(event, to: &secondarySubtitleCues)
+            applyEventMutations(event, to: &secondarySubtitleCues, channel: .secondary)
         }
     }
 
     /// Shared cue-array mutation: PGS clear-event trim, sorted insert, prune.
     /// Operates on whichever channel's cue store the caller passes in.
+    /// For the primary channel, also forwards text cues into the native
+    /// mov_text store when one is attached (#55).
     @MainActor
-    private func applyEventMutations(_ event: EmbeddedSubtitleDecoder.SubtitleEvent, to cues: inout [SubtitleCue]) {
+    private func applyEventMutations(_ event: EmbeddedSubtitleDecoder.SubtitleEvent, to cues: inout [SubtitleCue], channel: SubtitleChannel = .primary) {
         if let trimAt = event.pgsTrimAt {
             for i in 0..<cues.count {
                 guard case .image = cues[i].body else { continue }
@@ -478,6 +500,15 @@ extension AetherEngine {
             cues.insert(cue, at: lo)
         }
         pruneOldSubtitleCues(&cues)
+
+        // Feed the native mov_text store for the primary channel (#55).
+        // The store itself filters out bitmap cues, so no codec check needed here.
+        if channel == .primary, let store = nativeSubtitleCueStore, !event.cues.isEmpty {
+            store.appendCues(event.cues)
+            if store.cueCount > 0 {
+                nativeSubtitleRenditionAvailable = true
+            }
+        }
     }
 
     /// Remove subtitle cues whose `endTime` has fallen further behind
@@ -582,6 +613,11 @@ extension AetherEngine {
                 self.subtitleCues = result.cues
                 self.sidecarASSHeader = result.assHeader
                 self.isLoadingSubtitles = false
+                // Feed the native mov_text store when one is attached (#55).
+                if let store = self.nativeSubtitleCueStore {
+                    store.replaceCues(result.cues)
+                    self.nativeSubtitleRenditionAvailable = store.cueCount > 0
+                }
             }
         }
     }
@@ -625,6 +661,8 @@ extension AetherEngine {
 
     /// Turn subtitles off and clear cached cues. Tears down both the
     /// sidecar SRT decode task and the side-demuxer embedded reader.
+    /// Also detaches the native mov_text cue store from the producer
+    /// and clears the rendition-available signal (#55).
     public func clearSubtitle() {
         cancelSidecarTask()
         cancelEmbeddedSubtitleReader()
@@ -634,6 +672,10 @@ extension AetherEngine {
         subtitleCues = []
         sidecarASSHeader = nil
         isLoadingSubtitles = false
+        nativeSubtitleCueStore = nil
+        nativeVideoSession?.nativeSubtitleCueStoreForSession = nil
+        nativeVideoSession?.producer?.subtitleCueStore = nil
+        nativeSubtitleRenditionAvailable = false
     }
 
     func cancelSidecarTask(channel: SubtitleChannel = .primary) {
@@ -657,5 +699,24 @@ extension AetherEngine {
         isSecondarySubtitleActive = false
         secondarySubtitleCues = []
         isLoadingSecondarySubtitles = false
+    }
+
+    /// Enable or disable the native mov_text rendition on the current
+    /// AVPlayer item's legible media-selection group (#55). Lets hosts
+    /// hand subtitle rendering to AVKit / AirPlay / PiP rather than
+    /// driving the host overlay. Only effective when
+    /// `LoadOptions.prepareNativeSubtitles` was set at load time and
+    /// `nativeSubtitleRenditionAvailable` is true. Silently no-ops when
+    /// no native item is loaded or the item carries no legible group.
+    public func setNativeSubtitleSelected(_ on: Bool) {
+        guard let item = currentAVPlayer?.currentItem else { return }
+        Task { @MainActor in
+            guard let group = try? await item.asset.loadMediaSelectionGroup(for: .legible) else { return }
+            if on, let option = group.options.first {
+                item.select(option, in: group)
+            } else {
+                item.select(nil, in: group)
+            }
+        }
     }
 }

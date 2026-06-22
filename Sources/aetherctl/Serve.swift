@@ -3,7 +3,7 @@ import AetherEngine
 
 // MARK: - serve
 
-func runServe(url: URL, dvModeAvailable: Bool) -> Never {
+func runServe(url: URL, dvModeAvailable: Bool, nativeSubsIndex: Int? = nil) -> Never {
     // Mirror what the tvOS app does: route every engine log to stdout
     // instead of into a host overlay buffer, so the CLI session reads
     // linearly.
@@ -16,7 +16,8 @@ func runServe(url: URL, dvModeAvailable: Bool) -> Never {
         print("[\(timestamp)] \(line)")
     }
 
-    let flagSuffix = dvModeAvailable ? "" : " [--no-dv]"
+    var flagSuffix = dvModeAvailable ? "" : " [--no-dv]"
+    if let idx = nativeSubsIndex { flagSuffix += " [--native-subs \(idx)]" }
     print("aetherctl serve: \(url.absoluteString)\(flagSuffix)")
     print("")
 
@@ -24,12 +25,26 @@ func runServe(url: URL, dvModeAvailable: Bool) -> Never {
         url: url,
         dvModeAvailable: dvModeAvailable
     )
+    // Diagnostics affordance (#55): request the native mov_text track
+    // before start() so the muxer's init moov declares the subtitle
+    // stream. Must precede start().
+    if nativeSubsIndex != nil {
+        engine.requestNativeSubtitleTrack()
+    }
     let playbackURL: URL
     do {
         playbackURL = try engine.start()
     } catch {
         print("ERROR: \(error)")
         exit(1)
+    }
+    // Attach the cue store to the producer after start. The store
+    // starts empty; in a full AetherEngine session selectSubtitleTrack
+    // feeds it via the side demuxer.
+    if let idx = nativeSubsIndex {
+        engine.attachNativeSubtitleStore()
+        print("[native-subs] mov_text track declared in init moov, cue store attached for stream index \(idx)")
+        print("[native-subs] use a full AetherEngine session to feed cues via selectSubtitleTrack")
     }
 
     print("")
