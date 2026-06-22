@@ -240,7 +240,7 @@ public final class AetherEngine: ObservableObject {
     /// (embedded streams via a side demuxer). When `LoadOptions.prepareNativeSubtitles`
     /// is set, cues also flow into the `NativeSubtitleCueStore` so the
     /// muxer can inject them into the mov_text track. Native text-subtitle
-    /// selection is available via `setNativeSubtitleSelected(_:)`.
+    /// selection is available via `setNativeSubtitleSelected(track:)`.
     @Published public internal(set) var subtitleCues: [SubtitleCue] = []
     /// True while a sidecar file is being downloaded + decoded.
     @Published public internal(set) var isLoadingSubtitles: Bool = false

@@ -643,6 +643,10 @@ extension AetherEngine {
     /// then detaches the native mov_text rendition: cancels the multi-decode
     /// reader, clears every store, drops the session set, and clears the
     /// rendition-available signal (#55, all-tracks).
+    ///
+    /// Note: `nativeSubtitleTracks` is intentionally NOT cleared here.
+    /// The host needs the list to re-select a track after an audio or subtitle
+    /// switch. Only `stop()` and a new `load()` reset the list to empty.
     public func clearSubtitle() {
         cancelSidecarTask()
         cancelEmbeddedSubtitleReader()
