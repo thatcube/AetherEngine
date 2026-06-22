@@ -93,6 +93,11 @@ extension AetherEngine {
             // source-PTS cue timestamps to map them onto AVPlayer time.
             store.setShiftSeconds(playlistShiftSeconds)
             nativeSubtitleCueStore = store
+            // Persist the store on the video session so makeProducer can
+            // re-thread it onto every subsequent producer after a seek or
+            // audio-switch restart (#55). Also wire the current producer
+            // immediately so it can drain cues before the first restart.
+            nativeVideoSession?.nativeSubtitleCueStoreForSession = store
             nativeVideoSession?.producer?.subtitleCueStore = store
         }
 
@@ -668,6 +673,7 @@ extension AetherEngine {
         sidecarASSHeader = nil
         isLoadingSubtitles = false
         nativeSubtitleCueStore = nil
+        nativeVideoSession?.nativeSubtitleCueStoreForSession = nil
         nativeVideoSession?.producer?.subtitleCueStore = nil
         nativeSubtitleRenditionAvailable = false
     }

@@ -809,7 +809,7 @@ public final class AetherEngine: ObservableObject {
     ///
     /// CRITICAL INVARIANT for native tx3g subtitle track (#55): this value
     /// MUST remain greater than the producer's buffer-ahead distance
-    /// (bufferAheadSegments * targetSegmentDurationSeconds, currently 10 * 6 = 60s).
+    /// (bufferAheadSegments * targetSegmentDurationSeconds, currently 10 * 4 = 40s).
     /// The embedded subtitle reader parks at this horizon, and the producer
     /// drains decoded cues from the store when cutting each segment. If the
     /// buffer-ahead distance ever exceeds this value, segments cut beyond

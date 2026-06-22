@@ -1447,6 +1447,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                               ptsSeconds: s.pts,
                                               durationSeconds: s.duration)
                 }
+                EngineLog.emit(
+                    "[HLSSegmentProducer] subtitle inject seg-\(currentMuxerSegmentIndex) "
+                    + "window=[\(String(format: "%.3f", t0)), \(String(format: "%.3f", t1)))s "
+                    + "samples=\(plan.count) (\(cues.count) cue(s) + \(plan.count - cues.count) gap(s))",
+                    category: .engine, level: .verbose
+                )
             }
         }
 
