@@ -907,6 +907,38 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// reopen-with-backoff recovery when the source was lost.
     var onPumpFinished: (@Sendable (PumpExitReason) -> Void)?
 
+    /// Optional cue store for native mov_text subtitle injection (#55).
+    /// When non-nil, the segment-cut path drains cues for each segment
+    /// window and writes mov_text samples into the muxer before the cut.
+    /// Nil by default: sessions without a subtitle track are unchanged
+    /// (byte-identical output).
+    var subtitleCueStore: NativeSubtitleCueStore?
+
+    /// Turn a segment window's cues into a contiguous mov_text sample
+    /// plan: empty samples fill the gaps so the text track has no holes.
+    /// Cues are assumed clipped and sorted by NativeSubtitleCueStore.cuesInWindow.
+    /// `window` and `cues` are all on the same axis (AVPlayer-axis seconds).
+    static func movTextSamples(
+        forWindow window: (start: Double, end: Double),
+        cues: [(start: Double, end: Double, text: String)]
+    ) -> [(payload: Data, pts: Double, duration: Double)] {
+        var out: [(payload: Data, pts: Double, duration: Double)] = []
+        var cursor = window.start
+        for c in cues {
+            let cs = max(c.start, window.start)
+            let ce = min(c.end, window.end)
+            if cs > cursor {
+                out.append((MovTextSampleBuilder.emptySample(), cursor, cs - cursor))
+            }
+            out.append((MovTextSampleBuilder.sample(text: c.text), cs, max(0, ce - cs)))
+            cursor = ce
+        }
+        if cursor < window.end {
+            out.append((MovTextSampleBuilder.emptySample(), cursor, window.end - cursor))
+        }
+        return out
+    }
+
     /// Marks the FIRST segment this producer opens as discontinuous
     /// (`#EXT-X-DISCONTINUITY`). Set by the engine's live-reopen path:
     /// the fresh source connection joins the broadcast at "now", so the
@@ -1347,12 +1379,62 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
     }
 
+    /// Compute the [start, end) time window for a VOD or live segment
+    /// on the AVPlayer axis (seconds), for subtitle cue injection.
+    ///
+    /// VOD: derives start and end from the pre-planned `segmentBoundaries`
+    /// array (source video TB ticks), then converts to AVPlayer-axis
+    /// seconds using `videoShiftPts`. Returns nil if the shift is not yet
+    /// known or the index is out of bounds.
+    ///
+    /// Live: reads from `liveSegmentStartByIndex`, which already stores
+    /// AVPlayer-axis seconds (the cutter records the post-shift `pts`
+    /// converted to seconds). Returns nil when either boundary is absent.
+    private func segmentWindowAVPlayerSeconds(
+        segIdx: Int,
+        nextSegIdx: Int
+    ) -> (start: Double, end: Double)? {
+        if isLive {
+            guard let t0 = liveSegmentStartByIndex[segIdx],
+                  let t1 = liveSegmentStartByIndex[nextSegIdx]
+            else { return nil }
+            return (t0, t1)
+        } else {
+            guard videoShiftPts != Int64.min, sourceVideoTbSeconds > 0 else { return nil }
+            let i = segIdx - baseIndex
+            let iNext = nextSegIdx - baseIndex
+            guard i >= 0, iNext < segmentBoundaries.count else { return nil }
+            let t0 = Double(segmentBoundaries[i] - videoShiftPts) * sourceVideoTbSeconds
+            let t1 = Double(segmentBoundaries[iNext] - videoShiftPts) * sourceVideoTbSeconds
+            return (t0, t1)
+        }
+    }
+
     /// Cross a fragment boundary on the existing single-session muxer:
     /// trigger a fragment cut (= flush queued packets + close the
     /// completed segment's fd + open the next segment's fd), then
     /// apply the cache-window backpressure for the new index.
     private func advanceMuxer(to newIdx: Int) -> MP4SegmentMuxer? {
         guard let muxer = currentMuxer else { return nil }
+
+        // Native mov_text subtitle injection (#55): drain cues for the
+        // segment being finalized and write mov_text samples before the
+        // cut so AVPlayer sees them in the same fragment as the A/V data.
+        // Fully gated on subtitleCueStore being non-nil; no-op (and
+        // byte-identical output) for all video/audio-only sessions.
+        if let store = subtitleCueStore {
+            let segWindow = segmentWindowAVPlayerSeconds(
+                segIdx: currentMuxerSegmentIndex, nextSegIdx: newIdx)
+            if let (t0, t1) = segWindow, t1 > t0 {
+                let cues = store.cuesInWindow(start: t0, end: t1)
+                let plan = Self.movTextSamples(forWindow: (t0, t1), cues: cues)
+                for s in plan {
+                    muxer.writeSubtitleSample(s.payload,
+                                              ptsSeconds: s.pts,
+                                              durationSeconds: s.duration)
+                }
+            }
+        }
 
         if let result = muxer.cutFragmentForNextSegment(newIdx) {
             EngineLog.emit(
