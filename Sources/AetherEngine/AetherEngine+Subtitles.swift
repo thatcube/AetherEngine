@@ -1,4 +1,5 @@
 import Foundation
+import AVFoundation
 import Libavformat
 import Libavcodec
 import Libavutil
@@ -894,22 +895,51 @@ extension AetherEngine {
         )
     }
 
-    /// Enable or disable the native mov_text rendition on the current
-    /// AVPlayer item's legible media-selection group (#55). Lets hosts
-    /// hand subtitle rendering to AVKit / AirPlay / PiP rather than
-    /// driving the host overlay. Only effective when
-    /// `LoadOptions.prepareNativeSubtitles` was set at load time and
-    /// `nativeSubtitleRenditionAvailable` is true. Silently no-ops when
-    /// no native item is loaded or the item carries no legible group.
-    public func setNativeSubtitleSelected(_ on: Bool) {
+    /// Select or deselect the native mov_text subtitle track by ordinal (#55).
+    ///
+    /// Replaces the v1 bool form: pass a non-nil `ordinal` to activate the
+    /// track at that position, or nil to deselect all native subtitles.
+    ///
+    /// The selection resolves against the current AVPlayer item's legible
+    /// media-selection group. The group's options are expected to be in the
+    /// same order the muxer declared the mov_text streams (ordinal 0 = first
+    /// text track, etc.). When the session's language metadata is available
+    /// the selection first tries to match by `extendedLanguageTag` against
+    /// `nativeSubtitleTracks[ordinal].language`, then falls back to the
+    /// positional `group.options[ordinal]` if no language match is found.
+    /// This makes the selection robust whether AVFoundation preserves the
+    /// muxer declaration order or reorders by locale preference.
+    ///
+    /// Silently no-ops when no native item is loaded, the item carries no
+    /// legible group, or `ordinal` is out of range.
+    public func setNativeSubtitleSelected(track ordinal: Int?) {
         guard let item = currentAVPlayer?.currentItem else { return }
+        // Capture the current track list for the async closure (avoid
+        // capturing self so MainActor re-entrancy stays one hop).
+        let tracks = nativeSubtitleTracks
         Task { @MainActor in
             guard let group = try? await item.asset.loadMediaSelectionGroup(for: .legible) else { return }
-            if on, let option = group.options.first {
-                item.select(option, in: group)
-            } else {
+            guard !group.options.isEmpty else { return }
+            guard let ordinal else {
                 item.select(nil, in: group)
+                return
             }
+            // Language-match-with-positional-fallback: prefer the option whose
+            // extendedLanguageTag matches the declared track language so the
+            // selection is correct even if AVFoundation reorders the options.
+            // Fall back to positional when the language is unknown or no option
+            // carries the right tag.
+            var selected: AVMediaSelectionOption?
+            if ordinal < tracks.count, let lang = tracks[ordinal].language {
+                selected = group.options.first {
+                    $0.extendedLanguageTag?.hasPrefix(lang) == true
+                }
+            }
+            if selected == nil, ordinal < group.options.count {
+                selected = group.options[ordinal]
+            }
+            guard let option = selected else { return }
+            item.select(option, in: group)
         }
     }
 }

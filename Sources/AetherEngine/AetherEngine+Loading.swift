@@ -345,6 +345,20 @@ extension AetherEngine {
         nativeSubtitleTrackTable = textTracks.map { track in
             NativeSubtitleTrackEntry(sourceStreamIndex: track.id, language: track.language)
         }
+        // Publish the public NativeSubtitleTrack list from the load-time table.
+        // `displayName` is the locale's language name for known tags, otherwise
+        // "Subtitle <n>" (1-based for readability). The Locale lookup uses the
+        // engine host's current locale, same as AVKit's built-in track labels.
+        nativeSubtitleTracks = nativeSubtitleTrackTable.enumerated().map { ordinal, entry in
+            let name: String
+            if let lang = entry.language,
+               let localizedName = Locale.current.localizedString(forIdentifier: lang) {
+                name = localizedName
+            } else {
+                name = "Subtitle \(ordinal + 1)"
+            }
+            return NativeSubtitleTrack(ordinal: ordinal, language: entry.language, displayName: name)
+        }
         let hasTextSubtitleTrack = !nativeSubtitleTrackTable.isEmpty
         session.enableNativeSubtitleTrackForSession = loadedOptions.prepareNativeSubtitles && hasTextSubtitleTrack
 

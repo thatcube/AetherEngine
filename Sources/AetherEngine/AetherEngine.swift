@@ -277,6 +277,16 @@ public final class AetherEngine: ObservableObject {
     /// AirPlay). Cleared by `clearSubtitle` and `stopInternal`.
     @Published public internal(set) var nativeSubtitleRenditionAvailable: Bool = false
 
+    /// The ordered list of native mov_text subtitle tracks available on the
+    /// current session (#55). One entry per text subtitle stream declared in
+    /// the muxer init moov, in ordinal order. Populated from
+    /// `nativeSubtitleTrackTable` after the session starts and
+    /// `LoadOptions.prepareNativeSubtitles` was set; empty otherwise.
+    /// Cleared on stop and at the start of each `load()`. Hosts use this
+    /// list to populate a track picker and call
+    /// `setNativeSubtitleSelected(track:)` with the chosen ordinal.
+    @Published public internal(set) var nativeSubtitleTracks: [NativeSubtitleTrack] = []
+
     /// True while the active session is a live stream (the host set
     /// `LoadOptions.isLive = true` at load time). Hosts use this to
     /// hide duration / scrubber UI, skip seek affordances, and switch
@@ -1028,6 +1038,7 @@ public final class AetherEngine: ObservableObject {
         audioTracks = []
         subtitleTracks = []
         nativeSubtitleTrackTable = []
+        nativeSubtitleTracks = []
         metadata = nil
         fontAttachments = []
         subtitleCueDiagnosticCount = 0
@@ -2184,6 +2195,7 @@ public final class AetherEngine: ObservableObject {
         sidecarASSHeader = nil
         isLoadingSubtitles = false
         nativeSubtitleTrackTable = []
+        nativeSubtitleTracks = []
         cancelNativeSubtitleReaders()
         nativeSubtitleRenditionAvailable = false
         cancelSidecarTask(channel: .secondary)

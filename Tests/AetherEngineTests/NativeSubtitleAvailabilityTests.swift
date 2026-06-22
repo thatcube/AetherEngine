@@ -72,4 +72,34 @@ final class NativeSubtitleAvailabilityTests: XCTestCase {
         let opts = LoadOptions(prepareNativeSubtitles: true)
         XCTAssertTrue(opts.prepareNativeSubtitles)
     }
+
+    // MARK: - NativeSubtitleTrack shape (Task 4)
+
+    func test_nativeSubtitleTracks_carryOrdinalAndLanguage() {
+        // Construct two NativeSubtitleTrack values and assert ordinal /
+        // language / displayName are stored and retrieved correctly.
+        let t0 = NativeSubtitleTrack(ordinal: 0, language: "en", displayName: "English")
+        let t1 = NativeSubtitleTrack(ordinal: 1, language: "de", displayName: "German")
+        XCTAssertEqual(t0.ordinal, 0)
+        XCTAssertEqual(t0.language, "en")
+        XCTAssertEqual(t0.displayName, "English")
+        XCTAssertEqual(t1.ordinal, 1)
+        XCTAssertEqual(t1.language, "de")
+        XCTAssertEqual(t1.displayName, "German")
+    }
+
+    func test_nativeSubtitleTrack_nilLanguageFallbackDisplayName() {
+        // A track with no language tag must still carry a non-empty displayName.
+        let t = NativeSubtitleTrack(ordinal: 2, language: nil, displayName: "Subtitle 3")
+        XCTAssertNil(t.language)
+        XCTAssertEqual(t.displayName, "Subtitle 3")
+    }
+
+    func test_nativeSubtitleTrack_equatableByValue() {
+        let a = NativeSubtitleTrack(ordinal: 0, language: "en", displayName: "English")
+        let b = NativeSubtitleTrack(ordinal: 0, language: "en", displayName: "English")
+        let c = NativeSubtitleTrack(ordinal: 1, language: "en", displayName: "English")
+        XCTAssertEqual(a, b)
+        XCTAssertNotEqual(a, c)
+    }
 }

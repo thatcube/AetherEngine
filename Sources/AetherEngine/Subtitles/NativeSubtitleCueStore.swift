@@ -1,6 +1,19 @@
 // Sources/AetherEngine/Subtitles/NativeSubtitleCueStore.swift
 import Foundation
 
+/// A single native mov_text subtitle track exposed to hosts after load (#55).
+/// Ordinal is the 0-based index into the muxer's declared text tracks and
+/// matches the `group.options` position in the AVPlayer legible group.
+/// `language` is the ISO 639 tag from the source stream metadata (nil when
+/// absent). `displayName` is a human-readable label suitable for a track
+/// picker (the locale display name of `language`, or "Subtitle <n>" as
+/// the fallback when language is nil).
+public struct NativeSubtitleTrack: Sendable, Equatable {
+    public let ordinal: Int
+    public let language: String?
+    public let displayName: String
+}
+
 /// Sole owner of the bounded decoded-cue array backing the native
 /// mov_text subtitle track (#55). Holds only text `SubtitleCue`s, never
 /// packet data, so its footprint is bounded by cue count (leak guard).
