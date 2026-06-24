@@ -177,7 +177,18 @@ final class AudioBridge: @unchecked Sendable {
             cleanup()
             throw AudioBridgeError.decoderParametersFailed(code: copyRet)
         }
-        let openRet = avcodec_open2(dec, srcCodec, nil)
+        // DTS-HD MA / HRA carry a lossless XLL extension on top of the mandatory DTS core.
+        // The bridge re-encodes to lossy EAC3 (or FLAC), so the XLL refinement is discarded
+        // anyway, and its residual-coded channels cannot decode standalone on many Blu-ray
+        // frames ("Residual encoded channels are present without core", EINVAL -22; #64).
+        // Decode the always-present DTS core only: it reconstructs full-rate 5.1/7.1 PCM on
+        // every frame, which is exactly what the bridge needs. No-op for plain DTS core.
+        var decOpts: OpaquePointer?
+        if srcCodecID == AV_CODEC_ID_DTS {
+            av_dict_set(&decOpts, "core_only", "1", 0)
+        }
+        let openRet = avcodec_open2(dec, srcCodec, &decOpts)
+        av_dict_free(&decOpts)
         guard openRet >= 0 else {
             cleanup()
             throw AudioBridgeError.decoderOpenFailed(code: openRet)

@@ -12,6 +12,7 @@ the public-API contract.
 
 ### Fixed
 
+- **DTS-HD Master Audio failed to bridge ("Residual encoded channels are present without core", #64).** When the audio bridge decoded a DTS-HD MA / HRA track (common on Blu-ray remuxes), the libavcodec `dca` decoder rejected many frames with `EINVAL` because their lossless XLL extension uses residual coding that cannot reconstruct standalone, so the bridge produced no audio for those frames. The bridge re-encodes to lossy EAC3 (or FLAC) and discards the XLL refinement anyway, so it now decodes the mandatory DTS core only (`core_only`), which reconstructs full-rate 5.1/7.1 PCM on every frame. No effect on plain DTS core streams.
 - **UDF reader follows allocation-extent continuations (tag 258).** A file whose allocation descriptors overflow its (E)FE chains the rest through an Allocation Extent Descriptor (extent type 3). The reader now follows that chain (depth-bounded) instead of treating the continuation pointer as a bogus data extent. Defensive: inline descriptors already cover ~114 GiB per file, so no current Blu-ray needs it, but a heavily fragmented title would otherwise under-resolve.
 
 ## [3.13.3] — 2026-06-24
