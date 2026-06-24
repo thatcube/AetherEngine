@@ -8,4 +8,8 @@ enum FFmpegErr {
     static let eagain: Int32 = -35
     /// `AVERROR_INVALIDDATA` = FFERRTAG('I','N','D','A') = -0x41444E49.
     static let invalidData: Int32 = -0x41444E49
+    /// `AVERROR(EINVAL)`; EINVAL is POSIX 22 on Apple platforms. Some decoders (notably `dca` on a
+    /// DTS-HD MA XLL frame that residual-codes channels without a usable core) reject a single packet
+    /// with this while staying usable for the next one (#64).
+    static let einval: Int32 = -22
 }

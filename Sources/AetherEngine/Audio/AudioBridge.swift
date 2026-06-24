@@ -71,6 +71,12 @@ final class AudioBridge: @unchecked Sendable {
     // MARK: - State
 
     private var decoderCtx: UnsafeMutablePointer<AVCodecContext>?
+    /// dca_core bitstream filter, set only for DTS sources when the FFmpeg build provides it. Strips each
+    /// DTS-HD (MA / HRA) packet to its mandatory DTS core before the decoder sees it, so the lossless XLL
+    /// extension (which can residual-code channels that fail to reconstruct standalone) never reaches the
+    /// decoder. nil for non-DTS sources or an older FFmpeg without the filter, in which case feed() decodes
+    /// the source packet directly and leans on the per-packet EINVAL skip (#64).
+    private var dcaCoreBSF: UnsafeMutablePointer<AVBSFContext>?
     private var encoderCtx: UnsafeMutablePointer<AVCodecContext>?
     private var swrCtx: OpaquePointer?
     /// FIFO buffering resampled PCM until >= encoderCtx.frame_size samples. FLAC's wrapper has
@@ -177,21 +183,44 @@ final class AudioBridge: @unchecked Sendable {
             cleanup()
             throw AudioBridgeError.decoderParametersFailed(code: copyRet)
         }
-        // DTS-HD MA / HRA carry a lossless XLL extension on top of the mandatory DTS core.
-        // The bridge re-encodes to lossy EAC3 (or FLAC), so the XLL refinement is discarded
-        // anyway, and its residual-coded channels cannot decode standalone on many Blu-ray
-        // frames ("Residual encoded channels are present without core", EINVAL -22; #64).
-        // Decode the always-present DTS core only: it reconstructs full-rate 5.1/7.1 PCM on
-        // every frame, which is exactly what the bridge needs. No-op for plain DTS core.
-        var decOpts: OpaquePointer?
-        if srcCodecID == AV_CODEC_ID_DTS {
-            av_dict_set(&decOpts, "core_only", "1", 0)
-        }
-        let openRet = avcodec_open2(dec, srcCodec, &decOpts)
-        av_dict_free(&decOpts)
+        // DTS-HD MA / HRA carry a lossless XLL extension on top of the mandatory DTS core, and the
+        // bridge re-encodes to lossy EAC3 (or FLAC) so the XLL refinement is discarded anyway. An
+        // earlier fix opened `dca` with `core_only=1` to skip XLL, but on Blu-ray the core is usually
+        // carried as an asset INSIDE the extension substream (EXSS), not as a standalone core sync, so
+        // `core_only` makes the decoder report "No valid DCA sub-stream found" and produce no audio
+        // (libavcodec then prints "Consider disabling 'core_only'"; #64). The full path parses the EXSS
+        // and decodes the embedded core fine; the only failures are the occasional XLL frame whose
+        // channels residual-code without a usable core ("Residual encoded channels are present without
+        // core", EINVAL -22), and feed() now skips just that packet instead of failing the whole feed.
+        let openRet = avcodec_open2(dec, srcCodec, nil)
         guard openRet >= 0 else {
             cleanup()
             throw AudioBridgeError.decoderOpenFailed(code: openRet)
+        }
+
+        // For DTS, route packets through the dca_core bitstream filter (when this FFmpeg build ships it) so the
+        // decoder only ever sees the mandatory DTS core: full-rate 5.1/7.1 core PCM on every frame, with the XLL
+        // extension stripped at the bitstream level instead of failing per-frame inside the decoder. Best-effort:
+        // if the filter or its init is unavailable, leave dcaCoreBSF nil and feed() decodes the source directly.
+        if srcCodecID == AV_CODEC_ID_DTS, let bsf = av_bsf_get_by_name("dca_core") {
+            var bsfCtx: UnsafeMutablePointer<AVBSFContext>?
+            if av_bsf_alloc(bsf, &bsfCtx) >= 0, let bsfCtx {
+                _ = avcodec_parameters_copy(bsfCtx.pointee.par_in, srcCodecpar)
+                bsfCtx.pointee.time_base_in = srcTimeBase
+                if av_bsf_init(bsfCtx) >= 0 {
+                    dcaCoreBSF = bsfCtx
+                } else {
+                    var freeMe: UnsafeMutablePointer<AVBSFContext>? = bsfCtx
+                    av_bsf_free(&freeMe)
+                }
+            }
+        }
+        if srcCodecID == AV_CODEC_ID_DTS {
+            EngineLog.emit(
+                "[AudioBridge] DTS core extraction: "
+                + (dcaCoreBSF != nil ? "dca_core bitstream filter active" : "unavailable, decoding full path (EINVAL frames skipped)"),
+                category: .session
+            )
         }
 
         // 2. Bridge encoder by mode: .surroundCompat -> EAC3 128 kbps/ch max 6; .lossless -> FLAC VBR max 8.
@@ -502,6 +531,9 @@ final class AudioBridge: @unchecked Sendable {
     }
 
     private func cleanup() {
+        if dcaCoreBSF != nil {
+            av_bsf_free(&dcaCoreBSF)
+        }
         if decoderCtx != nil {
             avcodec_free_context(&decoderCtx)
         }
@@ -563,23 +595,48 @@ final class AudioBridge: @unchecked Sendable {
             }
         }
 
-        var sendRet = avcodec_send_packet(dec, packet)
-        if sendRet == FFmpegErr.eagain {
-            // EAGAIN = decoder output queue full (multi-frame packets, e.g. TrueHD bursts): receive frames first,
-            // then retry the send. (Old code lumped EAGAIN with real errors and dropped the packet.)
+        // Push one source packet (or one dca_core-stripped core packet) into the decoder and drain its frames.
+        func decodeOnePacket(_ pkt: UnsafePointer<AVPacket>) throws {
+            var sendRet = avcodec_send_packet(dec, pkt)
+            if sendRet == FFmpegErr.eagain {
+                // EAGAIN = decoder output queue full (multi-frame packets, e.g. TrueHD bursts): drain, then retry.
+                try receiveDecodedFrames()
+                sendRet = avcodec_send_packet(dec, pkt)
+            }
+            if sendRet == FFmpegErr.invalidData || sendRet == FFmpegErr.einval {
+                // Skippable single-packet rejections, decoder stays usable for the next packet:
+                //   invalidData = corrupt source packet (glitchy live MPEG-TS, broken mp2 header);
+                //   einval (-22) = a DTS-HD MA XLL frame residual-coding channels without a usable core, only
+                //   reachable when the dca_core BSF is absent (#64). Skip rather than throw: per-packet throwing
+                //   floods the caller hundreds/sec on a bad feed, and dropping the rare bad frame keeps the rest playing.
+                return
+            }
+            if sendRet < 0 && sendRet != FFmpegErr.eof {
+                throw AudioBridgeError.sendPacketFailed(code: sendRet)
+            }
             try receiveDecodedFrames()
-            sendRet = avcodec_send_packet(dec, packet)
-        }
-        if sendRet == FFmpegErr.invalidData {
-            // Corrupt source packet (glitchy live MPEG-TS, broken mp2 header). Decoder stays usable, so skip
-            // rather than throw (per-packet throwing floods the caller hundreds/sec on a persistently bad feed).
-            return results
-        }
-        if sendRet < 0 && sendRet != FFmpegErr.eof {
-            throw AudioBridgeError.sendPacketFailed(code: sendRet)
         }
 
-        try receiveDecodedFrames()
+        if let bsf = dcaCoreBSF {
+            // Strip the DTS-HD packet to its core, then decode each core packet. av_bsf_send_packet consumes the
+            // packet it is handed, so feed it a ref-copy and leave the caller's `packet` untouched (caller owns it).
+            var inPkt: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
+            defer { av_packet_free(&inPkt) }
+            if let inPkt, av_packet_ref(inPkt, packet) >= 0, av_bsf_send_packet(bsf, inPkt) >= 0 {
+                var coreP: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
+                defer { av_packet_free(&coreP) }
+                if let coreP {
+                    while av_bsf_receive_packet(bsf, coreP) >= 0 {
+                        if coreP.pointee.size > 0 {
+                            try decodeOnePacket(coreP)
+                        }
+                        av_packet_unref(coreP)
+                    }
+                }
+            }
+        } else {
+            try decodeOnePacket(packet)
+        }
 
         // Drain the FIFO into encoder-frame-size chunks, each fed as one AVFrame.
         // The helper may append encoded packets before throwing; feed propagates the error (the
