@@ -25,12 +25,24 @@ enum DiscReader {
     }
 
     /// Blu-ray: UDF filesystem with a BDMV directory. Returns (concatReader, "mpegts").
+    /// Emits `.demux` diagnostics once the UDF anchor is confirmed so a disc image
+    /// that fails recognition is debuggable (it would otherwise fall back to a raw
+    /// FFmpeg open that reports a bare INVALIDDATA). Non-disc sources stay silent.
     static func wrapBluRay(_ reader: IOReader) throws -> (IOReader, String)? {
         guard looksLikeUDF(reader) else { return nil }
+        EngineLog.emit("[disc] UDF anchor present; attempting Blu-ray BDMV", category: .demux)
         let udf: UDFReader
-        do { udf = try UDFReader(reader: reader) } catch DiscError.notUDF { return nil }
+        do { udf = try UDFReader(reader: reader) }
+        catch DiscError.notUDF {
+            EngineLog.emit("[disc] UDF anchor present but volume structure not UDF", category: .demux)
+            return nil
+        }
         let root = (try? udf.list(path: [])) ?? []
-        guard root.contains(where: { $0.isDir && $0.name == "BDMV" }) else { return nil }
+        guard root.contains(where: { $0.isDir && $0.name == "BDMV" }) else {
+            let names = root.isEmpty ? "<none>" : root.map(\.name).joined(separator: ", ")
+            EngineLog.emit("[disc] no BDMV directory in UDF root (entries: \(names)); not a Blu-ray", category: .demux)
+            return nil
+        }
         let playlistDir = (try? udf.list(path: ["BDMV", "PLAYLIST"])) ?? []
         var parsed: [MPLSPlaylist] = []
         for e in playlistDir where e.name.hasSuffix(".mpls") {
@@ -39,7 +51,10 @@ enum DiscReader {
             let bytes = readAll(reader, exts)
             if let pl = MPLSParser.parse(bytes) { parsed.append(pl) }
         }
-        guard let title = BDTitleSelector.selectMainTitle(parsed) else { return nil }
+        guard let title = BDTitleSelector.selectMainTitle(parsed) else {
+            EngineLog.emit("[disc] BDMV present but no parseable .mpls (\(playlistDir.count) PLAYLIST entries, \(parsed.count) parsed); cannot select a title", category: .demux)
+            return nil
+        }
         let streamDir = (try? udf.list(path: ["BDMV", "STREAM"])) ?? []
         var allExtents: [(offset: Int64, length: Int64)] = []
         for clip in title.clipIDs {
@@ -47,12 +62,17 @@ enum DiscReader {
                   let exts = try? udf.extents(of: e) else { continue }
             allExtents += exts
         }
-        guard !allExtents.isEmpty else { return nil }
+        guard !allExtents.isEmpty else {
+            EngineLog.emit("[disc] selected title clips=\(title.clipIDs) but resolved no m2ts extents in BDMV/STREAM (\(streamDir.count) entries); cannot build stream", category: .demux)
+            return nil
+        }
+        let totalBytes = allExtents.reduce(Int64(0)) { $0 + max(0, $1.length) }
+        EngineLog.emit("[disc] Blu-ray recognized: title clips=\(title.clipIDs) m2ts-extents=\(allExtents.count) bytes=\(totalBytes)", category: .demux)
         return (ConcatIOReader(base: reader, extents: allExtents), "mpegts")
     }
 
     /// Read all bytes of an extent list into memory (small files only: mpls).
-    private static func readAll(_ base: IOReader, _ exts: [(offset: Int64, length: Int64)]) -> [UInt8] {
+    static func readAll(_ base: IOReader, _ exts: [(offset: Int64, length: Int64)]) -> [UInt8] {
         // Extent lengths are untrusted on-disc bytes (up to ~1 GB each). Cap the total before
         // allocating so a crafted .mpls cannot drive an arbitrary allocation (jetsam/DoS); 8 MB
         // matches UDFReader.readDirectory's guard and dwarfs any real playlist (KB-scale).

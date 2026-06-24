@@ -69,6 +69,7 @@ func printUsage() {
       aetherctl serve [--no-dv] <url>
       aetherctl validate [--no-dv] <url>
       aetherctl swdecode [--frames N] <url>
+      aetherctl disc-inspect <disc.iso>
       aetherctl dovitest <file>
       aetherctl extract [--at <sec>] [--snapshot] [--width <px>] [--loops <n>] <url>
       aetherctl audio [--seconds N] <url>
@@ -137,6 +138,14 @@ func printUsage() {
                 metadata. Tests the SW-pipeline path without needing
                 a display layer. Use for AV1, VP9, MPEG-4 Part 2,
                 MPEG-2, VC-1 sources.
+
+      disc-inspect
+                Walk a local disc image (.iso) at the filesystem
+                layer, FFmpeg-free, and report what DiscReader makes
+                of it: ISO9660/UDF signatures, UDF root + BDMV tree,
+                parsed .mpls playlists, selected main title, and the
+                resolved m2ts extents. Prints where recognition bails
+                when it returns nil. Exit 0 if recognized, else 1.
 
       extract   Extract a still frame from a source. Thumbnail mode
                 (default) seeks to the nearest keyframe and downscales
@@ -267,6 +276,20 @@ if first == "dualsubs" {
     }
     rejectStrayFlags(rest, subcommand: "dualsubs")
     exit(runDualSubs(path: urlArg, primaryIndex: primary, secondaryIndex: secondary, seekTo: seekTo))
+}
+
+// Disc filesystem inspector (DVD-Video / Blu-ray ISO recognition triage).
+if first == "disc-inspect" {
+    var rest = Array(args.dropFirst(2))
+    let dump = takeFlag("--dump", from: &rest)
+    guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
+        print("ERROR: disc-inspect requires a <file> argument")
+        print("Usage: aetherctl disc-inspect [--dump] <disc.iso>")
+        exit(64)
+    }
+    rest.removeAll { $0 == urlArg }
+    rejectStrayFlags(rest, subcommand: "disc-inspect")
+    exit(runDiscInspect(url: parseSourceURL(urlArg), dump: dump))
 }
 
 // DV P7 -> 8.1 converter validation harness.

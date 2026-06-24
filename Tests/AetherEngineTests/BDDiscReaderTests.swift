@@ -33,4 +33,19 @@ final class BDDiscReaderTests: XCTestCase {
     func test_nilForNonDisc() throws {
         XCTAssertNil(try DiscReader.wrap(DataIOReader(data: Data(repeating: 0, count: 600*1024))))
     }
+
+    // Regression for #62: a real UDF 2.50 Blu-ray stores directory data inside the
+    // metadata partition (short_ad, metadata-virtual) while the m2ts payload lives in
+    // the physical partition (long_ad, ref 0). The old extentPartRef mapped a metadata
+    // FE's short_ad to the physical partition, so the root directory read garbage and
+    // BDMV was never found. The inspector must now report a recognized Blu-ray.
+    func test_inspectReportsBluRay() throws {
+        let d = DiscInspector.inspect(DataIOReader(data: bdImage()))
+        XCTAssertEqual(d.kind, .bluRay)
+        XCTAssertTrue(d.bdmvPresent)
+        XCTAssertEqual(d.selectedTitleClipIDs, ["00001"])
+        XCTAssertGreaterThanOrEqual(d.resolvedM2TSExtentCount, 2)
+        XCTAssertTrue(d.wrapRecognized)
+        XCTAssertEqual(d.wrapFormatHint, "mpegts")
+    }
 }

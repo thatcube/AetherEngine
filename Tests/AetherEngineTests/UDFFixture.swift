@@ -84,7 +84,7 @@ enum UDFFixture {
         func putV(_ bytes: [UInt8], vblock: Int) { put(bytes, atSector: phys(vblock)) }
 
         // m2ts: two physical extents past the metadata region (partition-relative blocks 40 and 50).
-        let frag1Block = 40, frag2Block = 50   // partition-relative blocks
+        let frag1Block = 40, frag2Block = 50   // physical partition (ref 0) blocks
         let half = m2tsBytes.count / 2
         let m2tsExt1 = Array(m2tsBytes[0..<half])
         let m2tsExt2 = Array(m2tsBytes[half...])
@@ -94,11 +94,14 @@ enum UDFFixture {
         // mpls data (virtual block 11)
         putV(padTo(mplsBytes, ss), vblock: 11)
 
-        // --- EFEs (all in the metadata partition, adType short_ad=0) ---
-        // m2ts EFE (vblock 12): two short_ad extents (fragmented), partition-relative blocks
-        let m2tsADs = shortAD(lenBytes: m2tsExt1.count, block: frag1Block)
-                    + shortAD(lenBytes: m2tsExt2.count, block: frag2Block)
-        putV(efe(location: 12, fileType: 5, partRefOfSelf: 0, adType: 0, infoLen: m2tsBytes.count, ads: m2tsADs), vblock: 12)
+        // --- EFEs (all resident in the metadata partition) ---
+        // m2ts EFE (vblock 12): the large stream data lives in the PHYSICAL partition, so it is
+        // referenced via long_ad (adType 1) carrying partition ref 0 -- exactly how real UDF 2.50
+        // Blu-rays store m2ts (a metadata-partition FE pointing at physical data). short_ad here
+        // would be metadata-partition-relative and could not address data past the metadata region.
+        let m2tsADs = longAD(lenBytes: m2tsExt1.count, block: frag1Block, partRef: 0)
+                    + longAD(lenBytes: m2tsExt2.count, block: frag2Block, partRef: 0)
+        putV(efe(location: 12, fileType: 5, partRefOfSelf: 1, adType: 1, infoLen: m2tsBytes.count, ads: m2tsADs), vblock: 12)
         // mpls EFE (vblock 10): long_ad (adType=1) into metadata partition ref 1, block 11.
         putV(efe(location: 10, fileType: 5, partRefOfSelf: 1, adType: 1, infoLen: mplsBytes.count,
                  ads: longAD(lenBytes: mplsBytes.count, block: 11, partRef: 1)), vblock: 10)

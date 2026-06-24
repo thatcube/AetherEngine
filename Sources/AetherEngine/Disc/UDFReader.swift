@@ -11,6 +11,12 @@ struct UDFEntry: Equatable {
 /// Read-only UDF 2.50 reader for Blu-ray BDMV. Resolves metadata partition and
 /// fragmented-file allocation descriptors. Sector size 2048. Tag-id validated (not CRC).
 final class UDFReader {
+    /// Verbose volume-structure dump for `aetherctl disc-inspect --dump`. Off in playback.
+    nonisolated(unsafe) static var diagnostics = false
+    private func dbg(_ line: @autoclosure () -> String) {
+        if UDFReader.diagnostics { EngineLog.emit("[udf] \(line())", category: .demux) }
+    }
+
     private let reader: IOReader
     private let ss = 2048
 
@@ -51,23 +57,15 @@ final class UDFReader {
     }
 
     /// Partition ref for an allocation descriptor. long_ad carries its own ref.
-    /// short_ad is FE-partition-relative, EXCEPT metadata-resident FEs whose short_ad
-    /// blocks are physical-partition-relative (mirrors Metadata File extents).
+    /// short_ad has none, so it is relative to the FE's own recording partition.
+    /// For a metadata-partition FE that means metadata-virtual blocks (resolved via
+    /// metaExtents, the same mapping the FE was read through): directory data and small
+    /// files live inside the metadata partition. Large file data (m2ts) sits in the
+    /// physical partition and is referenced with long_ad (explicit physical part ref).
+    /// The Metadata File's own extents are physical, but those are read directly in
+    /// parseVolumeStructure, not through this path.
     private func extentPartRef(for fe: FE, ad: AllocExt) -> Int {
-        if let ref = ad.longPartRef { return ref }
-        // short_ad: FE's own partition, unless that partition is metadata.
-        if fe.partRef < partMaps.count, partMaps[fe.partRef].isMetadata {
-            return physicalPartRef(forMetadataRef: fe.partRef)
-        }
-        return fe.partRef
-    }
-
-    private func physicalPartRef(forMetadataRef metaRef: Int) -> Int {
-        let physNum = partMaps[metaRef].physicalPartNumber
-        for (i, pm) in partMaps.enumerated() where !pm.isMetadata && pm.physicalPartNumber == physNum {
-            return i
-        }
-        return 0
+        ad.longPartRef ?? fe.partRef
     }
 
     // MARK: descriptor IO
@@ -139,10 +137,17 @@ final class UDFReader {
             let metaFE = try readFileEntryRaw(sector: physStart + pm.metadataFileBlock)
             metaExtents = metaFE.allocationExtents.map { (start: physStart + $0.block, blocks: $0.length / ss) }
         }
+        dbg("vds loc=\(vdsLoc) len=\(vdsLen) sectors=\(vdsSectors)")
+        dbg("physPartStart=\(physPartStart)")
+        dbg("partMaps=\(partMaps.map { $0.isMetadata ? "meta(phys=\($0.physicalPartNumber),fileBlk=\($0.metadataFileBlock))" : "phys(\($0.physicalPartNumber))" })")
+        dbg("metaExtents=\(metaExtents)")
+        dbg("fsd block=\(fsdBlock) partRef=\(fsdPartRef)")
         let fsdSector = try resolve(block: fsdBlock, partRef: fsdPartRef)  // root dir from FSD
         let fsd = try readSector(fsdSector)
+        dbg("fsd resolved sector=\(fsdSector) tag=\(tagID(fsd))")
         guard tagID(fsd) == 256 else { throw DiscError.malformed("no FSD") }
         rootBlock = u32(fsd, 404); rootPartRef = u16(fsd, 408)
+        dbg("root block=\(rootBlock) partRef=\(rootPartRef)")
     }
 
     // MARK: block resolution
@@ -198,6 +203,7 @@ final class UDFReader {
             exts.append(AllocExt(block: blk, length: len, longPartRef: longRef))
             p += stride
         }
+        dbg("FE @\(sector): tag=\(tid) adType=\(adType) lEA=\(lEA) lAD=\(lAD) exts=\(exts.map { "(blk:\($0.block),len:\($0.length),ref:\($0.longPartRef.map(String.init) ?? "-"))" })")
         return FE(partRef: 0, allocationExtents: exts)
     }
 
@@ -219,10 +225,14 @@ final class UDFReader {
                 s += 1
             }
         }
+        dbg("readDirectory block=\(block) partRef=\(partRef): \(data.count) bytes, first16=\(data.prefix(16).map { String(format: "%02x", $0) }.joined(separator: " "))")
         var out: [UDFEntry] = []
         var p = 0
         while p + 38 <= data.count {
-            guard tagID(Array(data[p..<min(p+16, data.count)])) == 257 else { break }
+            guard tagID(Array(data[p..<min(p+16, data.count)])) == 257 else {
+                dbg("  FID parse stop at off=\(p): tag=\(tagID(Array(data[p..<min(p+16, data.count)]))) (expected 257)")
+                break
+            }
             let chars = Int(data[p+18])
             let lfi = Int(data[p+19])
             let icbBlock = u32(data, p+20+4)     // long_ad block @ ICB+4
