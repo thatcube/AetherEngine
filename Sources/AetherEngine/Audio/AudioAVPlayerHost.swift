@@ -61,8 +61,11 @@ final class AudioAVPlayerHost {
     init() {
         #if os(tvOS) || os(iOS)
         nowPlayingSession = MPNowPlayingSession(players: [avPlayer])
-        // Deliberately NOT enabling automaticallyPublishesNowPlayingInfo: the host app writes metadata +
-        // accurate elapsed/rate to nowPlayingSession.nowPlayingInfoCenter itself (it owns the queue + artwork).
+        // Auto-publish now-playing from the item's externalMetadata + the player's elapsed/rate. The host stages
+        // title/artist/album/artwork via setExternalMetadata. Manual writes to nowPlayingInfoCenter raced
+        // MediaPlayer's internal serial queue on tvOS 26 and tripped a dispatch_assert_queue_fail (crash that
+        // surfaced on slow/external servers, where the async artwork write landed inside the race window).
+        nowPlayingSession.automaticallyPublishesNowPlayingInfo = true
         nowPlayingSession.becomeActiveIfPossible(completion: { _ in })
         #endif
     }
