@@ -29,7 +29,7 @@ let package = Package(
         // No network stack — we use custom AVIO + URLSession for HTTP streams.
         // Resolved over Git rather than a local path so consumers (and
         // Xcode Cloud) can build without a sibling FFmpegBuild checkout.
-        .package(url: "https://github.com/superuser404notfound/FFmpegBuild", from: "1.0.1"),  // 1.0.1: FFmpeg n8.1.2 (8.1.x maintenance line)
+        .package(url: "https://github.com/superuser404notfound/FFmpegBuild", from: "1.0.1"),  // 1.0.2: FFmpeg n8.1.2 + dca_core bitstream filter (#64)
         .package(url: "https://github.com/amosavian/AMSMB2", from: "4.0.3"),
         // libdovi (Dolby Vision RPU parser/converter). Resolved over Git like
         // FFmpegBuild so consumers (and Xcode Cloud) build without a sibling
