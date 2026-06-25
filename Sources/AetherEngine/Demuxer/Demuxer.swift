@@ -118,7 +118,27 @@ public final class Demuxer: @unchecked Sendable {
         try openWithProvider(bridge, inputFormat: inputFormat, isLive: isLive)
     }
 
+    /// A remote disc image (ISO 9660 / UDF / BDMV) by URL extension. Gates the HTTP disc-adapter
+    /// path so a normal media URL keeps the optimized streaming AVIOReader open with no probe cost.
+    static func isDiscImageURL(_ url: URL) -> Bool {
+        ["iso", "img", "udf"].contains(url.pathExtension.lowercased())
+    }
+
     private func openHTTP(url: URL, extraHeaders: [String: String], isLive: Bool = false) throws {
+        // A remote disc image goes through the same disc adapter as a local ISO (a raw .iso handed
+        // straight to libavformat fails to probe; it is a filesystem, not a media container, #64).
+        // Gated on the disc-image extension so normal media URLs skip the range-probe entirely; if
+        // the source is not a recognizable disc, fall through to the streaming reader.
+        if !isLive, Self.isDiscImageURL(url),
+           let discReader = HTTPDiscIOReader(url: url, extraHeaders: extraHeaders) {
+            if let (wrapped, discHint) = try DiscReader.wrap(discReader) {
+                let bridge = CustomIOReaderBridge(reader: wrapped)
+                let inputFormat = av_find_input_format(discHint)
+                try openWithProvider(bridge, inputFormat: inputFormat, isLive: false)
+                return
+            }
+            discReader.close()
+        }
         let reader = AVIOReader(
             url: url,
             extraHeaders: extraHeaders,
