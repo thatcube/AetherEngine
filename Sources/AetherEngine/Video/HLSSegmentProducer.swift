@@ -726,6 +726,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 video: muxerVideo,
                 audio: muxerAudio,
                 subtitles: muxerSubtitles,
+                // Cap the muxer's in-RAM interleaver at ~2 segments so a long/degenerate segment or an
+                // audio stream that decodes to nothing can't buffer the whole span and fill the disk (#64).
+                maxBufferedFragmentSeconds: 2 * targetSegmentDurationSeconds,
                 onInitCaptured: { [weak self] initBytes in
                     guard let self = self else { return }
                     if isReinit {

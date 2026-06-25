@@ -139,6 +139,19 @@ final class MP4SegmentMuxer {
     private(set) var muxerSubtitleTimeBase: AVRational = AVRational(num: 1, den: 1000)
     private let haveAudio: Bool
 
+    /// Mid-segment fragment-flush bound (#64). With movflags +frag_custom a moof+mdat is emitted only at
+    /// an explicit segment cut; a degenerate plan (sparse-keyframe TS index) or any very long segment
+    /// would otherwise buffer the whole span in libavformat's interleaver until the cut, growing RAM
+    /// without bound (a 110 min Blu-ray reached ~13 GB and swapped the device disk full). Track the video
+    /// output DTS window since the last flush and force an interim flush (the same drain pair as the cut,
+    /// minus the fd rotation) once it spans more than `maxBufferedFragmentTicks`. Output-TB ticks (the
+    /// muxer rewrites its own video time_base at write_header), 0 = bound disabled. Computed from the
+    /// latched `muxerVideoTimeBase` after write_header; defaults to 0 so cleanup() on an init error path
+    /// (which runs before the latch) sees a fully-initialized stored property.
+    private var maxBufferedFragmentTicks: Int64 = 0
+    /// Output-TB DTS of the first video packet since the last flush; Int64.min = no window open yet.
+    private var fragmentWindowFirstVideoDts: Int64 = Int64.min
+
     let videoOutputStreamIndex: Int32 = 0
     let audioOutputStreamIndex: Int32 = 1
 
@@ -159,6 +172,7 @@ final class MP4SegmentMuxer {
         video: VideoConfig,
         audio: AudioConfig?,
         subtitles: [SubtitleConfig] = [],
+        maxBufferedFragmentSeconds: Double = 8.0,
         onInitCaptured: @escaping (Data) -> Void
     ) throws {
         self.currentSegmentIndex = initialSegmentIndex
@@ -249,6 +263,13 @@ final class MP4SegmentMuxer {
         if haveAudio {
             muxerAudioTimeBase = ctx.pointee.streams.advanced(by: 1).pointee!.pointee.time_base
         }
+        // Bound is in the muxer's rewritten output video TB: packets reach writePacket already rescaled
+        // to muxerVideoTimeBase, so the window math must use it (not the source TB). Latched here, after
+        // write_header has rewritten the stream time_base (#64).
+        maxBufferedFragmentTicks = Self.bufferedFragmentTicks(
+            seconds: maxBufferedFragmentSeconds,
+            timeBase: muxerVideoTimeBase
+        )
         if let firstSubIdx = capturedSubtitleIndices.first {
             muxerSubtitleTimeBase = ctx.pointee.streams.advanced(by: Int(firstSubIdx)).pointee!.pointee.time_base
         }
@@ -256,6 +277,23 @@ final class MP4SegmentMuxer {
     }
 
     private let byteCounter: ByteCounter
+
+    // MARK: - Buffered-fragment bound math (pure, #64)
+
+    /// Output-TB tick span for `seconds` at `timeBase` (the muxer's rewritten video time_base). 0 when
+    /// the input is degenerate, which disables the bound.
+    static func bufferedFragmentTicks(seconds: Double, timeBase: AVRational) -> Int64 {
+        guard seconds > 0, timeBase.num > 0, timeBase.den > 0 else { return 0 }
+        return Int64(seconds * Double(timeBase.den) / Double(timeBase.num))
+    }
+
+    /// True when the buffered video span [firstDts, currentDts] has reached `boundTicks` and an interim
+    /// flush is due. A sentinel firstDts (Int64.min) means no window is open yet; a backward currentDts
+    /// (a DTS reset) never triggers; boundTicks <= 0 disables the bound.
+    static func bufferedTicksExceedsBound(firstDts: Int64, currentDts: Int64, boundTicks: Int64) -> Bool {
+        guard boundTicks > 0, firstDts != Int64.min, currentDts >= firstDts else { return false }
+        return (currentDts - firstDts) >= boundTicks
+    }
 
     // MARK: - Diagnostic probes
 
@@ -476,10 +514,44 @@ final class MP4SegmentMuxer {
         )
         packet.pointee.pts = clean.pts
         packet.pointee.dts = clean.dts
+
+        // #64 mid-segment flush bound: cap libavformat's interleaver RAM on a very long segment
+        // (degenerate sparse-keyframe plan, or an audio stream that decodes to nothing) by emitting a
+        // moof+mdat into the current staging file before the buffered span grows without bound. Tracked
+        // on the video output stream only; audio/subtitle packets ride along and are force-drained by the
+        // flush. Flush BEFORE writing the triggering packet so it opens a fresh window.
+        if packet.pointee.stream_index == videoOutputStreamIndex, packet.pointee.dts != Int64.min {
+            let dts = packet.pointee.dts
+            if fragmentWindowFirstVideoDts == Int64.min {
+                fragmentWindowFirstVideoDts = dts
+            } else if Self.bufferedTicksExceedsBound(
+                firstDts: fragmentWindowFirstVideoDts,
+                currentDts: dts,
+                boundTicks: maxBufferedFragmentTicks
+            ) {
+                flushPendingFragment()
+                fragmentWindowFirstVideoDts = dts
+            }
+        }
+
         // av_write_frame was tried as a leak hypothesis; no impact on 8 MB/s mallocMB growth
         // (leak was Data(d) dispatch_data aliasing in AVIOReader). Reverted to interleaved for
         // cross-stream DTS monotonicity and audio+video re-ordering via libavformat.
         return av_interleaved_write_frame(ctx, packet)
+    }
+
+    /// Emit a moof+mdat for everything buffered into the CURRENT staging file, without rotating the fd or
+    /// advancing the segment index (#64). Mirrors `cutFragmentForNextSegment`'s drain pair minus the
+    /// rotation, so libavformat's interleaver RAM is released mid-segment; the first such flush also emits
+    /// ftyp+moov under +delay_moov, populating init.mp4 early instead of only at the (far-off) first cut.
+    private func flushPendingFragment() {
+        guard let ctx = formatContext, headerWritten, fd >= 0 else { return }
+        _ = av_interleaved_write_frame(ctx, nil)
+        _ = av_write_frame(ctx, nil)
+        if !moovFlushed {
+            moovFlushed = true
+            _ = av_write_frame(ctx, nil)
+        }
     }
 
     /// Finalize the current segment and rotate fd to a fresh staging file for `nextIdx`.
@@ -498,6 +570,8 @@ final class MP4SegmentMuxer {
             moovFlushed = true
             _ = av_write_frame(ctx, nil)
         }
+        // New segment starts a fresh buffered-fragment window (#64).
+        fragmentWindowFirstVideoDts = Int64.min
 
         // 2. Snapshot the completed segment + reset counters.
         let completedPath = currentStagingPath
