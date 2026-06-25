@@ -10,6 +10,16 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [3.13.8] — 2026-06-25
+
+Maintenance release on the 3.13.x line. Backports the #64 follow-up from 4.0.5.
+
+### Fixed
+
+- **A Blu-ray whose content starts late played nothing until you seeked past the start (#64 follow-up).** The 3.13.7 disk-fill fix routes a sparse MPEG-TS keyframe index to the uniform-stride segment plan, but that plan anchored its source-axis boundaries at PTS 0. On a title whose first keyframe is well after zero (one real disc starts at 11.6s) the leading segments had no frames, so the producer never emitted them while the playlist still advertised them, and the player's first-segment fetch was permanently out of range. The uniform plan now anchors its boundaries at the first keyframe (falling back to the video stream start time), so segment 0 begins at the content start. No public API change.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.13.8))
+
 ## [3.13.7] — 2026-06-25
 
 Maintenance release on the 3.13.x line. Backports the #64 Blu-ray (MPEG-TS)
