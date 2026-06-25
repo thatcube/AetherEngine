@@ -455,16 +455,24 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     category: .session
                 )
             } else {
+                // Anchor the uniform plan at the content start so seg 0 is the first real keyframe, not an
+                // empty source-0 segment the producer never emits (which strands AVPlayer's seg0 fetch; #64
+                // follow-up). Prefer the first indexed keyframe; fall back to the video stream start_time.
+                let sorted = keyframes.sorted()
+                let streamStart = videoStream.pointee.start_time
+                let anchorPts = sorted.first ?? (streamStart != Int64.min ? max(0, streamStart) : 0)
                 plan = Self.buildUniformSegmentPlan(
                     videoTimeBase: videoTimeBase,
-                    sourceDurationSeconds: durationSeconds
+                    sourceDurationSeconds: durationSeconds,
+                    startPts0: anchorPts
                 )
+                self.firstKeyframePts = anchorPts
+                self.firstKeyframeSeconds = Double(anchorPts) * Double(videoTimeBase.num) / Double(videoTimeBase.den)
                 // A sparse/clustered index (MPEG-TS / M2TS: no Cues, only what find_stream_info + the
                 // mid-file seek scanned) would otherwise build a multi-thousand-second first segment that
                 // the frag_custom muxer buffers whole in RAM (#64). Report the witness gap.
                 let tb = (videoTimeBase.num > 0 && videoTimeBase.den > 0)
                     ? Double(videoTimeBase.num) / Double(videoTimeBase.den) : 0
-                let sorted = keyframes.sorted()
                 var largestGapSeconds = 0.0
                 if tb > 0, sorted.count >= 2 {
                     for i in 1..<sorted.count {
@@ -476,7 +484,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     ? "\(keyframes.count) IRAPs in index, need >=2"
                     : "index too sparse (\(keyframes.count) IRAPs, largestGap=\(String(format: "%.1f", largestGapSeconds))s)"
                 EngineLog.emit(
-                    "[HLSVideoEngine] segment plan: uniform stride fallback (\(reason))",
+                    "[HLSVideoEngine] segment plan: uniform stride fallback (\(reason), anchorPts=\(anchorPts))",
                     category: .session
                 )
             }

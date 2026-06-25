@@ -126,4 +126,23 @@ struct SegmentPlanSparseIndexTests {
         }
         #expect((plan.last?.startSeconds ?? 0) < 6599)
     }
+
+    @Test("The uniform fallback anchors segment 0 at the content start, not source PTS 0")
+    func uniformPlanAnchoredAtFirstKeyframe() {
+        // A Blu-ray title whose first keyframe is at 11.609s must not advertise empty leading
+        // segments (source 0-11.6s) that never get produced; seg 0 must begin at the content
+        // keyframe so the player can start there. Regression guard: without the anchor the #64
+        // disk-fill fix's uniform fallback put the first content at segment 2, so AVPlayer's
+        // seg0 fetch was permanently out-of-range and playback only worked after seeking past ~13s.
+        let firstKf: Int64 = 1_044_806  // 11.609 s @ 90 kHz
+        let plan = HLSVideoEngine.buildUniformSegmentPlan(
+            videoTimeBase: ts90k, sourceDurationSeconds: 6599, startPts0: firstKf)
+        #expect(plan.first?.startPts == firstKf)       // source-axis seg 0 begins at the content keyframe
+        #expect(plan.first?.startSeconds == 0)         // playlist axis stays 0-based
+        #expect(plan[1].startPts == firstKf + 360_000) // next boundary is +4 s (4 * 90000) from the anchor
+        // Default anchor (0) preserves the legacy behavior for callers that do not pass one.
+        let unanchored = HLSVideoEngine.buildUniformSegmentPlan(
+            videoTimeBase: ts90k, sourceDurationSeconds: 6599)
+        #expect(unanchored.first?.startPts == 0)
+    }
 }

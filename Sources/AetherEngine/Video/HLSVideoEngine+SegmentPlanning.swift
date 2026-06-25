@@ -47,10 +47,18 @@ extension HLSVideoEngine {
         return largestGapSeconds <= maxTrustedGapSeconds
     }
 
-    /// Uniform-duration fallback plan when the keyframe index is too sparse. The muxer still snaps cuts to real keyframes, so EXTINF drift accumulates per segment; restart machinery renegotiates alignment after scrubs.
+    /// Uniform-duration fallback plan when the keyframe index is too sparse. Source-axis boundaries are
+    /// anchored at `startPts0` (the first keyframe PTS), exactly like the keyframe-aligned plan, so segment 0
+    /// begins at the content start rather than at source PTS 0. A title whose content starts late (e.g. a
+    /// Blu-ray beginning at 11.6s) would otherwise advertise empty leading segments that the producer never
+    /// emits, leaving AVPlayer's seg0 fetch permanently out of range and playback stalled until a seek past
+    /// the content start (#64 follow-up). The playlist axis (`startSeconds`) stays 0-based; the producer's
+    /// shift maps source to playlist. The muxer still snaps cuts to real keyframes, so EXTINF drift
+    /// accumulates per segment; restart machinery renegotiates alignment after scrubs.
     static func buildUniformSegmentPlan(
         videoTimeBase: AVRational,
-        sourceDurationSeconds: Double
+        sourceDurationSeconds: Double,
+        startPts0: Int64 = 0
     ) -> [Segment] {
         guard sourceDurationSeconds > 0 else { return [] }
         let stride = Self.targetSegmentDuration
@@ -63,8 +71,8 @@ extension HLSVideoEngine {
         for i in 0..<count {
             let startSeconds = Double(i) * stride
             let endSeconds = min(sourceDurationSeconds, Double(i + 1) * stride)
-            let startPts = Int64(startSeconds / tb)
-            let endPts = Int64(endSeconds / tb)
+            let startPts = startPts0 + Int64(startSeconds / tb)
+            let endPts = startPts0 + Int64(endSeconds / tb)
             plan.append(Segment(
                 startPts: startPts,
                 endPts: endPts,
