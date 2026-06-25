@@ -10,6 +10,20 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [4.0.3] — 2026-06-25
+
+### Fixed
+
+- **Enabling subtitles could freeze or badly slow the scrub-preview (trickplay) thumbnails (#27).** On-device scrub thumbnails are produced by an independent still-extraction pipeline that opens its own connection to the source and runs on a single serial decode queue. Its remote-source chunk read could park on a flat ~35s timeout with no way to cancel it, so a single stalled read froze the queue and pinned the preview on one frame while further scrubs queued behind it. Turning subtitles on is what triggered it: that spins up a third reader (the subtitle side-demuxer, opened with the persistent playback profile and a 90s read-ahead) which competes with the thumbnail reader for the source's bandwidth and the device's cores, lengthening the cold reads into the park; with subtitles off the reads return promptly and the preview tracks the scrub. Interlaced 480p MPEG-2 made it worse because that codec is software-decoded, so playback already held the cores. The still-extraction reader now aborts an in-flight fetch within ~100ms when a scrub supersedes it (or on teardown), bounds each decode with a short read deadline, fails fast (one retry instead of three across two URLs), and the thumbnail decoder is capped to two threads at `.utility` QoS so it can no longer starve the real-time software playback decode. Engine-internal change; no public API change. The playback and live read paths are untouched.
+
+- **Dead live remote-HLS streams froze silently instead of retuning.** When a live IPTV/HLS source stopped delivering segments (segment 404s or an expired auth token), the native player's `failedToPlayToEnd` was only logged and the item stayed `readyToPlay`, so no terminal error reached the host and the automatic live retune never fired (the picture just froze). Remote-HLS `failedToPlayToEnd` is now routed through deferred-confirmation into a terminal error (gated to remote-HLS live only), so the host's live retune kicks in.
+
+### Diagnostics
+
+- Added a positive content-vs-clock ledger and a VOD backpressure-wedge probe to keep instrumenting the #65 post-seek-burst frame-drift investigation.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.0.3))
+
 ## [4.0.2] — 2026-06-25
 
 ### Fixed
