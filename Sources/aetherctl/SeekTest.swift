@@ -12,6 +12,12 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
     // producer gate-open shifts. Two distinct values across a burst => cross-epoch shift divergence (Root A).
     let publishedShifts = UncheckedBox<[Double]>([])
     let gateOpenShifts = UncheckedBox<[Int]>([])
+    // #65 ledger: largest |drift| (actual source content minus planned source per opened segment). A multi-second
+    // value POSITIVELY confirms a content-vs-clock offset (Root B). Near-zero across a real restart cascade
+    // redirects the 6s symptom to the producer wedge. parkCount = abnormal backpressure parks (VOD wedge signature).
+    let maxLedgerDriftAbs = UncheckedBox<Double>(0)
+    let ledgerCount = UncheckedBox<Int>(0)
+    let parkCount = UncheckedBox<Int>(0)
     // EngineLog.handler fires from many threads concurrently (demuxer, producer, server, audio). Serialize the
     // whole body: unsynchronized append to the Swift arrays below corrupts the heap (SIGTRAP) under load.
     let handlerLock = NSLock()
@@ -46,6 +52,16 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
             let digits = tail.prefix { $0 == "-" || $0.isNumber }
             if let v = Int(digits) { gateOpenShifts.value.append(v) }
         }
+        // "[HLSSegmentProducer] #65 ledger seg-... drift=<X>s ...". Track the largest magnitude content drift.
+        if line.contains("#65 ledger ") {
+            ledgerCount.value += 1
+            if let r = line.range(of: "drift=") {
+                let token = line[r.upperBound...].prefix { $0 == "-" || $0 == "." || $0.isNumber }
+                if let v = Double(token) { maxLedgerDriftAbs.value = max(maxLedgerDriftAbs.value, abs(v)) }
+            }
+        }
+        // "[HLSSegmentProducer] #65 backpressure PARK ...". Count abnormal parks (VOD wedge signature).
+        if line.contains("#65 backpressure PARK") { parkCount.value += 1 }
     }
 
     print("")
@@ -234,18 +250,30 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
                  "[" + pubShifts.map { String(format: "%.3f", $0) }.joined(separator: ", ") + "]",
                  distinctPub.count))
     print("  clockLead settle = \(String(format: "%.2f", settleClockLead))s  (headless ~0 by design; #65 is presented-vs-clock, invisible to ct-src)")
+    print("  ledger segments opened = \(ledgerCount.value)  maxContentDrift = \(String(format: "%.3f", maxLedgerDriftAbs.value))s  (the POSITIVE Root-B signal)")
+    print("  abnormal backpressure parks (VOD wedge signature) = \(parkCount.value)")
     if fullRestart == 0 {
         print("  >> INCONCLUSIVE: 0 producer restarts. The file was fully produced before the burst, so")
         print("     every seek hit the cache and the cross-epoch cascade never fired. Re-run with a LONGER")
         print("     file (seek targets must land beyond the producer write head) to exercise #65.")
+    } else if maxLedgerDriftAbs.value >= 0.5 {
+        print("  >> ROOT B CONFIRMED (content-vs-clock): a segment was muxed with source content offset")
+        print("     \(String(format: "%.2f", maxLedgerDriftAbs.value))s from its planned/EXTINF position, so the presented frame leads the")
+        print("     clock by that much. Fix the content-drift source (off-plan seek landing / uniform-plan stride),")
+        print("     NOT a seam port. Grep '#65 ledger' for the exact seg/epoch.")
     } else if distinctRaw.count > 1 || distinctPub.count > 1 {
         print("  >> ROOT A (cross-epoch shift divergence): the producer published MORE THAN ONE shift across")
         print("     the burst. Buffered bytes from a superseded epoch fold with the latest scalar -> picture")
         print("     leads the clock. The live seam-history port is the fix.")
+    } else if parkCount.value > 0 {
+        print("  >> PRODUCER WEDGE: invariant shift AND ~zero ledger drift, but \(parkCount.value) abnormal backpressure")
+        print("     park(s). The 6s symptom is the frozen-clock/stall artifact, not a content offset. Fix the VOD")
+        print("     backpressure wedge (add a watchdog / re-base the producer onto AVPlayer's index), not the fold.")
     } else {
-        print("  >> ROOT B suspected: producer shift was INVARIANT across all restarts, so the seam collapse")
-        print("     is harmless. A ~6s divergence would then come from playlist startSeconds vs bytes' tfdt,")
-        print("     which needs a buffer flush / URL re-key, not a seam port.")
+        print("  >> NO ENGINE-LEVEL DIVERGENCE REPRODUCED: invariant shift, ledger drift ~0, no wedge. The headless")
+        print("     harness did not surface #65 in any engine signal. The avBufAhead+zeros from #65's earlier diag")
+        print("     are consistent with healthy playback, so they do NOT confirm Root B on their own. Re-run with a")
+        print("     LONGER high-bitrate file, or rely on the reporter device trace ('#65 ledger' + 'PARK' lines).")
     }
     print("")
     print("VERDICT: seektest DONE (comparison harness; compare tallies old vs new build)")

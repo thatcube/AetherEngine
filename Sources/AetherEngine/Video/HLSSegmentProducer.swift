@@ -326,6 +326,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// Max segments ahead of AVPlayer's highest fetched segment (cut from 20 to 10; 4K HEVC ~10 MB/seg = 200 MB old buffer).
     private static let bufferAheadSegments = 10
 
+    /// #65 stall diag: VOD has no watchdog to break a permanent backpressure park (every pump watchdog is
+    /// isLive-gated). Only log a park once it exceeds ~2 segment durations of zero playback progress, so normal
+    /// backpressure (releases within one segment) stays silent and a real wedge surfaces its frozen tuple.
+    private static let backpressureWedgeLogThresholdSeconds = 12
+
     private let pumpQueue = DispatchQueue(
         label: "AetherEngine.HLSSegmentProducer.pump",
         qos: .userInitiated
@@ -660,13 +665,46 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 H264SPS.annexBExtradata(sps: sps, pps: pps))
     }
 
+    /// Pump-side backpressure wait. Returns true on release, false when stop was requested.
+    /// #65 diag: an abnormally long park (no playback progress for > threshold) surfaces the producer-vs-AVPlayer
+    /// index tuple once, then every 10 s, so a VOD wedge (cacheTarget frozen below target with no watchdog to break
+    /// it) is distinguishable from healthy backpressure (cacheTarget climbing toward target). VOD only; live keeps
+    /// its own watchdogs.
+    private func awaitBackpressureRelease(target: Int, head: Int, context: String) -> Bool {
+        var parked = 0
+        var nextLogAt = Self.backpressureWedgeLogThresholdSeconds
+        while !checkShouldStop() {
+            if cache.awaitFetchHighWater(reaching: target, timeout: 1.0) {
+                if parked >= Self.backpressureWedgeLogThresholdSeconds {
+                    EngineLog.emit(
+                        "[HLSSegmentProducer] #65 backpressure released (\(context)) head=\(head) "
+                        + "target=\(target) after=\(parked)s cacheTarget=\(cache.targetIndex) "
+                        + "highStored=\(cache.highestStoredIndex) cached=\(cache.count)",
+                        category: .session
+                    )
+                }
+                return true
+            }
+            parked += 1
+            if !isLive, parked >= nextLogAt {
+                nextLogAt += 10
+                EngineLog.emit(
+                    "[HLSSegmentProducer] #65 backpressure PARK (\(context)) head=\(head) "
+                    + "target=\(target) cacheTarget=\(cache.targetIndex) "
+                    + "highStored=\(cache.highestStoredIndex) cached=\(cache.count) parked=\(parked)s "
+                    + "(no playback progress; VOD has no watchdog to break this)",
+                    category: .session
+                )
+            }
+        }
+        return false
+    }
+
     /// Allocate (or re-allocate at SSAI program switch) the session's mp4 muxer.
     private func allocateMuxer(initialSegmentIndex: Int,
                                adVideoConfig: (width: Int32, height: Int32, extradata: [UInt8])? = nil) -> MP4SegmentMuxer? {
         let backpressureTarget = initialSegmentIndex - Self.bufferAheadSegments
-        while !checkShouldStop() {
-            if cache.awaitFetchHighWater(reaching: backpressureTarget, timeout: 1.0) { break }
-        }
+        if !awaitBackpressureRelease(target: backpressureTarget, head: initialSegmentIndex, context: "alloc") { return nil }
         if checkShouldStop() { return nil }
 
         let isReinit = adVideoConfig != nil
@@ -842,9 +880,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
         currentMuxerSegmentIndex = newIdx
         let backpressureTarget = newIdx - Self.bufferAheadSegments
-        while !checkShouldStop() {
-            if cache.awaitFetchHighWater(reaching: backpressureTarget, timeout: 1.0) { break }
-        }
+        if !awaitBackpressureRelease(target: backpressureTarget, head: newIdx, context: "advance") { return nil }
         if checkShouldStop() { return nil }
 
         return muxer
@@ -1033,6 +1069,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         var lastForeignStreamIndexSinceFinalize: Int32 = -1
         var firstVideoPtsSinceFinalize: Int64 = Int64.min
         var lastVideoPtsSinceFinalize: Int64 = Int64.min
+        var vodLedgerLastRoutedSeg = Int.min  // #65 ledger: last VOD segment index logged at the routing site
 
         do {
             readLoop: while true {
@@ -1735,6 +1772,33 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         let prevSeg = isLive
                             ? pendingVideoSegIndex
                             : segmentIndex(forSourcePts: prev.pointee.dts)
+                        // #65 ledger: at each VOD segment open, map the segment's item-axis start (what AVPlayer and
+                        // currentTime see) to the TRUE source content muxed there. drift = actual source - planned
+                        // source for this index; non-zero means the presented frame leads the clock (Root B positively
+                        // confirmed, with the exact idx/epoch). Zero across the whole burst means there is no
+                        // content-vs-clock offset and the reported 6 s is the stall/frozen-clock artifact instead.
+                        if !isLive, prevSeg != vodLedgerLastRoutedSeg, prev.pointee.dts != Int64.min,
+                           sourceVideoTbSeconds > 0 {
+                            vodLedgerLastRoutedSeg = prevSeg
+                            let shiftTicks = videoShiftPts == Int64.min ? 0 : videoShiftPts
+                            let outDts = prev.pointee.dts
+                            let srcDts = outDts &+ shiftTicks
+                            let localI = prevSeg - baseIndex
+                            let planSrc: Int64? = (localI >= 0 && localI < segmentBoundaries.count)
+                                ? segmentBoundaries[localI] : nil
+                            let tb = sourceVideoTbSeconds
+                            EngineLog.emit(
+                                "[HLSSegmentProducer] #65 ledger seg-\(prevSeg) base=\(baseIndex) "
+                                + "itemAxis=\(String(format: "%.3f", Double(outDts) * tb))s "
+                                + "sourceStart=\(String(format: "%.3f", Double(srcDts) * tb))s "
+                                + (planSrc != nil
+                                    ? "planSource=\(String(format: "%.3f", Double(planSrc!) * tb))s "
+                                      + "drift=\(String(format: "%.3f", Double(srcDts &- planSrc!) * tb))s "
+                                    : "planSource=n/a drift=n/a ")
+                                + "shift=\(String(format: "%.3f", Double(shiftTicks) * tb))s",
+                                category: .session
+                            )
+                        }
                         if let muxer = ensureMuxer(forSegmentIndex: prevSeg) {
                             finalizeAndWriteVideo(prev, nextDts: packet.pointee.dts, muxer: muxer)
                             bumpPacketsWritten()
