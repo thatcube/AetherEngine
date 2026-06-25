@@ -24,6 +24,13 @@ public struct DiscInspection: Sendable {
         public let durationSeconds: Double
     }
 
+    /// A selectable title as `DiscReader.wrap` enumerates it, with its chapter start offsets (#67).
+    public struct TitleSummary: Sendable {
+        public let id: Int
+        public let durationSeconds: Double
+        public let chapterStartsSeconds: [Double]
+    }
+
     public var kind: Kind = .notADisc
     public var iso9660Signature: Bool = false
     public var udfAnchor: Bool = false
@@ -40,6 +47,9 @@ public struct DiscInspection: Sendable {
     /// What `DiscReader.wrap` would return for this image (non-nil = recognized as playable).
     public var wrapRecognized: Bool = false
     public var wrapFormatHint: String?
+    /// The full selectable-title list (with chapters) the engine would expose, longest first (#67).
+    public var titles: [TitleSummary] = []
+    public var selectedTitleIndex: Int = 0
 }
 
 /// Diagnostic mirror of `DiscReader.wrap`. Walks the disc filesystem verbosely and
@@ -121,10 +131,18 @@ enum DiscInspector {
             return .notADisc
         }()
 
-        // What the real playback path decides for the same image.
+        // What the real playback path decides for the same image, plus the full title + chapter list it exposes.
         if let discInfo = (try? DiscReader.wrap(reader)) ?? nil {
             d.wrapRecognized = true
             d.wrapFormatHint = discInfo.formatHint
+            d.selectedTitleIndex = discInfo.selectedTitleIndex
+            d.titles = discInfo.titles.map { t in
+                DiscInspection.TitleSummary(
+                    id: t.id,
+                    durationSeconds: Double(t.durationTicks) / bdTickRate,
+                    chapterStartsSeconds: t.chapters.map { Double($0.startTicks) / bdTickRate }
+                )
+            }
         }
         return d
     }

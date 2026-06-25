@@ -65,4 +65,12 @@ final class BDDiscReaderTests: XCTestCase {
         XCTAssertEqual(info.selectedTitleIndex, 0)
         XCTAssertEqual(info.selectedTitle?.id, 0)
     }
+
+    func test_inspectListsTitles() throws {
+        let d = DiscInspector.inspect(DataIOReader(data: bdImage()))
+        XCTAssertEqual(d.titles.count, 1)                          // single-playlist fixture -> one title
+        XCTAssertEqual(d.titles[0].id, 0)
+        XCTAssertEqual(d.selectedTitleIndex, 0)
+        XCTAssertTrue(d.titles[0].chapterStartsSeconds.isEmpty)    // the fixture playlist declares no PlayListMarks
+    }
 }

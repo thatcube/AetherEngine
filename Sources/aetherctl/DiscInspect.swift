@@ -53,5 +53,22 @@ func runDiscInspect(url: URL, dump: Bool = false) -> Int32 {
     }
 
     print("DiscReader.wrap: \(d.wrapRecognized ? "RECOGNIZED (format hint: \(d.wrapFormatHint ?? "?"))" : "nil (NOT recognized -> falls back to raw FFmpeg open)")")
+
+    func hms(_ s: Double) -> String {
+        let t = Int(s.rounded()); return String(format: "%d:%02d:%02d", t / 3600, (t % 3600) / 60, t % 60)
+    }
+    if !d.titles.isEmpty {
+        print("")
+        print("Titles:      \(d.titles.count) (selected: \(d.selectedTitleIndex))")
+        for t in d.titles {
+            let dur = t.durationSeconds > 0 ? hms(t.durationSeconds) : "unknown"
+            print("  [\(t.id)] dur=\(dur)  chapters=\(t.chapterStartsSeconds.count)")
+            if !t.chapterStartsSeconds.isEmpty {
+                let shown = t.chapterStartsSeconds.prefix(40).map { hms($0) }.joined(separator: ", ")
+                let more = t.chapterStartsSeconds.count > 40 ? ", ..." : ""
+                print("        @ \(shown)\(more)")
+            }
+        }
+    }
     return d.wrapRecognized ? 0 : 1
 }
