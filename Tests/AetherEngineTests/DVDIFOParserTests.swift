@@ -126,8 +126,8 @@ final class DVDIFOParserTests: XCTestCase {
         // One PGC: 120s total, 3 cells of 40s, programs entering at cells 1 and 2.
         let pgc = makePGC(playbackSeconds: 120, programEntryCells: [1, 2], cellSeconds: [40, 40, 40])
         let detail = try! XCTUnwrap(DVDIFOParser.parseTitleDetail(makeVTSIFO(pgcs: [pgc])))
-        XCTAssertEqual(detail.durationTicks, 120 * 45_000)           // PGC playback_time
-        XCTAssertEqual(detail.chapterStartTicks, [0, 40 * 45_000])   // program 2 starts after cell 1 (40s)
+        XCTAssertEqual(detail.durationTicks, 120 * 45_000)               // PGC playback_time
+        XCTAssertEqual(detail.chapterStartTicks, [0, 40 * 45_000] as [UInt64])  // program 2 starts after cell 1 (40s)
     }
 
     func test_picksLongestPGCInVTS() {
@@ -136,7 +136,7 @@ final class DVDIFOParserTests: XCTestCase {
         let longPGC = makePGC(playbackSeconds: 100, programEntryCells: [1, 2], cellSeconds: [60, 40])
         let detail = try! XCTUnwrap(DVDIFOParser.parseTitleDetail(makeVTSIFO(pgcs: [shortPGC, longPGC])))
         XCTAssertEqual(detail.durationTicks, 100 * 45_000)
-        XCTAssertEqual(detail.chapterStartTicks, [0, 60 * 45_000])
+        XCTAssertEqual(detail.chapterStartTicks, [0, 60 * 45_000] as [UInt64])
     }
 
     func test_titleDetailNilOnBadMagic() {
