@@ -10,6 +10,14 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [4.0.2] — 2026-06-25
+
+### Fixed
+
+- **DTS-HD Master Audio lost its lossless XLL extension in FLAC bridge mode (#66).** The 4.0.1 fix routed every DTS source through the `dca_core` bitstream filter, stripping each packet to its lossy DTS core before the decoder. For DTS-HD MA streams that decode the full lossless XLL cleanly, that downgraded `.lossless` (FLAC) output to lossy 5.1, audible for hosts bridging to a multichannel-LPCM AVR. The bridge now decodes the full stream again (DTS-HD MA reconstructs the lossless XLL as S32P, re-encoded bit-perfectly to FLAC), and keeps the per-packet `EINVAL` skip that handles the rare residual-XLL-without-core frame (#64). It also re-derives the resampler input format from each decoded frame (the canonical libswresample contract, matching the software audio decoder), so a stream whose `sample_fmt` was unresolved at decoder open, or a bailed live probe, can no longer misread the decoded samples as the seed format. The `dca_core` filter is simply no longer used; no FFmpegBuild change is required.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.0.2))
+
 ## [4.0.1] — 2026-06-24
 
 ### Fixed
