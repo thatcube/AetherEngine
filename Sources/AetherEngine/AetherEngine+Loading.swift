@@ -692,6 +692,7 @@ extension AetherEngine {
         var reopenedSelectedTitleID: Int? = nil
         var reopenedAudioTracks: [TrackInfo] = []
         var reopenedSubtitleTracks: [TrackInfo] = []
+        var reopenedStartSeconds: Double = 0
         if let pre = customPreopened {
             reopenedDiscTitles = pre.discTitleInfos()
             if !reopenedDiscTitles.isEmpty {
@@ -699,6 +700,11 @@ extension AetherEngine {
                 reopenedSelectedTitleID = pre.selectedDiscTitleID
                 reopenedAudioTracks = pre.audioTrackInfos()
                 reopenedSubtitleTracks = pre.subtitleTrackInfos()
+                // stopInternal zeroed sourceStartSeconds; recapture the software-path chapter-seek base from
+                // the reopened demuxer so a DVD chapter seek after an audio switch / custom reload still lands
+                // (the native base self-heals via onPlaylistShiftChanged, this one does not). (#67)
+                let st = pre.formatStartTime
+                reopenedStartSeconds = st > 0 ? Double(st) / Double(AV_TIME_BASE) : 0
             }
         }
 
@@ -798,6 +804,7 @@ extension AetherEngine {
             discTitles = reopenedDiscTitles
             discChapters = reopenedDiscChapters
             selectedDiscTitle = reopenedSelectedTitleID.flatMap { id in reopenedDiscTitles.first { $0.id == id } }
+            sourceStartSeconds = reopenedStartSeconds
             // A title switch changes the title's stream set. The native path already republished the session's
             // real list via syncPublishedAudioStateFromNativeSession above; only the software path, which does
             // not reconcile tracks post-load, needs the probe-derived lists re-applied here.

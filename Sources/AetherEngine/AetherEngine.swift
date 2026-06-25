@@ -149,6 +149,11 @@ public final class AetherEngine: ObservableObject {
     /// background-resume reopens (a URL-disc reopen with no id would silently revert to the main title).
     var activeDiscTitleID: Int?
 
+    /// Source container start PTS (seconds) from the probe (AVFormatContext.start_time). The software-path
+    /// playback clock begins here (the native path's content base is `playlistShiftSeconds`), so a DVD
+    /// chapter seek adds it to the chapter's title-relative (0-based) target. 0 when unknown (#67).
+    var sourceStartSeconds: Double = 0
+
     /// Active playback backend: `.native` (AVPlayer) or `.software` (SoftwarePlaybackHost/dav1d/libavcodec).
     /// Exposed for diagnostic overlays; hosts should not branch on it.
     @Published public internal(set) var playbackBackend: PlaybackBackend = .none
@@ -844,6 +849,10 @@ public final class AetherEngine: ObservableObject {
         discChapters = probeOpened ? probe.discChapterInfos() : []
         activeDiscTitleID = probeOpened ? probe.selectedDiscTitleID : nil
         selectedDiscTitle = activeDiscTitleID.flatMap { id in discTitles.first { $0.id == id } }
+        // Content start PTS for the software-path chapter-seek base (see sourceStartSeconds). start_time is
+        // AV_NOPTS_VALUE (Int64.min) when unknown; only a positive value is a real offset.
+        let probedStartTime = probeOpened ? probe.formatStartTime : 0
+        sourceStartSeconds = probedStartTime > 0 ? Double(probedStartTime) / Double(AV_TIME_BASE) : 0
         // Assemble SourceProbe now while the demuxer is open; ownership transfers to loadNative/loadSoftware
         // after which streams are gone (AetherEngine#28).
         let sourceProbe: SourceProbe? = probeOpened
@@ -1538,15 +1547,17 @@ public final class AetherEngine: ObservableObject {
             )
             return
         }
-        // discChapters are title-relative (0-based: chapter 1 = 0), matching the MPLS playlist timeline and the
-        // 0-based title duration. The engine clock and seek(to:) run on the source-PTS axis, which begins at the
-        // title's content start (the producer's playlist shift). Add that base so the seek lands on the chapter
-        // rather than `playlistShiftSeconds` seconds early on discs whose first clip starts at a non-zero PTS.
-        let target = chapter.startSeconds + playlistShiftSeconds
+        // discChapters are title-relative (0-based: chapter 1 = 0), matching the disc timeline and the
+        // 0-based title duration. The engine clock and seek(to:) run on the source-PTS axis, which begins at
+        // the title's content start; that base differs by backend (native re-times onto a 0-based playlist
+        // shifted by playlistShiftSeconds; the software path's raw clock begins at the container start,
+        // sourceStartSeconds). Add it so the seek lands on the chapter, not the base seconds early.
+        let base = (playbackBackend == .software) ? sourceStartSeconds : playlistShiftSeconds
+        let target = chapter.startSeconds + base
         EngineLog.emit(
             "[AetherEngine] selectChapter: seeking to chapter \(id) @ title-relative "
             + "\(String(format: "%.2f", chapter.startSeconds))s -> source \(String(format: "%.2f", target))s "
-            + "(shift \(String(format: "%.2f", playlistShiftSeconds))s)",
+            + "(base \(String(format: "%.2f", base))s, backend \(playbackBackend))",
             category: .engine
         )
         Task { @MainActor [weak self] in await self?.seek(to: target) }
@@ -1677,6 +1688,7 @@ public final class AetherEngine: ObservableObject {
         selectedDiscTitle = nil
         discChapters = []
         activeDiscTitleID = nil
+        sourceStartSeconds = 0
         isLive = false
         liveWindow = nil
         clock.liveEdgeTime = 0

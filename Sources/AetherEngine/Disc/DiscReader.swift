@@ -133,10 +133,25 @@ enum DiscReader {
         let extents = orderedGroups[selectedIndex].vobs.map {
             (offset: Int64($0.startSector * iso.sectorSize), length: Int64($0.length))
         }
-        // Whole-VTS titles; duration is unknown without PGC parsing (a follow-up). dvdVTSN keeps the
-        // title -> title-set mapping for that later chapter/duration work.
-        let titles = orderedGroups.enumerated().map { idx, g in
-            DiscTitle(id: idx, durationTicks: 0, dvdVTSN: g.vtsn)
+        // Whole-VTS titles. Each VTS_NN_0.IFO's main PGC gives the title duration and chapter starts; a disc
+        // with an unreadable VTS IFO keeps duration 0 / no chapters but still plays. dvdVTSN keeps the
+        // title -> title-set mapping.
+        let titles = orderedGroups.enumerated().map { idx, g -> DiscTitle in
+            var durationTicks: UInt64 = 0
+            var chapters: [DiscChapter] = []
+            let nn = g.vtsn < 10 ? "0\(g.vtsn)" : "\(g.vtsn)"
+            let ifoName = "VTS_\(nn)_0.IFO"
+            if let vtsIFO = files.first(where: { $0.name.uppercased() == ifoName }) {
+                let bytes = readAll(reader, [(offset: Int64(vtsIFO.startSector * iso.sectorSize),
+                                             length: Int64(vtsIFO.length))])
+                if let detail = DVDIFOParser.parseTitleDetail(bytes) {
+                    durationTicks = detail.durationTicks
+                    chapters = detail.chapterStartTicks.enumerated().map { i, start in
+                        DiscChapter(id: i, startTicks: start)
+                    }
+                }
+            }
+            return DiscTitle(id: idx, durationTicks: durationTicks, chapters: chapters, dvdVTSN: g.vtsn)
         }
         return DiscInfo(reader: ConcatIOReader(base: reader, extents: extents),
                         formatHint: "mpeg", titles: titles, selectedTitleIndex: selectedIndex)
