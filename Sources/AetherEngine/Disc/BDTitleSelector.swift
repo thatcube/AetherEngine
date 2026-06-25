@@ -19,7 +19,11 @@ enum BDTitleSelector {
         return pool.sorted { $0.durationTicks > $1.durationTicks }
             .enumerated()
             .map { index, playlist in
-                DiscTitle(id: index, durationTicks: playlist.durationTicks, bdClipIDs: playlist.clipIDs)
+                let chapters = playlist.chapterStartTicks.enumerated().map { i, start in
+                    DiscChapter(id: i, startTicks: start)
+                }
+                return DiscTitle(id: index, durationTicks: playlist.durationTicks,
+                                 chapters: chapters, bdClipIDs: playlist.clipIDs)
             }
     }
 }

@@ -167,7 +167,9 @@ Decrypted disc images play through the normal decode path via a synthetic seekab
 
 Both: no decryption (CSS / AACS retail discs must be ripped decrypted first), no GPL nav libraries, no menus, BD-J, or multi-angle.
 
-**Title selection.** `engine.discTitles` (`@Published [TitleInfo]`) lists the disc's titles (id, name, duration, chapter count) and `engine.selectedDiscTitle` is the active one; `engine.selectTitle(id:)` switches title, rebuilding the pipeline from the new title's head. The selection survives audio-track switches and background-resume reloads, and a fresh `load` defaults to the main title (an out-of-range id clamps to it). Blu-ray enumerates all playlists; a DVD currently exposes a single (longest) title, with per-title IFO enumeration and chapter surfacing (`engine.discChapters`) as follow-ups.
+**Title selection.** `engine.discTitles` (`@Published [TitleInfo]`) lists the disc's titles (id, name, duration, chapter count) and `engine.selectedDiscTitle` is the active one; `engine.selectTitle(id:)` switches title, rebuilding the pipeline from the new title's head. The selection survives audio-track switches and background-resume reloads, and a fresh `load` defaults to the main title (an out-of-range id clamps to it). Blu-ray enumerates all playlists; a DVD currently exposes a single (longest) title, with per-title IFO enumeration as a follow-up.
+
+**Chapters.** For Blu-ray, `engine.discChapters` (`@Published [ChapterInfo]`) carries the selected title's chapters, parsed from the playlist's PlayListMark entries (entry marks only; link points dropped) and made title-relative (each mark's timestamp on its clip's STC, offset by the clip's in_time and the cumulative duration of preceding play items). `engine.selectChapter(id:)` seeks to a chapter (a thin `seek` wrapper, no pipeline rebuild). DVD chapters are a follow-up.
 
 ## Network sources (SMB)
 

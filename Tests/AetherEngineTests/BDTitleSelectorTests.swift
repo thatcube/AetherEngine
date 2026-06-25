@@ -40,4 +40,14 @@ final class BDTitleSelectorTests: XCTestCase {
     func test_enumerateTitlesEmptyInput() {
         XCTAssertTrue(BDTitleSelector.enumerateTitles([]).isEmpty)
     }
+
+    func test_enumerateTitlesCarriesChapters() {
+        let main = MPLSPlaylist(clipIDs: ["00001"], durationTicks: 5_400_000,
+                                chapterStartTicks: [0, 1_350_000, 2_700_000])
+        let titles = BDTitleSelector.enumerateTitles([main])
+        XCTAssertEqual(titles.count, 1)
+        XCTAssertEqual(titles[0].chapters.map(\.id), [0, 1, 2])           // chapter ids are 0-based ordinals
+        XCTAssertEqual(titles[0].chapters.map(\.startTicks), [0, 1_350_000, 2_700_000])
+        XCTAssertEqual(titles[0].titleInfo().chapterCount, 3)
+    }
 }

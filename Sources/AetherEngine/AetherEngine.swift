@@ -1527,6 +1527,31 @@ public final class AetherEngine: ObservableObject {
         }
     }
 
+    /// Seek to a chapter within the active disc title. `id` is a `ChapterInfo.id` from `discChapters`. A thin
+    /// wrapper over `seek(to:)` (no pipeline rebuild, since the chapter lives in the playing title's stream).
+    /// No-op when `id` is unknown. (#67)
+    public func selectChapter(id: Int) {
+        guard let chapter = discChapters.first(where: { $0.id == id }) else {
+            EngineLog.emit(
+                "[AetherEngine] selectChapter: id=\(id) not in discChapters (\(discChapters.map { $0.id })), ignored",
+                category: .engine
+            )
+            return
+        }
+        // discChapters are title-relative (0-based: chapter 1 = 0), matching the MPLS playlist timeline and the
+        // 0-based title duration. The engine clock and seek(to:) run on the source-PTS axis, which begins at the
+        // title's content start (the producer's playlist shift). Add that base so the seek lands on the chapter
+        // rather than `playlistShiftSeconds` seconds early on discs whose first clip starts at a non-zero PTS.
+        let target = chapter.startSeconds + playlistShiftSeconds
+        EngineLog.emit(
+            "[AetherEngine] selectChapter: seeking to chapter \(id) @ title-relative "
+            + "\(String(format: "%.2f", chapter.startSeconds))s -> source \(String(format: "%.2f", target))s "
+            + "(shift \(String(format: "%.2f", playlistShiftSeconds))s)",
+            category: .engine
+        )
+        Task { @MainActor [weak self] in await self?.seek(to: target) }
+    }
+
     /// Most recent sidecar subtitle URL; rehydrated by selectAudioTrack after pipeline reload. Cleared on clearSubtitle/stop.
     var loadedSidecarURL: URL?
     /// Active secondary sidecar URL, or nil. Mirror of loadedSidecarURL.

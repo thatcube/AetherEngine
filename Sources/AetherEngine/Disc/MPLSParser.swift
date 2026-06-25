@@ -3,6 +3,9 @@ import Foundation
 struct MPLSPlaylist: Equatable {
     let clipIDs: [String]
     let durationTicks: UInt64
+    /// Entry-mark chapter starts, 45 kHz ticks relative to the title's start, sorted ascending. Empty when
+    /// the playlist declares no PlayListMark section (or only link-point marks). See `parseChapterStarts` (#67).
+    var chapterStartTicks: [UInt64] = []
 }
 
 enum MPLSParser {
@@ -15,6 +18,10 @@ enum MPLSParser {
         var pos = plStart + 10
         var clips: [String] = []
         var ticks: UInt64 = 0
+        // Per-PlayItem state for chapter resolution: a mark's timestamp is on its clip's STC (which begins at
+        // the PlayItem's in_time), so the title-relative chapter start needs in_time and the running offset.
+        var inTimes: [UInt64] = []
+        var cumulativeBefore: [UInt64] = []
         for _ in 0..<count {
             guard pos + 2 <= data.count else { return nil }
             let itemLen = be16(data, pos)
@@ -24,11 +31,42 @@ enum MPLSParser {
             let inT = UInt64(be32(data, body + 12))
             let outT = UInt64(be32(data, body + 16))
             clips.append(clip)
+            inTimes.append(inT)
+            cumulativeBefore.append(ticks)
             if outT >= inT { ticks += (outT - inT) }
             pos = body + itemLen
         }
         guard !clips.isEmpty else { return nil }
-        return MPLSPlaylist(clipIDs: clips, durationTicks: ticks)
+        let chapters = parseChapterStarts(data, inTimes: inTimes, cumulativeBefore: cumulativeBefore)
+        return MPLSPlaylist(clipIDs: clips, durationTicks: ticks, chapterStartTicks: chapters)
+    }
+
+    /// Parse the PlayListMark section (header offset 12 = PlayListMarkStartAddress) into title-relative chapter
+    /// starts. Lenient: any malformed mark data yields no chapters rather than failing the whole playlist.
+    private static func parseChapterStarts(
+        _ data: [UInt8], inTimes: [UInt64], cumulativeBefore: [UInt64]
+    ) -> [UInt64] {
+        guard data.count >= 16 else { return [] }
+        let plmStart = be32(data, 12)
+        // 0 (or out of range) = no PlayListMark section. Need length(4) + number_of_marks(2).
+        guard plmStart > 0, plmStart + 6 <= data.count else { return [] }
+        let markCount = be16(data, plmStart + 4)
+        var entry = plmStart + 6
+        var starts: [UInt64] = []
+        for _ in 0..<markCount {
+            guard entry + 14 <= data.count else { break }
+            let markType = data[entry + 1]
+            let ref = be16(data, entry + 2)
+            let timeStamp = UInt64(be32(data, entry + 4))
+            entry += 14
+            // 1 = entry mark (chapter); 2 = link point (navigation, not a chapter). Skip unknown refs.
+            guard markType == 1, ref < inTimes.count else { continue }
+            let onClip = timeStamp >= inTimes[ref] ? timeStamp - inTimes[ref] : 0
+            starts.append(cumulativeBefore[ref] + onClip)
+        }
+        // Marks can appear out of order; present chapters in playback order, deduped.
+        var seen = Set<UInt64>()
+        return starts.sorted().filter { seen.insert($0).inserted }
     }
 
     private static func be16(_ b: [UInt8], _ i: Int) -> Int { (Int(b[i]) << 8) | Int(b[i+1]) }
