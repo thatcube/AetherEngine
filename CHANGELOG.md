@@ -10,6 +10,16 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [3.13.10] — 2026-06-25
+
+Maintenance release on the 3.13.x line. Backports remote disc-image playback from 4.0.7.
+
+### Added
+
+- **Remote disc images (ISO 9660 / UDF / Blu-ray BDMV) over HTTP(S) (#64).** Network ISO playback failed because the HTTP open path fed a disc image straight to libavformat (it is a filesystem, not a media container). New `HTTPDiscIOReader` reads a remote disc image over byte-range requests with an adaptive read-ahead window and per-request retry, and `openHTTP` routes a disc-image URL (`.iso` / `.img` / `.udf`) through the disc adapter like the local path, falling back to streaming when the source is not a recognizable disc. The server must support byte ranges.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.13.10))
+
 ## [3.13.9] — 2026-06-25
 
 Maintenance release on the 3.13.x line. Backports the #64 audio fix from 4.0.6.
