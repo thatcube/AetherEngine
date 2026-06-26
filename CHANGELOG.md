@@ -10,6 +10,15 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [4.2.1] — 2026-06-26
+
+### Fixed
+
+- **Persistent AVIOReader reconnect storm on a non-faststart / coarsely-interleaved remote MP4 (#69).** A remote MP4 with a trailing `moov` and track data tens of MB apart makes the demuxer ping-pong across distant file regions during `avformat_find_stream_info` / index parse. The persistent reader used to tear down and reopen its HTTP connection on every such non-sequential read, so the parse storm drove the origin into a 429 and playback never started. Those random-access reads now go through the existing pooled keep-alive session, cached as 4 MB aligned blocks in a small LRU (8 blocks, roughly 32 MB, VOD-only), so the streaming connection stays anchored and the storm collapses to the two legitimate reconnects (open plus the one seek to the moov). The sequential playback fast path never enters the cache, so it carries no overhead; only full-length blocks are cached, so a truncated range response cannot shadow the re-fetch of its uncovered tail; and once detour reads turn sequential past 8 MB the streaming connection re-anchors there, returning steady playback (and large backward scrubs) to the cheap sliding-window path. Thanks to reckloon for the detailed diagnosis and the validated detour-cache design.
+- **Reconnect loop under a sustained 429 (#71).** When an origin rate-limited essentially every request, the reader looped reconnecting (gen=N climbing) instead of failing cleanly: a 429 carried no `Retry-After` so the backoff was zero, and the random-access parse seeks kept resetting the unproductive-reconnect streak before it reached the give-up cap. A 429/503 now drives a separate rate-limit streak that the seek-driven reconnects do not reset and that only real read progress clears, so a throttled origin gives up cleanly after a bounded number of attempts, with exponential backoff that grows even when no `Retry-After` is present. The detour cache's miss-under-429 fallback backs off in place and retries the pooled fetch rather than opening a fresh connection, so it cannot re-enter the churn the cache removes.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.2.1))
+
 ## [4.2.0] — 2026-06-26
 
 ### Added
