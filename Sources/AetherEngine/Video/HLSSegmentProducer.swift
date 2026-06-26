@@ -1100,18 +1100,24 @@ final class HLSSegmentProducer: @unchecked Sendable {
     }
 
     /// #74: whether a pre-video-gate audio packet should be buffered for in-DTS-order replay (instead of
-    /// dropped). Only at head-of-stream, only while the gate is still waiting, only audio, only under the
-    /// byte cap. Restart/seek producers (not head-of-stream) keep the drop: their post-gate shift-snap
-    /// already anchors the surviving audio to the video tfdt, so there is no leading-second to preserve.
+    /// dropped). Buffered while the gate is still waiting, only audio, only under the byte cap, for:
+    ///   - head-of-stream (any), and
+    ///   - VOD restart/seek.
+    /// The wide-interleave failure is the same at both: the matching audio is muxed ahead of the video in
+    /// file order, so on a seek it is read during the keyframe scan-forward (gate still closed) and was
+    /// dropped, leaving the post-gate restart-target filter to snap the next (~1 s-later) audio onto the
+    /// keyframe. Buffering it lets that same filter pick the matching packet from the [target, …] window.
+    /// Live restart still drops: its program-boundary re-anchor handles audio separately.
     static func shouldBufferPregateAudio(
         isAudioPkt: Bool,
         audioWaitForVideo: Bool,
         isHeadOfStream: Bool,
+        isLive: Bool,
         bufferedBytes: Int,
         packetSize: Int,
         capBytes: Int
     ) -> Bool {
-        guard isAudioPkt, audioWaitForVideo, isHeadOfStream else { return false }
+        guard isAudioPkt, audioWaitForVideo, isHeadOfStream || !isLive else { return false }
         return bufferedBytes + max(packetSize, 0) <= capBytes
     }
 
@@ -1316,17 +1322,19 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     }
                 }
 
-                // #74: buffer head-of-stream audio that arrives before the first video packet, for
-                // in-DTS-order replay once the video gate opens (drained at the loop top), instead of
-                // dropping it at the audio gate. On wide-interleave sources the old drop discarded the
-                // entire leading second of real audio, leaving a constant ~1 s A/V desync. Bounded by a
-                // byte cap; over the cap the original gate drop below resumes. Scoped to head-of-stream
-                // (restartTargetVideoDts == min); restart producers keep the drop (post-gate shift-snap
-                // already anchors their surviving audio to the video tfdt).
+                // #74: buffer pre-video-gate audio for in-DTS-order replay once the video gate opens
+                // (drained at the loop top), instead of dropping it at the audio gate. On wide-interleave
+                // sources (audio muxed ahead of video in file order) the old drop discarded the matching
+                // audio, leaving a constant ~1 s A/V desync. Bounded by a byte cap; over the cap the
+                // original gate drop below resumes. Applies to head-of-stream (any) and VOD restart/seek:
+                // on a seek the matching audio is read during the keyframe scan-forward (gate still
+                // closed), and buffering it lets the post-gate restart-target filter pick it from the
+                // [target, …] window. Live restart keeps the drop (program-boundary re-anchor handles it).
                 if Self.shouldBufferPregateAudio(
                     isAudioPkt: isAudioPkt,
                     audioWaitForVideo: audioWaitForVideo,
                     isHeadOfStream: restartTargetVideoDts == Int64.min,
+                    isLive: isLive,
                     bufferedBytes: pregateAudioBufferBytes,
                     packetSize: Int(packet.pointee.size),
                     capBytes: Self.maxPregateAudioBufferBytes
@@ -1335,7 +1343,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     pregateAudioBufferBytes += Int(packet.pointee.size)
                     pktPtr = nil  // ownership moves to the buffer; freed on replay or teardown
                     continue
-                } else if isAudioPkt, audioWaitForVideo, restartTargetVideoDts == Int64.min,
+                } else if isAudioPkt, audioWaitForVideo,
+                          restartTargetVideoDts == Int64.min || !isLive,
                           !pregateAudioOverflowLogged {
                     pregateAudioOverflowLogged = true
                     EngineLog.emit(
