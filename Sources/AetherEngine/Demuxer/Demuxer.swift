@@ -69,6 +69,10 @@ public final class Demuxer: @unchecked Sendable {
     private var avioProvider: AVIOProvider?
     private var openProfile: DemuxerOpenProfile = .playback
 
+    /// Number of attached-picture (cover-art) streams reclassified to ATTACHMENT before
+    /// stream-info probing on the most recent open. See `reclassifyAttachedPictures`. (#75)
+    private(set) var attachedPictureStreamsReclassified: Int = 0
+
     // Memory probe: compare against RSS growth; 0 for file:// sources.
     var avioBytesFetched: Int64 { avioProvider?.cumulativeBytesFetched ?? 0 }
 
@@ -260,7 +264,35 @@ public final class Demuxer: @unchecked Sendable {
         }
     }
 
+    /// True for streams carrying a single cover-art still (e.g. mjpeg poster). FFmpeg flags these
+    /// with `AV_DISPOSITION_ATTACHED_PIC` at open, independent of codec type. (#75)
+    static func isAttachedPicture(disposition: Int32) -> Bool {
+        (disposition & AV_DISPOSITION_ATTACHED_PIC) != 0
+    }
+
+    /// Reclassify cover-art streams to `AVMEDIA_TYPE_ATTACHMENT` BEFORE `avformat_find_stream_info`.
+    /// An unresolvable cover (mjpeg with no decodable frame, reported size 0x0) otherwise keeps
+    /// `has_codec_parameters` false, so find_stream_info reads to the full probe budget (tens of MB
+    /// on a remote source) before giving up, dominating open. find_stream_info syncs codecpar into
+    /// its internal avctx unconditionally at setup, and `has_codec_parameters` returns true for an
+    /// ATTACHMENT stream with no width/pixfmt/decoder dependency, so the probe stops once the real
+    /// streams resolve. Cover extraction reads `attached_pic` + the unchanged disposition (queued at
+    /// open), so it is unaffected. Discard is deliberately left untouched: `AVDISCARD_ALL` would make
+    /// `avformat_queue_attached_pictures` skip the cover. (#75)
+    private func reclassifyAttachedPictures(_ ctx: UnsafeMutablePointer<AVFormatContext>) {
+        var count = 0
+        for i in 0..<Int(ctx.pointee.nb_streams) {
+            guard let stream = ctx.pointee.streams[i],
+                  let codecpar = stream.pointee.codecpar,
+                  Self.isAttachedPicture(disposition: stream.pointee.disposition) else { continue }
+            codecpar.pointee.codec_type = AVMEDIA_TYPE_ATTACHMENT
+            count += 1
+        }
+        attachedPictureStreamsReclassified = count
+    }
+
     private func probeStreams(_ ctx: UnsafeMutablePointer<AVFormatContext>) throws {
+        reclassifyAttachedPictures(ctx)
         let findRet = avformat_find_stream_info(ctx, nil)
         guard findRet >= 0 else {
             throw DemuxerError.streamInfoFailed(code: findRet)
