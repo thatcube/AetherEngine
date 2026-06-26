@@ -10,6 +10,18 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [4.5.0] — 2026-06-26
+
+### Added
+
+- **Subtitle-language pick ranks by container disposition; `TrackInfo` surfaces forced / SDH / commentary (#73).** `LoadOptions.preferredSubtitleLanguages` (4.4.0) activated the first track in a matching language. It now activates the *best* track within the first matching preference: full subtitles rank over SDH (`HEARING_IMPAIRED`), forced, and commentary (`COMMENT`), and text over bitmap, all from container dispositions; preference order still dominates rank. New `TrackInfo.isForced` / `isHearingImpaired` / `isCommentary` (read alongside the existing `isDefault`) surface those dispositions for audio and subtitle tracks, so a host can rank or filter `subtitleTracks` the same way. The pure `selectSubtitleIndex`, `subtitlePickRank`, and `isBitmapSubtitleCodec` helpers are exposed and unit-tested.
+
+### Fixed
+
+- **Bitmap subtitles leaked into the native `mov_text` rendition (#55).** With `prepareNativeSubtitles` set, two sites matched `TrackInfo.codec` (the libavcodec *decoder* name, e.g. `pgssub`) against an exact-match set of *descriptor* names (`hdmv_pgs_subtitle`, `dvb_subtitle`, `dvd_subtitle`, `xsub`), so PGS / DVB / DVD bitmap tracks were not excluded (only `xsub` matched by coincidence). They leaked into the `mov_text` trak table and the native-store-attach set, producing phantom entries in the `AVMediaSelection` legible group and a store/reader index mismatch. Both sites now use a shared decoder-name `isBitmapSubtitleCodec` classifier that agrees with the reader's enum classifier, so only true text tracks become native `mov_text` traks.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.5.0))
+
 ## [4.4.0] — 2026-06-26
 
 ### Added
