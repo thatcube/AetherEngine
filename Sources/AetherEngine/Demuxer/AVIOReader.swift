@@ -254,8 +254,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     }
 
     func open() throws {
-        fileSize = probeFileSize()
-
         guard let buf = av_malloc(Int(Self.avioBufferSize)) else {
             throw AVIOReaderError.allocationFailed
         }
@@ -278,28 +276,95 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
         context = ctx
 
-        if usePersistentReader {
+        if prefetchEnabled {
+            // Playback path. The persistent connection's `Range: bytes=0-` request is itself
+            // the size probe: its 206 Content-Range is folded into fileSize by
+            // persistentReceivedResponse (issue #70), so the common case skips the dedicated
+            // probeFileSize() round-trip (and its HEAD fallback, the request some origins 429).
             startPersistentConnection(at: 0)
-            winCond.lock()
-            let deadline = Date(timeIntervalSinceNow: 15)
-            while window.isEmpty && !connEnded && !isClosed {
-                if !winCond.wait(until: deadline) { break }
+            let gotData = awaitFirstPersistentData()
+            var tookFallback = false
+            if !isLive {
+                // Atomically decide, under winCond, whether the optimistic connection resolved
+                // a size; if not, abandon it (generation bump ignores a size landing in the
+                // race window). fileSize is read under the lock because the delegate thread now
+                // writes it (issue #70 review #4/#5).
+                let (haveSize, abandoned) = resolveOptimisticOpen()
+                abandoned?.invalidateAndCancel()
+                if !haveSize {
+                    // The data connection resolved no size (no-length origin, a transient 429,
+                    // slow headers, or an origin whose length only comes via HEAD). Fall back to
+                    // the exact pre-#70 probe path (Range bytes=0- then HEAD, on its own
+                    // connection and budget): it keeps seekability whenever a size is reachable
+                    // and only streams on a genuinely length-less source, restoring main's
+                    // resilience to all of those cases (issue #70 review #1/#3/#4).
+                    tookFallback = true
+                    EngineLog.emit("[AVIOReader] Data connection resolved no size, falling back to probe", category: .demux, level: .verbose)
+                    fileSize = probeFileSize()
+                    if isStreaming {
+                        startStreamingDownload()
+                        _ = streamDataReady.wait(timeout: .now() + .seconds(15))
+                    } else {
+                        startPersistentConnection(at: 0)
+                        if !awaitFirstPersistentData() {
+                            EngineLog.emit("[AVIOReader] Persistent open (post-probe): no data within 15s, proceeding to read-loop reconnect", category: .demux)
+                        }
+                    }
+                }
             }
-            let gotData = !window.isEmpty
-            winCond.unlock()
-            if !gotData {
+            if !tookFallback && !gotData {
                 // No first byte within 15s; read loop's stall/reconnect machinery takes over.
-                EngineLog.emit("[AVIOReader] Persistent open: no data within 15s, proceeding to read-loop reconnect", category: .demux)
+                EngineLog.emit("[AVIOReader] Persistent open: no first byte within 15s, proceeding to read-loop reconnect", category: .demux)
             }
-        } else if isStreaming {
-            startStreamingDownload()
-            _ = streamDataReady.wait(timeout: .now() + .seconds(15))
         } else {
-            if let data = fetchChunk(from: 0, size: chunkSize) {
-                currentBuffer = data
-                currentOffset = 0
+            // Non-prefetch (still extraction / one-shot seekable): the size is needed up
+            // front for SEEK_END and container index seeks, so keep the dedicated probe.
+            fileSize = probeFileSize()
+            if isStreaming {
+                startStreamingDownload()
+                _ = streamDataReady.wait(timeout: .now() + .seconds(15))
+            } else {
+                if let data = fetchChunk(from: 0, size: chunkSize) {
+                    currentBuffer = data
+                    currentOffset = 0
+                }
             }
         }
+    }
+
+    /// Block up to 15s for the persistent connection's first window bytes. The response
+    /// (and thus any Content-Range size) has already been processed by the time data
+    /// arrives. Demux thread, open-time only. Returns true if data arrived.
+    private func awaitFirstPersistentData() -> Bool {
+        winCond.lock()
+        let deadline = Date(timeIntervalSinceNow: 15)
+        while window.isEmpty && !connEnded && !isClosed {
+            if !winCond.wait(until: deadline) { break }
+        }
+        let gotData = !window.isEmpty
+        winCond.unlock()
+        return gotData
+    }
+
+    /// Under a single winCond critical section: snapshot whether the optimistic open-time
+    /// connection resolved a size (fileSize > 0, written by the delegate thread in
+    /// persistentReceivedResponse), and if not, atomically abandon that connection so the
+    /// open can fall back to the probe path. Bumping the generation inside the same lock as
+    /// the read means a size that lands in the race window is ignored rather than racing a
+    /// half-done teardown (issue #70 review #4/#5). Returns the session to cancel outside
+    /// the lock. Demux thread, open-time only; leaves the AVIO context intact (unlike close()).
+    private func resolveOptimisticOpen() -> (haveSize: Bool, abandoned: URLSession?) {
+        winCond.lock()
+        defer { winCond.unlock() }
+        if fileSize > 0 { return (true, nil) }
+        connGeneration &+= 1
+        let session = activeSession
+        activeSession = nil
+        activeTask = nil
+        window = Data()
+        connEnded = true
+        winCond.broadcast()
+        return (false, session)
     }
 
     // Close flags written on the teardown thread (markClosed / fullyClose) and read on the demux
@@ -1058,6 +1123,19 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // from byte 0 (silent corruption). Reject it. Live is exempt: transcode
         // reconnect legitimately answers 200 with "from now".
         let requestedOffset = (generation == connGeneration) ? winStart : 0
+        // Issue #70: the first from-0 data connection doubles as the size probe, so the
+        // playback open skips probeFileSize() entirely. Derive the total from this
+        // response (206 Content-Range, or Content-Length on a from-0 2xx). Write-once
+        // (fileSize <= 0), current-gen only, and never for live (whose length is
+        // non-authoritative). The response precedes any body and no read() reads fileSize
+        // until open() returns, so this write is ordered behind winCond just like the data.
+        if generation == connGeneration, !isLive, fileSize <= 0,
+           let total = Self.sizeFromResponse(http, requestedOffset: requestedOffset) {
+            fileSize = total
+            #if DEBUG
+            EngineLog.emit("[AVIOReader] File size: \(total) bytes (data connection)", category: .demux)
+            #endif
+        }
         winCond.unlock()
         if status == 200 && requestedOffset > 0 && !isLive {
             EngineLog.emit(
@@ -1288,8 +1366,29 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return URLSession(configuration: config, delegate: nil, delegateQueue: nil)
     }()
 
+    /// Total size from a data-connection response: `Content-Range` total on a 206, or
+    /// `Content-Length` on a from-0 2xx (origins that answer 200 ignoring Range). Nil when
+    /// the origin gave no usable length (chunked, or an unknown `*` total). Issue #70.
+    static func sizeFromResponse(_ http: HTTPURLResponse, requestedOffset: Int64) -> Int64? {
+        // On a 206 the total lives ONLY in Content-Range; Content-Length is the partial span,
+        // so a 206 with an unknown (`*`) or unparseable range must report no size, never fall
+        // through to the partial length (issue #70 review #6).
+        if http.statusCode == 206 {
+            guard let cr = http.value(forHTTPHeaderField: "Content-Range"),
+                  let total = HTTPDiscIOReader.parseContentRangeTotal(cr), total > 0 else {
+                return nil
+            }
+            return total
+        }
+        if (200...299).contains(http.statusCode), requestedOffset == 0,
+           http.expectedContentLength > 0 {
+            return http.expectedContentLength
+        }
+        return nil
+    }
+
     private func probeFileSize() -> Int64 {
-        // Range bytes=0-0 probe (AetherEngine#8: HEAD breaks on Cloudflare-fronted
+        // Range bytes=0- probe (AetherEngine#8: HEAD breaks on Cloudflare-fronted
         // origins returning 405). Without a known size, streaming mode is used and
         // SEEK_SET/SEEK_END return -1, breaking MKV/AVI index seeks and scrubbing.
         if let size = rangeProbeFileSize(), size > 0 {
@@ -1301,11 +1400,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return headProbeFileSize()
     }
 
-    /// Range bytes=0-0 GET cancelled at didReceive response. Returns total from
-    /// Content-Range on 206, or expectedContentLength on 2xx (origins that ignore Range).
+    /// Open-ended Range bytes=0- GET cancelled at didReceive response (no body transfers).
+    /// Returns the total from Content-Range on 206, or expectedContentLength on 2xx (origins
+    /// that ignore Range). bytes=0- over bytes=0-0: some origins special-case the single-byte
+    /// form and omit length, then 429 the HEAD fallback (issue #70); bytes=0- answers with a
+    /// proper Content-Range in one shot.
     private func rangeProbeFileSize() -> Int64? {
         var request = URLRequest(url: url)
-        request.setValue("bytes=0-0", forHTTPHeaderField: "Range")
+        request.setValue("bytes=0-", forHTTPHeaderField: "Range")
         request.timeoutInterval = 20
         applyExtraHeaders(&request)
 
@@ -1781,22 +1883,13 @@ private final class ProbeDelegate: NSObject, URLSessionDataDelegate, @unchecked 
         defer { completionHandler(.cancel) }
         guard let http = response as? HTTPURLResponse else { return }
         let status = http.statusCode
-        if (status == 206 || (200...299).contains(status)),
-           let resolved = dataTask.currentRequest?.url {
+        if (200...299).contains(status), let resolved = dataTask.currentRequest?.url {
             onResolved?(resolved)
         }
-        if status == 206,
-           let contentRange = http.value(forHTTPHeaderField: "Content-Range"),
-           let slash = contentRange.firstIndex(of: "/") {
-            let totalString = contentRange[contentRange.index(after: slash)...]
-            if totalString != "*", let size = Int64(totalString) {
-                totalSize = size
-                return
-            }
-        }
-        if (200...299).contains(status), http.expectedContentLength > 0 {
-            totalSize = http.expectedContentLength
-        }
+        // The probe requests `bytes=0-`, so requestedOffset is 0. Shared with the
+        // data-connection path so a 206 with an unknown (`*`) total never reports its
+        // partial Content-Length as the size (issue #70 review #6).
+        totalSize = AVIOReader.sizeFromResponse(http, requestedOffset: 0)
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
