@@ -249,12 +249,10 @@ extension AetherEngine {
             }
         }
         // prepareNativeSubtitles + non-bitmap text tracks: flag gates allocateMuxer SubtitleConfig; must be set before start() (#55).
-        // TrackInfo.codec is the lower-case libavcodec name (e.g. "subrip", "ass"). Bitmap codecs excluded:
-        let bitmapCodecNames: Set<String> = [
-            "hdmv_pgs_subtitle", "dvb_subtitle", "dvd_subtitle", "xsub"
-        ]
         // Each text track becomes one mov_text track in the init moov (#55, all-tracks). Sidecar entries append at runtime; this table is embedded-only.
-        let textTracks = subtitleTracks.filter { !bitmapCodecNames.contains($0.codec) }
+        // Bitmap codecs excluded via the shared decoder-name classifier (a prior exact-match Set used descriptor
+        // names that never matched TrackInfo.codec's decoder names, so PGS/DVB/DVD leaked in as mov_text).
+        let textTracks = subtitleTracks.filter { !Self.isBitmapSubtitleCodec($0.codec) }
         nativeSubtitleTrackTable = textTracks.map { track in
             NativeSubtitleTrackEntry(sourceStreamIndex: track.id, language: track.language)
         }

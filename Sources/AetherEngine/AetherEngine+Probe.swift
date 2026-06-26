@@ -258,21 +258,53 @@ extension AetherEngine {
         return nil
     }
 
-    /// Resolve the subtitle track to auto-activate from `LoadOptions.preferredSubtitleLanguages`: the first
-    /// track whose language matches a preference (preferences scanned in order), else nil. Unlike audio there
-    /// is no explicit index override and no default fallback: nil means "keep subtitles off" (the default).
-    /// Pure and nonisolated; the engine calls this at the end of a successful load and, on a hit, activates
-    /// the track via the host-overlay path so the host need not language-match `subtitleTracks` itself (#73).
+    /// Resolve the subtitle track to auto-activate from `LoadOptions.preferredSubtitleLanguages`: within the
+    /// first preference (scanned in order) that has any language match, the best-ranked track by
+    /// `subtitlePickRank`; else nil. Preference order dominates rank, so an earlier preference always beats a
+    /// later one. Unlike audio there is no explicit index override and no default fallback: nil means "keep
+    /// subtitles off" (the default). Pure and nonisolated; the engine calls this at the end of a successful
+    /// load and, on a hit, activates the track via the host-overlay path so a host without container metadata
+    /// of its own need not language-match and rank `subtitleTracks` itself (#73).
     nonisolated static func selectSubtitleIndex(
         tracks: [TrackInfo],
         preferredLanguages: [String]
     ) -> Int32? {
         for preferred in preferredLanguages {
-            if let match = tracks.first(where: { languageMatches($0.language, preferred) }) {
-                return Int32(match.id)
+            let matches = tracks.filter { languageMatches($0.language, preferred) }
+            // min(by:) is stable, so equal-rank ties keep container order.
+            if let best = matches.min(by: { subtitlePickRank($0) < subtitlePickRank($1) }) {
+                return Int32(best.id)
             }
         }
         return nil
+    }
+
+    /// Lower rank wins. The descriptor axis (full > SDH > forced > commentary, from container dispositions)
+    /// dominates; text-vs-bitmap is a tiebreaker (text preferred, since host styling only applies to text
+    /// cues). Sourced from `TrackInfo` disposition flags rather than title strings, so it is locale-robust.
+    /// Used by `selectSubtitleIndex` and exposed so a host can rank `subtitleTracks` the same way (#73).
+    nonisolated static func subtitlePickRank(_ track: TrackInfo) -> Int {
+        let descriptorRank: Int
+        if track.isCommentary {
+            descriptorRank = 3
+        } else if track.isForced {
+            descriptorRank = 2
+        } else if track.isHearingImpaired {
+            descriptorRank = 1
+        } else {
+            descriptorRank = 0
+        }
+        return descriptorRank * 2 + (isBitmapSubtitleCodec(track.codec) ? 1 : 0)
+    }
+
+    /// True when the codec is a bitmap (image) subtitle. `TrackInfo.codec` is the libavcodec DECODER name
+    /// (pgssub / dvdsub / dvbsub / xsub), not the descriptor name (hdmv_pgs_subtitle / dvb_subtitle / ...);
+    /// matched case-insensitively by substring so either form is tolerated. Bitmap subs cannot mux into
+    /// mov_text, so the native-subtitle rendition (#55) excludes them and only the host overlay renders them.
+    nonisolated static func isBitmapSubtitleCodec(_ codec: String) -> Bool {
+        let c = codec.lowercased()
+        return ["pgs", "hdmv", "dvb_sub", "dvbsub", "dvd_sub", "dvdsub", "vobsub", "xsub"]
+            .contains(where: { c.contains($0) })
     }
 
     /// Case-insensitive language match across ISO 639-1 / 639-2 (B and T) / English name, e.g.

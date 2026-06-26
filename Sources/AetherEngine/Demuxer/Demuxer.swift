@@ -416,7 +416,11 @@ public final class Demuxer: @unchecked Sendable {
             name = "Track \(index) (\(codecName))"
         }
 
-        let isDefault = (stream.pointee.disposition & AV_DISPOSITION_DEFAULT) != 0
+        let disposition = stream.pointee.disposition
+        let isDefault = (disposition & AV_DISPOSITION_DEFAULT) != 0
+        let isForced = (disposition & AV_DISPOSITION_FORCED) != 0
+        let isHearingImpaired = (disposition & AV_DISPOSITION_HEARING_IMPAIRED) != 0
+        let isCommentary = (disposition & AV_DISPOSITION_COMMENT) != 0
         let channels = Int(codecpar.pointee.ch_layout.nb_channels)
 
         // EAC3 profile 30 = JOC (Dolby Atmos on streaming). Lets UI label "Atmos".
@@ -444,6 +448,9 @@ public final class Demuxer: @unchecked Sendable {
             language: language,
             channels: channels,
             isDefault: isDefault,
+            isForced: isForced,
+            isHearingImpaired: isHearingImpaired,
+            isCommentary: isCommentary,
             isAtmos: isAtmos,
             assHeader: assHeader
         )

@@ -132,8 +132,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Call after `start()`. Returns per-track languages for logging.
     @discardableResult
     public func attachAllNativeSubtitleStores() -> [String?] {
-        let bitmap: Set<String> = ["hdmv_pgs_subtitle", "dvb_subtitle", "dvd_subtitle", "xsub"]
-        let text = (demuxer?.subtitleTrackInfos() ?? []).filter { !bitmap.contains($0.codec) }
+        // Decoder-name classifier: an exact-match Set of descriptor names here never matched TrackInfo.codec
+        // (the libavcodec decoder name), so bitmap tracks leaked into the native mov_text store set.
+        let text = (demuxer?.subtitleTrackInfos() ?? []).filter { !AetherEngine.isBitmapSubtitleCodec($0.codec) }
         let languages = text.map { $0.language }
         attachNativeSubtitleStores(count: text.count, languages: languages)
         return languages

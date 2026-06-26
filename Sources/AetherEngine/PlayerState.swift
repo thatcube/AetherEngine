@@ -98,9 +98,11 @@ public struct LoadOptions: Sendable, Equatable {
     public var preferredAudioLanguages: [String]
 
     /// Ordered subtitle-language preference (ISO 639-1 / 639-2 codes or English names, e.g. `["en", "de"]`).
-    /// When non-empty, at the end of a successful load the engine activates the first subtitle track whose
+    /// When non-empty, at the end of a successful load the engine activates the best subtitle track whose
     /// language matches a preference (preferences scanned in order, case-insensitive, ISO 639-1/2 B+T and
-    /// English-name synonyms); no match leaves subtitles OFF (the default). This drives the host-overlay
+    /// English-name synonyms; within the matched preference, full subtitles rank over SDH / forced /
+    /// commentary and text over bitmap, from container dispositions); no match leaves subtitles OFF (the
+    /// default). This drives the host-overlay
     /// path (`subtitleCues`, equivalent to a `selectSubtitleTrack` call) and publishes the resolved track
     /// via `activeSubtitleTrackIndex`. Where `preferredAudioLanguages` saves a real cost (its track is muxed
     /// into the loopback HLS at the first frame, so a late pick forces a pre-probe or reload), this is pure
@@ -276,19 +278,29 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
     /// 2=stereo, 6=5.1, 8=7.1. 0 for non-audio.
     public let channels: Int
     public let isDefault: Bool
+    /// Container disposition `FORCED` (subtitles meant to show without the user enabling subtitles, e.g.
+    /// foreign-dialogue or signs tracks). Drives the subtitle-language ranking in `selectSubtitleIndex`.
+    public let isForced: Bool
+    /// Container disposition `HEARING_IMPAIRED` (SDH / closed-caption tracks with sound descriptions).
+    public let isHearingImpaired: Bool
+    /// Container disposition `COMMENT` (director / cast commentary tracks). Applies to audio and subtitle.
+    public let isCommentary: Bool
     /// EAC3 with JOC profile (Dolby Atmos). Lets the UI surface "Atmos" instead of the bed channel count (typically 5.1).
     public let isAtmos: Bool
 
     /// ASS / SSA tracks only: `[Script Info]` + `[V4+ Styles]` + `[Events]` format line from codec extradata. Hosts rendering ASS styling themselves (see `LoadOptions.preserveASSMarkup`) need it to resolve style references. nil for all other track kinds.
     public let assHeader: String?
 
-    public init(id: Int, name: String, codec: String, language: String?, channels: Int = 0, isDefault: Bool, isAtmos: Bool = false, assHeader: String? = nil) {
+    public init(id: Int, name: String, codec: String, language: String?, channels: Int = 0, isDefault: Bool, isForced: Bool = false, isHearingImpaired: Bool = false, isCommentary: Bool = false, isAtmos: Bool = false, assHeader: String? = nil) {
         self.id = id
         self.name = name
         self.codec = codec
         self.language = language
         self.channels = channels
         self.isDefault = isDefault
+        self.isForced = isForced
+        self.isHearingImpaired = isHearingImpaired
+        self.isCommentary = isCommentary
         self.isAtmos = isAtmos
         self.assHeader = assHeader
     }

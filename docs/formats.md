@@ -70,6 +70,15 @@ Subtitle packets are routed through the same demux loop as audio and video. No s
 - **Bitmap codecs** (PGS / HDMV PGS / DVB / DVD) → `.image(SubtitleImage)`. The indexed pixel plane is walked through its palette, premultiplied against alpha, and wrapped as a `CGImage`. Position is normalised in `[0..1]` against the source video frame so the host scales to any on-screen rect.
 - **Sidecar files** (a separate `.srt` / `.ass` / `.vtt` URL) → `selectSidecarSubtitle(url:httpHeaders:)` opens its own short-lived `AVFormatContext`, decodes the whole file once, atomically swaps the result into `subtitleCues`. The fetch forwards the session's `LoadOptions.httpHeaders` by default (WebDAV auth and friends); pass the call's own `httpHeaders` to override per fetch.
 
+### Track selection by language preference
+
+`LoadOptions` can seed the initial audio and subtitle tracks from an ordered language preference, resolved from the engine's single probe so a host honors a saved preference without a separate pre-probe or a post-load reload:
+
+- **`preferredAudioLanguages`** (ordered ISO 639-1 / 639-2 codes or English names, e.g. `["en", "de"]`) picks the first-frame audio track: an explicit `audioSourceStreamIndex` wins, else the first track matching a preference in order, else the container default. The pick is muxed into the loopback HLS, so it is correct on the first frame with no `selectAudioTrack` reload.
+- **`preferredSubtitleLanguages`** activates a subtitle at the end of load. Within the first preference that has a match, it picks the *best* track by container disposition: full subtitles rank over SDH (`HEARING_IMPAIRED`), forced, and commentary (`COMMENT`), and text over bitmap. No match leaves subtitles off. It drives the host-overlay path, so unlike audio it needs no reload regardless; it only spares a host from language-matching `subtitleTracks` itself. The native menu (below) keeps its own host-driven default selection via `setNativeSubtitleSelected(track:)`.
+
+Matching is case-insensitive across ISO 639-1, 639-2/B, 639-2/T, and English names (`en` == `eng` == `english`); preference order dominates, so an earlier preference on a later track still wins. The resolved tracks are published on `player.activeAudioTrackIndex` / `player.activeSubtitleTrackIndex` (both match `TrackInfo.id`), and every `TrackInfo` carries `isDefault` / `isForced` / `isHearingImpaired` / `isCommentary` (from container dispositions) so a host can rank or filter the track lists the same way.
+
 ### Second simultaneous subtitle track (bilingual)
 
 A second subtitle channel can run alongside the primary for bilingual playback / language learning: `selectSecondarySubtitleTrack(index:)` for an embedded track and `selectSecondarySidecarSubtitle(url:httpHeaders:)` for a sidecar file, mirroring the primary API. Its cues land in a separate `@Published secondarySubtitleCues` list (so the host can render the two channels independently, e.g. top vs bottom), with `isSecondarySubtitleActive` and `isLoadingSecondarySubtitles` for UI state; `clearSecondarySubtitle()` tears it down. The secondary channel decodes through the same demux loop and PTS rules as the primary.

@@ -74,9 +74,10 @@ extension AetherEngine {
         startEmbeddedSubtitleTask(url: url, reader: customClone, formatHint: customFormatHint, streamIndex: Int32(index), startAt: startAt)
     }
 
-    /// Apply `LoadOptions.preferredSubtitleLanguages` at the end of a successful load: activate the first
-    /// subtitle track whose language matches a preference (scanned in order), else leave subtitles off (the
-    /// default). Uses the host-overlay path (equivalent to a `selectSubtitleTrack` call); `startAnchor` is the
+    /// Apply `LoadOptions.preferredSubtitleLanguages` at the end of a successful load: activate the best-ranked
+    /// subtitle track whose language matches a preference (scanned in order; see `selectSubtitleIndex`), else
+    /// leave subtitles off (the default). Uses the host-overlay path (equivalent to a `selectSubtitleTrack`
+    /// call); `startAnchor` is the
     /// load's resume position so a mid-file resume seeks the side demuxer to the playhead instead of byte 0.
     /// A no-op when the list is empty, no track matches, or the host already activated a subtitle. The resolved
     /// index is published via `activeSubtitleTrackIndex`. Independent of `prepareNativeSubtitles`. (#73)
