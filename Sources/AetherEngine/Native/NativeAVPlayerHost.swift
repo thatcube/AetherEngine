@@ -254,8 +254,8 @@ final class NativeAVPlayerHost {
                         try? await Task.sleep(nanoseconds: 2_500_000_000)
                         guard let self = self, let item = self.playerItem else { return }
                         Self.dumpAudioRoute(sid: sid, phase: "settled")
-                        Self.warnIfFLACSurroundExceedsRoute(item, sid: sid)
-                        Self.warnIfEAC3SurroundOnStereoRoute(item, sid: sid)
+                        await Self.warnIfFLACSurroundExceedsRoute(item, sid: sid)
+                        await Self.warnIfEAC3SurroundOnStereoRoute(item, sid: sid)
                     }
                 }
             }
@@ -734,15 +734,14 @@ final class NativeAVPlayerHost {
     }
 
     /// Warn when the FLAC bridge produced N-channel LPCM but the route carries fewer channels. FLAC bridge decodes to LPCM (unlike stream-copy EAC3/AC3 which tunnels encoded); Sonos Arc reports ch=2 LPCM even with eARC. Not a bridge bug -- a route capability mismatch.
-    private static func warnIfFLACSurroundExceedsRoute(_ item: AVPlayerItem, sid: Int) {
+    private static func warnIfFLACSurroundExceedsRoute(_ item: AVPlayerItem, sid: Int) async {
         #if os(iOS) || os(tvOS)
         var trackChannels: Int = 0
         var isFLAC = false
         for itemTrack in item.tracks {
             guard let assetTrack = itemTrack.assetTrack else { continue }
             guard assetTrack.mediaType == .audio else { continue }
-            guard let fmt = assetTrack.formatDescriptions.first else { continue }
-            let cm = fmt as! CMFormatDescription
+            guard let cm = try? await assetTrack.load(.formatDescriptions).first else { continue }
             let codec = fourccString(CMFormatDescriptionGetMediaSubType(cm))
             if codec.lowercased() == "flac" {
                 isFLAC = true
@@ -773,15 +772,14 @@ final class NativeAVPlayerHost {
     }
 
     /// Warn when EAC3/AC3 multichannel plays into a stereo-only HDMI route. Atmos excluded (ch=2 MAT carrier is correct for Atmos passthrough). Cause: Sonos Arc reports ch=2 LPCM after boot or HDMI handshake glitch; fix is power-cycling the sink. Not a pipeline bug (dec3 bitstream is identical across runs).
-    private static func warnIfEAC3SurroundOnStereoRoute(_ item: AVPlayerItem, sid: Int) {
+    private static func warnIfEAC3SurroundOnStereoRoute(_ item: AVPlayerItem, sid: Int) async {
         #if os(iOS) || os(tvOS)
         var trackChannels: Int = 0
         var codecID: String = ""
         for itemTrack in item.tracks {
             guard let assetTrack = itemTrack.assetTrack else { continue }
             guard assetTrack.mediaType == .audio else { continue }
-            guard let fmt = assetTrack.formatDescriptions.first else { continue }
-            let cm = fmt as! CMFormatDescription
+            guard let cm = try? await assetTrack.load(.formatDescriptions).first else { continue }
             let codec = fourccString(CMFormatDescriptionGetMediaSubType(cm))
             let lower = codec.lowercased()
             if lower == "ec-3" || lower == "ac-3" {

@@ -214,7 +214,7 @@ final class HTTPDiscIOReader: IOReader, @unchecked Sendable {
         for (k, v) in extraHeaders { req.setValue(v, forHTTPHeaderField: k) }
 
         let sem = DispatchSemaphore(value: 0)
-        var result: RangeResponse?
+        nonisolated(unsafe) var result: RangeResponse?
         let task = session.dataTask(with: req) { data, response, _ in
             if let http = response as? HTTPURLResponse {
                 result = RangeResponse(
