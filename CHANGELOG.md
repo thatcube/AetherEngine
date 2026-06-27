@@ -10,6 +10,14 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [4.6.3] — 2026-06-27
+
+### Fixed
+
+- **A remote ISO no longer recognizes the disc twice at startup (#76).** The 4.6.2 cache stopped the per-switch re-open, but the reporter still saw the disc open twice before playback began. The probe demuxer opens the source with no explicit title (`selectTitleID == nil`) and caches the recognition under that key, while the rest of the engine references that same title by its resolved id (the default resolves to title index 0, and `DiscTitle.id == index`): background reloads and the subtitle side demuxer pass the concrete id, never nil. The side demuxer's first open therefore missed the probe's cache entry and re-ran the full UDF / `.mpls` parse, the second "disc tray" open before the first cue. `DiscReader.storeRecognition` now aliases the entry under the resolved selected index when it differs from the requested id, so the nil-probe recognition is hit by the concrete-id lookup. Disc recognition runs once per session; the subtitle side demuxer still attaches its own (probe-capped) demuxer for the bitmap-subtitle stream, which is decoded out-of-band from a separate context by design, but no longer re-recognizes the disc in front of it.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.6.3))
+
 ## [4.6.2] — 2026-06-27
 
 ### Changed
