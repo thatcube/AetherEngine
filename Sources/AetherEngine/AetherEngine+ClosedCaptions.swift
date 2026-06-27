@@ -18,16 +18,24 @@ import Libavutil
 /// cues (the single buffer owns them). `makeProducer` re-threads the observer onto every restart, so it
 /// survives seek/reload/wedge with no second connection.
 ///
-/// First cut: 608 field-1 / CC1 only (see `CEA608Decoder`). Thread-confined to the pump thread for decode;
-/// `@unchecked Sendable` for the observer-closure boundary. Snapshot publication hops to the MainActor.
+/// First cut: 608 field-1 / CC1 only (see `CEA608Decoder`). Decode state is guarded by an internal lock
+/// (the restart path can briefly overlap two pumps on one tap); `@unchecked Sendable` for the
+/// observer-closure boundary. Snapshot publication hops to the MainActor.
 final class ClosedCaptionTap: @unchecked Sendable {
     private weak var engine: AetherEngine?
     let ccStreamIndex: Int32
 
+    /// Guards all decode state below. `ingest()` normally runs only on the single producer pump thread, but
+    /// the restart path abandons an old pump after a 5 s join timeout (`HLSVideoEngine.performRestart`), so an
+    /// abandoned old pump can briefly overlap the new one calling into the same tap. The lock keeps `decoder`
+    /// (not thread-safe) and the cue buffer memory-safe under that overlap, mirroring `NativeSubtitleCueStore`
+    /// (#55). Worst case during the rare overlap is a few garbled cues that self-correct on the next reset/EOC.
+    private let lock = NSLock()
+
     private let decoder = CEA608Decoder()
     private var lastPTS: Double = -1
 
-    // Pump-thread-owned cue buffer.
+    // Cue buffer, guarded by `lock`.
     private var cues: [SubtitleCue] = []
     private var openCueID: Int?
     private var nextID = 0
@@ -55,12 +63,18 @@ final class ClosedCaptionTap: @unchecked Sendable {
     }
 
     /// Drop decoder + cue-buffer state on the next ingest. Called from `seek()` so a scrub starts clean.
-    func requestReset() { resetRequested = true }
+    func requestReset() {
+        lock.lock(); resetRequested = true; lock.unlock()
+    }
 
     /// Called on the producer pump thread for each CC-stream packet.
     func ingest(_ packet: UnsafePointer<AVPacket>, timeBase tb: AVRational) {
         let triplets = CCDataParser.parseCCDataTriplets(packet: packet).filter { $0.type == 0 }
         guard !triplets.isEmpty else { return }
+
+        // Parsing above touches only the packet; everything below mutates shared decode state.
+        lock.lock()
+        defer { lock.unlock() }
 
         let raw = packet.pointee.pts != Int64.min ? packet.pointee.pts : packet.pointee.dts
         let pts: Double

@@ -1376,9 +1376,12 @@ public final class AetherEngine: ObservableObject {
         if activeEmbeddedSubtitleStreamIndex >= 0, let url = loadedURL {
             let streamIdx = activeEmbeddedSubtitleStreamIndex
             // #77: in-band CC is fed by the producer CC tap, which rides the producer across the seek.
-            // Just tell it to drop stale decoder/cue state at this discontinuity; it republishes as the
-            // re-anchored producer re-pumps. No side demuxer to re-arm.
+            // Clear the on-screen caption now so a pre-seek cue can't linger (symmetric with the side-demuxer
+            // branch below), then tell the tap to drop stale decoder/cue state at this discontinuity; it
+            // republishes as the re-anchored producer re-pumps. No side demuxer to re-arm.
             if activeSubtitleStreamIsClosedCaption(streamIdx) {
+                subtitleCues = []
+                ccCueSnapshot = []
                 closedCaptionTap?.requestReset()
             } else {
                 cancelEmbeddedSubtitleReader()
