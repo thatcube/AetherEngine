@@ -10,6 +10,14 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [4.6.1] — 2026-06-27
+
+### Fixed
+
+- **Hardened the 4.6.0 in-band CEA-608 closed-caption path (#77).** Two robustness fixes from post-merge review. (1) The `ClosedCaptionTap` decoded on the producer pump thread with no lock, on the assumption of a single pump. The restart path abandons an old pump after a 5 s join timeout (`HLSVideoEngine.performRestart`), so an abandoned pump can briefly overlap the new one calling into the same tap, racing the (not-thread-safe) `CEA608Decoder` and the cue buffer. The tap now guards its decode state with a lock, mirroring `NativeSubtitleCueStore` (#55); worst case during the rare overlap is a few garbled cues that self-correct on the next reset / EOC. (2) Seeking with closed captions active left the pre-seek caption on screen until the next caption decoded, because the CC seek path reset the tap but did not clear the mirrored cues. It now clears them immediately, symmetric with the side-demuxer subtitle path.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.6.1))
+
 ## [4.6.0] — 2026-06-27
 
 ### Added
