@@ -1500,7 +1500,49 @@ public final class AetherEngine: ObservableObject {
 
     /// Active AVPlayer on the native path, nil on SW path or when idle. Published so hosts driving an
     /// AVPlayerViewController can rebind `.player` on every audio-track reload (one-shot assignment goes stale).
-    @Published public internal(set) var currentAVPlayer: AVPlayer?
+    @Published public internal(set) var currentAVPlayer: AVPlayer? {
+        didSet { observeExternalPlayback() }
+    }
+
+    /// AirPlay (#86, DrHurt): observe the native AVPlayer's external-playback flag. While AirPlaying, the
+    /// loopback stream must be reachable by the receiver, so swap the playback URL host from 127.0.0.1 to the
+    /// device's LAN IP (the server binds all interfaces) and reload; swap back when it ends. Loopback path
+    /// only; a remote-HLS source is already reachable by the receiver, so it is left untouched.
+    private var externalPlaybackObservation: NSKeyValueObservation?
+    /// True while loadedURL's host is the LAN IP (swapped for AirPlay), so we only revert what we swapped.
+    private var loopbackUsingLANHost = false
+
+    private func observeExternalPlayback() {
+        externalPlaybackObservation?.invalidate()
+        externalPlaybackObservation = nil
+        guard let player = currentAVPlayer else { return }
+        externalPlaybackObservation = player.observe(\.isExternalPlaybackActive, options: [.new]) { [weak self] _, change in
+            let active = change.newValue ?? false
+            Task { @MainActor in self?.handleExternalPlaybackChange(active: active) }
+        }
+    }
+
+    private func handleExternalPlaybackChange(active: Bool) {
+        func swap(_ url: URL, _ host: String) -> URL? {
+            var c = URLComponents(url: url, resolvingAgainstBaseURL: false)
+            c?.host = host
+            return c?.url
+        }
+        if active {
+            guard !loopbackUsingLANHost, let url = loadedURL, url.host == "127.0.0.1",
+                  let lanIP = HLSLocalServer.localWiFiIPAddress(), let lanURL = swap(url, lanIP) else { return }
+            EngineLog.emit("[AirPlay] external playback active -> reload via LAN host \(lanIP)", category: .engine)
+            loadedURL = lanURL
+            loopbackUsingLANHost = true
+            Task { try? await reloadAtCurrentPosition() }
+        } else {
+            guard loopbackUsingLANHost, let url = loadedURL, let backURL = swap(url, "127.0.0.1") else { return }
+            EngineLog.emit("[AirPlay] external playback ended -> reload via loopback", category: .engine)
+            loadedURL = backURL
+            loopbackUsingLANHost = false
+            Task { try? await reloadAtCurrentPosition() }
+        }
+    }
 
     #if os(tvOS) || os(iOS)
     /// MPNowPlayingSession for the active AVPlayer audio path, or nil. The host registers transport commands

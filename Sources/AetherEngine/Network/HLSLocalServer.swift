@@ -137,6 +137,27 @@ final class HLSLocalServer: @unchecked Sendable {
         return URL(string: "http://127.0.0.1:\(port)/media.m3u8")
     }
 
+    /// The device's WiFi (en0) IPv4 address for the AirPlay LAN-host swap (#86). nil if en0 has no IPv4
+    /// (no WiFi / Ethernet-only) so the caller keeps 127.0.0.1. en0 is WiFi on Apple devices; per DrHurt's
+    /// caveat we use the physical IP only while AirPlaying, loopback otherwise.
+    static func localWiFiIPAddress() -> String? {
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }
+        defer { freeifaddrs(ifaddr) }
+        for ptr in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let flags = Int32(ptr.pointee.ifa_flags)
+            guard (flags & (IFF_UP | IFF_RUNNING | IFF_LOOPBACK)) == (IFF_UP | IFF_RUNNING),
+                  let sa = ptr.pointee.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET),
+                  String(cString: ptr.pointee.ifa_name) == "en0" else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            if getnameinfo(sa, socklen_t(sa.pointee.sa_len), &host, socklen_t(host.count),
+                           nil, 0, NI_NUMERICHOST) == 0 {
+                return String(cString: host)
+            }
+        }
+        return nil
+    }
+
     /// Number of segments currently published.
     var segmentCount: Int {
         provider?.segmentCount ?? 0
@@ -241,7 +262,10 @@ final class HLSLocalServer: @unchecked Sendable {
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = 0 // kernel picks ephemeral
-        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        // Bind all interfaces (not just loopback) so an AirPlay receiver can reach the stream over the LAN
+        // via the device's WiFi IP (#86, DrHurt). Local playback still uses 127.0.0.1; the URL host is only
+        // swapped to the LAN IP while external playback is active. Ephemeral port, serves the current stream only.
+        addr.sin_addr.s_addr = inet_addr("0.0.0.0")
 
         let bindResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
