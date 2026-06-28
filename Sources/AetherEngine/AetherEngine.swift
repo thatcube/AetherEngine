@@ -158,6 +158,22 @@ public final class AetherEngine: ObservableObject {
     /// Exposed for diagnostic overlays; hosts should not branch on it.
     @Published public internal(set) var playbackBackend: PlaybackBackend = .none
 
+    /// iOS: master enable for background playback (PiP + background audio). Default on; no user setting yet.
+    public var backgroundPlaybackEnabled = true
+    /// iOS: set by the host from the AVKit PiP delegate; the keepalive policy + pause-safety read it.
+    public var pictureInPictureActive = false
+    #if os(iOS)
+    /// True between didEnterBackground and didBecomeActive; gates the pause-while-backgrounded teardown.
+    private var isBackgrounded = false
+    #endif
+
+    /// Wedge-safe keepalive decision: keep the video pipeline alive on background ONLY while the app stays
+    /// genuinely running (PiP active, or actively playing for background audio), never across an idle
+    /// suspension. Pure so the policy is unit-tested without the lifecycle. See setupLifecycleObservers.
+    nonisolated static func shouldKeepVideoAlive(enabled: Bool, pipActive: Bool, state: PlaybackState) -> Bool {
+        enabled && (pipActive || state == .playing)
+    }
+
     /// 1 Hz diagnostics sampler. Separate ObservableObject for the same reason as `clock`: per-sample
     /// objectWillChange would re-render every engine-observing view (AetherEngine#29 follow-up).
     /// Observe only in stats overlays.
@@ -1200,6 +1216,13 @@ public final class AetherEngine: ObservableObject {
         if state == .playing {
             state = .paused
         }
+        #if os(iOS)
+        // Paused while backgrounded with no PiP: the app will idle-suspend, so release the video pipeline
+        // now (wedge-safe, mirrors the unconditional background teardown). Audio backends are already spared.
+        if isBackgrounded && !pictureInPictureActive && !audioAVPlayerActive && audioHost == nil {
+            Task { @MainActor in await self.teardownVideoForBackground() }
+        }
+        #endif
     }
 
     public func togglePlayPause() {
@@ -1837,12 +1860,32 @@ public final class AetherEngine: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor in
                 guard let self = self else { return }
+                #if os(iOS)
+                self.isBackgrounded = true
+                #endif
                 if self.audioAVPlayerActive || self.audioHost != nil { return }
+                #if os(iOS)
+                // Keep the video pipeline alive for PiP / background audio while the app stays running.
+                // Wedge-safe: a pause while backgrounded tears down via pause() below, so nothing crosses
+                // an idle suspension. tvOS keeps the unconditional teardown.
+                if Self.shouldKeepVideoAlive(enabled: self.backgroundPlaybackEnabled,
+                                             pipActive: self.pictureInPictureActive,
+                                             state: self.state) { return }
+                #endif
                 guard self.state == .playing || self.state == .paused else { return }
                 await self.teardownVideoForBackground()
             }
         }
         lifecycleObservers.append(bgObserver)
+        #if os(iOS)
+        let fgObserver = nc.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.isBackgrounded = false }
+        }
+        lifecycleObservers.append(fgObserver)
+        #endif
         #endif
     }
 
