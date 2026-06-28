@@ -310,7 +310,9 @@ extension AetherEngine {
             session.nativeSubtitleLanguagesForSession = languages
             session.producer?.subtitleCueStores = stores
             session.producer?.nativeSubtitleLanguages = languages
-            startNativeSubtitleReaders(url: url, stores: stores)
+            // #15: defer the readers; start them only when a native track is selected (PiP). The mov_text
+            // track is already declared above so AVKit can offer it; until selection the samples are empty.
+            nativeSubtitleReaderParams = (url: url, stores: stores)
         }
 
         // Reuse the existing host across native->native reloads (issue #15): a fresh AVPlayer breaks AVKit's MediaRemote re-registration ("Code=14 client callback"), blanking the Control Center widget. stopInternal kept the host alive (keepNativeHost).

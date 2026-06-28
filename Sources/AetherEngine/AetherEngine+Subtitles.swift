@@ -899,6 +899,14 @@ extension AetherEngine {
 
     /// Select or deselect the native mov_text track by ordinal (#55). nil deselects all. Matches by `extendedLanguageTag` first (language-rank-aware for same-language duplicates), falls back to positional index. No-op when no legible group or ordinal out of range.
     public func setNativeSubtitleSelected(track ordinal: Int?) {
+        // #15: lazy readers — run the side-demuxer only while a native track is selected (PiP), idle otherwise.
+        if ordinal != nil {
+            if nativeSubtitleReadersTask == nil, let params = nativeSubtitleReaderParams {
+                startNativeSubtitleReaders(url: params.url, stores: params.stores)
+            }
+        } else {
+            cancelNativeSubtitleReaders()
+        }
         guard let item = currentAVPlayer?.currentItem else { return }
         // Capture track list; avoid capturing self to keep MainActor re-entrancy to one hop.
         let tracks = nativeSubtitleTracks
@@ -926,5 +934,19 @@ extension AetherEngine {
             guard let option = selected else { return }
             item.select(option, in: group)
         }
+    }
+
+    /// #15: select the native mov_text track matching the currently-active subtitle so AVKit renders it inside
+    /// the PiP window; nil deselects when PiP ends. Maps the active subtitle's source stream to the native
+    /// ordinal. No-op (no PiP subtitle) when the active subtitle has no native text equivalent: a bitmap
+    /// (PGS/DVB), CEA-608/708, or a sidecar track (sourceStreamIndex nil).
+    public func setNativeSubtitleForPiP(_ active: Bool) {
+        guard active, let activeIdx = activeSubtitleTrackIndex,
+              let ordinal = nativeSubtitleTrackTable.firstIndex(where: { $0.sourceStreamIndex == activeIdx })
+        else {
+            setNativeSubtitleSelected(track: nil)
+            return
+        }
+        setNativeSubtitleSelected(track: ordinal)
     }
 }

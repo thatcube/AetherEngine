@@ -550,6 +550,11 @@ public final class AetherEngine: ObservableObject {
     /// (mirrors activeSubtitleSideDemuxer).
     var nativeSubtitleReadersDemuxer: Demuxer?
 
+    /// Lazy-start params for the native subtitle readers (#15): captured at load when prepareNativeSubtitles
+    /// declared the mov_text track, but the readers only start on the first setNativeSubtitleSelected (PiP),
+    /// so a session that never selects a native track pays no standing side-demuxer cost. Cleared on stop/clear.
+    var nativeSubtitleReaderParams: (url: URL, stores: [NativeSubtitleCueStore])?
+
     /// Per-session subtitle event log counter. Caps diagnostic output; reset on each load.
     var subtitleCueDiagnosticCount: Int = 0
 
@@ -775,6 +780,7 @@ public final class AetherEngine: ObservableObject {
         subtitleTracks = []
         nativeSubtitleTrackTable = []
         nativeSubtitleTracks = []
+        nativeSubtitleReaderParams = nil
         metadata = nil
         fontAttachments = []
         discTitles = []
@@ -1854,6 +1860,7 @@ public final class AetherEngine: ObservableObject {
         isLoadingSubtitles = false
         nativeSubtitleTrackTable = []
         nativeSubtitleTracks = []
+        nativeSubtitleReaderParams = nil
         cancelNativeSubtitleReaders()
         nativeSubtitleRenditionAvailable = false
         cancelSidecarTask(channel: .secondary)
