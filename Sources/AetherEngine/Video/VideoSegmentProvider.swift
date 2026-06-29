@@ -530,12 +530,17 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 
     // MARK: - Native subtitle renditions (#15)
 
-    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String)] {
+    /// #15: ordinal AVKit should treat as the DEFAULT/AUTOSELECT subtitle rendition (DEFAULT=YES in the master),
+    /// so AVPlayerViewController selects + keeps it through its own pipeline instead of disabling a non-default
+    /// programmatic selection. Set from the host's from-load choice; nil = no default (all DEFAULT=NO).
+    var defaultNativeSubtitleOrdinal: Int? = nil
+
+    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isDefault: Bool)] {
         guard !nativeSubStores.isEmpty else { return [] }
         return nativeSubStores.indices.map { i in
             let lang = i < nativeSubLanguages.count ? nativeSubLanguages[i] : nil
             let name = lang.flatMap { Locale.current.localizedString(forIdentifier: $0) } ?? "Subtitle \(i + 1)"
-            return (ordinal: i, language: lang, name: name)
+            return (ordinal: i, language: lang, name: name, isDefault: i == defaultNativeSubtitleOrdinal)
         }
     }
 

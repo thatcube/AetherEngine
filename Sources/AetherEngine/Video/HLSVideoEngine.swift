@@ -105,6 +105,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// nil entry = no language box for that track.
     var nativeSubtitleLanguagesForSession: [String?] = []
 
+    /// #15: the native subtitle ordinal to mark DEFAULT=YES/AUTOSELECT=YES in the master (the host's from-load
+    /// choice), so AVKit selects + keeps it natively. Must be set before start() so the master reflects it.
+    var nativeSubtitleDefaultOrdinalForSession: Int? = nil
+
     /// #77: in-band CC stream index + observer, re-threaded onto every producer so the tap survives
     /// seek/reload/wedge. Set before start(). -1 / nil = no CC tap.
     var closedCaptionStreamIndexForSession: Int32 = -1
@@ -903,6 +907,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             nativeSubtitleStores: nativeSubtitleCueStoresForSession,
             nativeSubtitleLanguages: nativeSubtitleLanguagesForSession
         )
+        prov.defaultNativeSubtitleOrdinal = nativeSubtitleDefaultOrdinalForSession
         self.provider = prov
         if isLiveSession {
             prod.onLiveSegmentFinalized = { [weak prov] index, durationSeconds, startPtsSeconds, discontinuous in

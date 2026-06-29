@@ -285,6 +285,14 @@ extension AetherEngine {
         if session.enableNativeSubtitleTrackForSession, !nativeSubtitleTrackTable.isEmpty {
             session.nativeSubtitleCueStoresForSession = nativeSubtitleTrackTable.map { _ in NativeSubtitleCueStore() }
             session.nativeSubtitleLanguagesForSession = nativeSubtitleTrackTable.map { $0.language }
+            // #15: mark the host's from-load choice as the DEFAULT/AUTOSELECT subtitle rendition in the master
+            // (must be set before start()), so AVKit selects + keeps it through its own pipeline. Map the source
+            // stream index to the native ordinal.
+            if let fromLoadIdx = loadedOptions.nativeSubtitleFromLoadStreamIndex {
+                session.nativeSubtitleDefaultOrdinalForSession = nativeSubtitleTrackTable.firstIndex {
+                    $0.sourceStreamIndex == fromLoadIdx
+                }
+            }
         }
 
         // session.start() opens its own Demuxer + prewarm seek (~1-3 s on slow CDN); detach so @MainActor doesn't block.
@@ -317,6 +325,13 @@ extension AetherEngine {
                 let shift = session.playlistShiftSeconds
                 stores.forEach { $0.setShiftSeconds(shift) }
                 nativeSubtitleReaderParams = (url: url, stores: stores)
+                // #15: with a DEFAULT=YES rendition, AVKit auto-fetches it right after the item loads, so the
+                // cue stores must already be filling -- start the readers EAGERLY here (before host.load) instead
+                // of lazily on host selection, or AVKit caches the first (empty) .vtt and shows nothing.
+                if session.nativeSubtitleDefaultOrdinalForSession != nil {
+                    persistentNativeSubtitleOrdinal = session.nativeSubtitleDefaultOrdinalForSession
+                    startNativeSubtitleReaders(url: url, stores: stores)
+                }
             }
         }
 

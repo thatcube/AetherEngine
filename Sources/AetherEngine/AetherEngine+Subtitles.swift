@@ -990,10 +990,6 @@ extension AetherEngine {
         EngineLog.emit("[PiPDiag] setPersistent idx=\(idx.map(String.init) ?? "nil") -> ordinal=\(ordinal.map(String.init) ?? "nil") table=\(nativeSubtitleTrackTable.count) reachable=\(nativeSubtitleRenditionReachable) hasItem=\(currentAVPlayer?.currentItem != nil)", category: .engine)
         guard ordinal != nil else {
             cancelNativeSubtitleReaders()
-            // Clear the legible criteria (else AVKit keeps re-preferring the old language) and deselect.
-            currentAVPlayer?.setMediaSelectionCriteria(
-                AVPlayerMediaSelectionCriteria(preferredLanguages: [], preferredMediaCharacteristics: nil),
-                forMediaCharacteristic: .legible)
             guard let item = currentAVPlayer?.currentItem else { return }
             Task { @MainActor in
                 guard let group = try? await item.asset.loadMediaSelectionGroup(for: .legible) else { return }
@@ -1051,20 +1047,18 @@ extension AetherEngine {
                     try? await Task.sleep(nanoseconds: 100_000_000)
                 }
             }
-            // Work WITH AVKit instead of against it. AVPlayerViewController's media-selection management
-            // (AVSmartSubtitlesController) actively reconciles/disables an explicitly-selected legible track
-            // when nothing is preferred (renditions are DEFAULT=NO/AUTOSELECT=NO) -- the cause of the flaky
-            // "needs toggling" + "disappears after ~2 s" behaviour. Setting a media-selection CRITERIA that
-            // prefers this legible language makes AVKit's own reconciliation KEEP it selected (and render it
-            // through its pipeline) instead of disabling it. The explicit select aligns the initial choice.
+            // Work WITH AVKit: the chosen rendition is DEFAULT=YES,AUTOSELECT=YES in the master, so AVKit's own
+            // media-selection picks + keeps it. Reaffirm via a legible criteria preferring its language + an
+            // explicit select, with automatic criteria ON so AVKit maintains it (instead of disabling a manual
+            // selection). Replaces the old criteria=false + deselect/reselect re-assert that AVKit kept undoing.
             if let lang = option.extendedLanguageTag {
-                let criteria = AVPlayerMediaSelectionCriteria(preferredLanguages: [lang],
-                                                              preferredMediaCharacteristics: nil)
-                currentAVPlayer?.setMediaSelectionCriteria(criteria, forMediaCharacteristic: .legible)
+                currentAVPlayer?.setMediaSelectionCriteria(
+                    AVPlayerMediaSelectionCriteria(preferredLanguages: [lang], preferredMediaCharacteristics: nil),
+                    forMediaCharacteristic: .legible)
             }
             currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically = true
             item.select(option, in: group)
-            EngineLog.emit("[PiPDiag] applyPersistent SELECTED (criteria) ordinal=\(ordinal) lang=\(option.extendedLanguageTag ?? "?")", category: .engine)
+            EngineLog.emit("[PiPDiag] applyPersistent SELECTED (default+criteria) ordinal=\(ordinal) lang=\(option.extendedLanguageTag ?? "?")", category: .engine)
         }
     }
 }

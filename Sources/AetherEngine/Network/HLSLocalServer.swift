@@ -53,7 +53,7 @@ protocol HLSSegmentProvider: AnyObject {
 
     /// Native subtitle renditions (#15): one per text track, for the master EXT-X-MEDIA:TYPE=SUBTITLES tags
     /// and the /subs_{N} endpoints. Empty unless prepareNativeSubtitles is on and the cue stores are threaded.
-    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String)] { get }
+    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isDefault: Bool)] { get }
     /// WebVTT body for one subtitle SEGMENT (#15): cues whose window overlaps video segment `segmentIndex` of
     /// `ordinal`. nil if either index is out of range. The subtitle media playlist mirrors the video media
     /// playlist one segment per video segment, so the embedded reader (parked ~90s ahead of the playhead)
@@ -88,7 +88,7 @@ extension HLSSegmentProvider {
     var masterAverageBandwidth: Int? { nil }
     var masterHDCPLevel: String? { nil }
     var masterClosedCaptions: String? { nil }
-    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String)] { [] }
+    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isDefault: Bool)] { [] }
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String? { nil }
     var liveTargetSegmentDuration: Double? { nil }
     var liveBlockingReloadEnabled: Bool { true }
@@ -917,13 +917,16 @@ final class HLSLocalServer: @unchecked Sendable {
             streamInfAttrs.append("CLOSED-CAPTIONS=\(cc)")
         }
         // #15: native WebVTT subtitle renditions (separate from the A/V variant; in-band timed text is
-        // non-conformant for HLS). DEFAULT/AUTOSELECT=NO so the host overlay stays in fullscreen and the
-        // native track is selected only in PiP. Orthogonal to the video VIDEO-RANGE/CODECS attributes.
+        // non-conformant for HLS). The host's chosen track is marked DEFAULT=YES,AUTOSELECT=YES so AVKit's own
+        // media-selection (AVSmartSubtitlesController) treats it as the PRIMARY subtitle and keeps it selected,
+        // instead of disabling a non-default programmatic selection (the cause of the flaky / disappearing subs).
+        // The rest stay DEFAULT=NO,AUTOSELECT=NO. Orthogonal to the video VIDEO-RANGE/CODECS attributes.
         let subRenditions = provider.nativeSubtitleRenditions
         for r in subRenditions {
             var mediaAttrs = ["TYPE=SUBTITLES", "GROUP-ID=\"subs\"", "NAME=\"\(r.name)\""]
             if let lang = r.language { mediaAttrs.append("LANGUAGE=\"\(lang)\"") }
-            mediaAttrs.append(contentsOf: ["DEFAULT=NO", "AUTOSELECT=NO", "URI=\"subs_\(r.ordinal).m3u8\""])
+            let defaultFlag = r.isDefault ? "YES" : "NO"
+            mediaAttrs.append(contentsOf: ["DEFAULT=\(defaultFlag)", "AUTOSELECT=\(defaultFlag)", "URI=\"subs_\(r.ordinal).m3u8\""])
             lines.append("#EXT-X-MEDIA:\(mediaAttrs.joined(separator: ","))")
         }
         if !subRenditions.isEmpty {
