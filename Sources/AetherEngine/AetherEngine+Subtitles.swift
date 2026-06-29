@@ -1049,9 +1049,13 @@ extension AetherEngine {
                     try? await Task.sleep(nanoseconds: 100_000_000)
                 }
             }
-            // SINGLE select (from-load): the renderer attaches to this selection at first establishment.
+            // Re-assert (deselect -> runloop hop -> reselect): AVKit overrides/does-not-render an explicit
+            // legible selection made programmatically unless re-asserted (the fix/pip-subs-reassert finding).
+            // A single select alone was observed to render NOWHERE (not even after a PiP round-trip).
+            item.select(nil, in: group)
+            try? await Task.sleep(nanoseconds: 100_000_000)
             item.select(option, in: group)
-            EngineLog.emit("[PiPDiag] applyPersistent SELECTED ordinal=\(ordinal) lang=\(option.extendedLanguageTag ?? "?")", category: .engine)
+            EngineLog.emit("[PiPDiag] applyPersistent SELECTED (re-assert) ordinal=\(ordinal) lang=\(option.extendedLanguageTag ?? "?")", category: .engine)
         }
     }
 }
