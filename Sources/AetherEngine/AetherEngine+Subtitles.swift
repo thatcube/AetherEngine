@@ -1047,18 +1047,14 @@ extension AetherEngine {
                     try? await Task.sleep(nanoseconds: 100_000_000)
                 }
             }
-            // Work WITH AVKit: the chosen rendition is DEFAULT=YES,AUTOSELECT=YES in the master, so AVKit's own
-            // media-selection picks + keeps it. Reaffirm via a legible criteria preferring its language + an
-            // explicit select, with automatic criteria ON so AVKit maintains it (instead of disabling a manual
-            // selection). Replaces the old criteria=false + deselect/reselect re-assert that AVKit kept undoing.
-            if let lang = option.extendedLanguageTag {
-                currentAVPlayer?.setMediaSelectionCriteria(
-                    AVPlayerMediaSelectionCriteria(preferredLanguages: [lang], preferredMediaCharacteristics: nil),
-                    forMediaCharacteristic: .legible)
-            }
-            currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically = true
+            // Re-assert (deselect -> runloop hop -> reselect): the ONLY mechanism observed to make AVKit's
+            // legible renderer attach to the loopback rendition (criteria-auto and DEFAULT=YES rendered
+            // nothing). Pin manual criteria so AVKit uses the explicit selection.
+            currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically = false
+            item.select(nil, in: group)
+            try? await Task.sleep(nanoseconds: 100_000_000)
             item.select(option, in: group)
-            EngineLog.emit("[PiPDiag] applyPersistent SELECTED (default+criteria) ordinal=\(ordinal) lang=\(option.extendedLanguageTag ?? "?")", category: .engine)
+            EngineLog.emit("[PiPDiag] applyPersistent SELECTED (re-assert) ordinal=\(ordinal) lang=\(option.extendedLanguageTag ?? "?")", category: .engine)
         }
     }
 }
