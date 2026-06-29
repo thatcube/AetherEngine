@@ -949,6 +949,12 @@ extension AetherEngine {
                     try? await Task.sleep(nanoseconds: 100_000_000)
                 }
             }
+            // #15: AVKit attaches the legible renderer to whatever selection is active when the rendering
+            // pipeline is established; a selection made mid-playback updates state + downloads cues but is not
+            // drawn until re-asserted. Deselect, hop one runloop, then reselect to force the renderer to attach
+            // (documented workaround; the same effect a PiP round-trip had). Needs the manual-criteria pin above.
+            item.select(nil, in: group)
+            try? await Task.sleep(nanoseconds: 100_000_000)
             item.select(option, in: group)
         }
     }
