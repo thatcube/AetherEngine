@@ -174,6 +174,27 @@ public final class AetherEngine: ObservableObject {
         enabled && (pipActive || state == .playing)
     }
 
+    /// What to do with the active video pipeline when the app enters the background. Pure so the lifecycle
+    /// policy is unit-testable. Mirrors the spirit of the native keepalive onto the software path.
+    enum BackgroundAction: Equatable {
+        case doNothing               // audio backend, or native keepalive: leave the running session alone
+        case enterSoftwareAudioOnly  // SW host kept alive: drop video in the demux loop, keep feeding audio
+        case teardownVideo           // release the video pipeline before idle suspension
+    }
+
+    /// - keepVideoAlive: result of shouldKeepVideoAlive. Pass false on tvOS (the wedge-safe unconditional teardown).
+    nonisolated static func backgroundAction(
+        isAudioBackend: Bool,
+        hasSoftwareHost: Bool,
+        keepVideoAlive: Bool,
+        state: PlaybackState
+    ) -> BackgroundAction {
+        if isAudioBackend { return .doNothing }
+        if keepVideoAlive { return hasSoftwareHost ? .enterSoftwareAudioOnly : .doNothing }
+        guard state == .playing || state == .paused else { return .doNothing }
+        return .teardownVideo
+    }
+
     /// 1 Hz diagnostics sampler. Separate ObservableObject for the same reason as `clock`: per-sample
     /// objectWillChange would re-render every engine-observing view (AetherEngine#29 follow-up).
     /// Observe only in stats overlays.
