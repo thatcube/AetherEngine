@@ -589,6 +589,25 @@ final class HLSLocalServer: @unchecked Sendable {
                            data: Data(body.utf8),
                            contentType: "application/vnd.apple.mpegurl")
 
+        case let p where p.hasPrefix("/subs_") && p.hasSuffix(".m3u8"):
+            // #15: VOD subtitle media playlist for the native WebVTT rendition.
+            let ordinal = Self.parseSubsOrdinal(p)
+            let dur = provider?.nativeSubtitleProgramDuration(ordinal: ordinal) ?? 1.0
+            let subBody = Self.buildSubtitleMediaPlaylistText(ordinal: ordinal, programDuration: dur)
+            return send200(fd: fd, path: normalizedPath,
+                           data: Data(subBody.utf8),
+                           contentType: "application/vnd.apple.mpegurl")
+
+        case let p where p.hasPrefix("/subs_") && p.hasSuffix(".vtt"):
+            // #15: WebVTT body generated on demand from the cue store for this ordinal.
+            let ordinal = Self.parseSubsOrdinal(p)
+            guard let vtt = provider?.nativeSubtitleVTT(ordinal: ordinal) else {
+                return send404(fd: fd, path: normalizedPath, reason: "no subtitle ordinal \(ordinal)")
+            }
+            return send200(fd: fd, path: normalizedPath,
+                           data: Data(vtt.utf8),
+                           contentType: "text/vtt")
+
         case "/init.mp4":
             let data = provider?.initSegment() ?? Data()
             if data.isEmpty {
@@ -896,6 +915,29 @@ final class HLSLocalServer: @unchecked Sendable {
         lines.append("#EXT-X-STREAM-INF:\(streamInfAttrs.joined(separator: ","))")
         lines.append("media.m3u8")
         return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// VOD subtitle media playlist (#15): one WebVTT segment covering the whole program. The cue store is
+    /// filled lazily on selection, so the .vtt is generated on demand when AVPlayer fetches it.
+    static func buildSubtitleMediaPlaylistText(ordinal: Int, programDuration: Double) -> String {
+        let dur = max(1.0, programDuration)
+        return """
+        #EXTM3U
+        #EXT-X-VERSION:7
+        #EXT-X-TARGETDURATION:\(Int(ceil(dur)))
+        #EXT-X-PLAYLIST-TYPE:VOD
+        #EXTINF:\(String(format: "%.3f", dur)),
+        subs_\(ordinal).vtt
+        #EXT-X-ENDLIST
+
+        """
+    }
+
+    /// Parse the ordinal from "/subs_{N}.m3u8" or "/subs_{N}.vtt" (defaults to 0). #15.
+    static func parseSubsOrdinal(_ path: String) -> Int {
+        let name = path.hasPrefix("/") ? String(path.dropFirst()) : path
+        let body = name.hasPrefix("subs_") ? String(name.dropFirst("subs_".count)) : name
+        return Int(body.prefix { $0.isNumber }) ?? 0
     }
 
     static func buildMediaPlaylistText(provider: HLSSegmentProvider,
