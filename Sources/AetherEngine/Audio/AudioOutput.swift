@@ -109,6 +109,13 @@ final class AudioOutput: @unchecked Sendable {
         return t.isFinite ? t : 0
     }
 
+    /// Whether the audio renderer can accept more samples. The combined demux loop normally paces on the
+    /// video renderer; in background-audio-only mode (video dropped) it paces on this instead, so it does
+    /// not buffer the rest of the file unbounded.
+    var isReadyForMoreMediaData: Bool {
+        renderer.isReadyForMoreMediaData
+    }
+
     /// Flush the audio renderer (call on seek).
     func flush() {
         lock.lock()

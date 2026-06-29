@@ -220,6 +220,20 @@ final class SoftwarePlaybackHost {
         }
     }
 
+    /// Set by the engine on background-enter (iOS keepalive) and cleared on foreground. While true the
+    /// combined demux loop drops video packets and paces on the audio renderer, so audio keeps playing in
+    /// the background. The setter broadcasts the demux condition so a parked loop re-evaluates immediately.
+    nonisolated(unsafe) private var _backgroundAudioOnly = false
+    nonisolated var backgroundAudioOnly: Bool {
+        get { flagsLock.lock(); defer { flagsLock.unlock() }; return _backgroundAudioOnly }
+        set {
+            flagsLock.lock(); _backgroundAudioOnly = newValue; flagsLock.unlock()
+            demuxCondition.lock()
+            demuxCondition.broadcast()
+            demuxCondition.unlock()
+        }
+    }
+
     // MARK: - Init
 
     init() {
@@ -389,6 +403,22 @@ final class SoftwarePlaybackHost {
         pausedByHost = true
         rate = 0
         isPlaying = false
+    }
+
+    /// Background-enter (iOS keepalive): keep audio flowing, stop feeding video. The demux loop reads the flag.
+    func enterBackgroundAudioOnly() {
+        backgroundAudioOnly = true
+    }
+
+    /// Foreground return: resume video. Flush the video decoder + renderer (NOT audio) so video resyncs at the
+    /// next keyframe; the synchronizer is already at the audio time, so the keyframe presents promptly. Order
+    /// matters: while backgroundAudioOnly is still true the loop drops video and never touches videoDecoder /
+    /// renderer, so flushing here from the main actor cannot race the demux queue. Clear the flag last.
+    func exitBackgroundAudioOnly() {
+        guard backgroundAudioOnly else { return }
+        videoDecoder.flush()
+        renderer.flush()
+        backgroundAudioOnly = false
     }
 
     func setRate(_ newRate: Float) {
@@ -602,6 +632,9 @@ final class SoftwarePlaybackHost {
         let getSeekGeneration: @Sendable () -> UInt64 = { [weak self] in
             self?.seekGeneration ?? 0
         }
+        let getBackgroundAudioOnly: @Sendable () -> Bool = { [weak self] in
+            self?.backgroundAudioOnly ?? false
+        }
 
         if liveSession, let ring {
             let readCursor: @Sendable () -> Int = { [weak self] in
@@ -683,6 +716,7 @@ final class SoftwarePlaybackHost {
                 clockArmed: getClockArmed,
                 markClockArmed: setClockArmed,
                 seekGeneration: getSeekGeneration,
+                backgroundAudioOnly: getBackgroundAudioOnly,
                 onError: onError,
                 onEnd: onEnd
             )
@@ -963,6 +997,7 @@ final class SoftwarePlaybackHost {
         clockArmed: @Sendable () -> Bool,
         markClockArmed: @Sendable () -> Void,
         seekGeneration: @Sendable () -> UInt64,
+        backgroundAudioOnly: @Sendable () -> Bool,
         onError: @Sendable (String) -> Void,
         onEnd: @Sendable () -> Void
     ) {
@@ -1089,8 +1124,14 @@ final class SoftwarePlaybackHost {
             }
 
             if streamIdx == videoStreamIndex {
+                // Background audio-only: drop video, don't gate on the non-draining display layer.
+                if backgroundAudioOnly() {
+                    av_packet_unref(packet)
+                    av_packet_free_safe(packet)
+                    continue
+                }
                 // Back-pressure via SampleBufferRenderer.isReadyForMoreMediaData (not the deprecated layer property). Park on condition while paused to avoid 200 Hz CPU spin.
-                while !renderer.isReadyForMoreMediaData && !stopRequested() {
+                while !renderer.isReadyForMoreMediaData && !stopRequested() && !backgroundAudioOnly() {
                     if !isPlaying() {
                         condition.lock()
                         while !isPlaying() && !stopRequested() {
@@ -1100,6 +1141,12 @@ final class SoftwarePlaybackHost {
                     } else {
                         Thread.sleep(forTimeInterval: 0.005)
                     }
+                }
+                // Entered background while parked on back-pressure: drop this frame.
+                if backgroundAudioOnly() {
+                    av_packet_unref(packet)
+                    av_packet_free_safe(packet)
+                    continue
                 }
                 if stopRequested() {
                     av_packet_unref(packet)
@@ -1120,6 +1167,26 @@ final class SoftwarePlaybackHost {
                     markClockArmed()
                 }
             } else if streamIdx == audioStreamIndex, let aDec = audioDecoder, let aOut = audioOutput {
+                // Background audio-only: the video gate is bypassed, so pace on the audio renderer to avoid
+                // buffering the rest of the file. Park on condition while paused (same shape as the video gate).
+                if backgroundAudioOnly() {
+                    while !aOut.isReadyForMoreMediaData && !stopRequested() && backgroundAudioOnly() {
+                        if !isPlaying() {
+                            condition.lock()
+                            while !isPlaying() && !stopRequested() {
+                                _ = condition.wait(until: Date(timeIntervalSinceNow: 0.5))
+                            }
+                            condition.unlock()
+                        } else {
+                            Thread.sleep(forTimeInterval: 0.005)
+                        }
+                    }
+                    if stopRequested() {
+                        av_packet_unref(packet)
+                        av_packet_free_safe(packet)
+                        break
+                    }
+                }
                 audioPacketsSeen += 1
                 let buffers = aDec.decode(packet: packet)
                 if !buffers.isEmpty { audioBuffersProduced = true }

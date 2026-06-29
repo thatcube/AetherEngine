@@ -26,4 +26,31 @@ struct BackgroundKeepaliveTests {
     func teardownWhenDisabled() {
         #expect(AetherEngine.shouldKeepVideoAlive(enabled: false, pipActive: true, state: .playing) == false)
     }
+
+    @Test("audio backend is always spared")
+    func audioBackendSpared() {
+        #expect(AetherEngine.backgroundAction(isAudioBackend: true, hasSoftwareHost: false, keepVideoAlive: false, state: .playing) == .doNothing)
+        #expect(AetherEngine.backgroundAction(isAudioBackend: true, hasSoftwareHost: true, keepVideoAlive: true, state: .playing) == .doNothing)
+    }
+
+    @Test("native keepalive leaves the session alone")
+    func nativeKeepaliveLeavesAlone() {
+        #expect(AetherEngine.backgroundAction(isAudioBackend: false, hasSoftwareHost: false, keepVideoAlive: true, state: .playing) == .doNothing)
+    }
+
+    @Test("software host kept alive enters audio-only")
+    func softwareEntersAudioOnly() {
+        #expect(AetherEngine.backgroundAction(isAudioBackend: false, hasSoftwareHost: true, keepVideoAlive: true, state: .playing) == .enterSoftwareAudioOnly)
+    }
+
+    @Test("teardown video when not kept alive and playing or paused")
+    func teardownWhenNotKeptAlive() {
+        #expect(AetherEngine.backgroundAction(isAudioBackend: false, hasSoftwareHost: false, keepVideoAlive: false, state: .playing) == .teardownVideo)
+        #expect(AetherEngine.backgroundAction(isAudioBackend: false, hasSoftwareHost: true, keepVideoAlive: false, state: .paused) == .teardownVideo)
+    }
+
+    @Test("do nothing when idle or loading (nothing to tear down)")
+    func doNothingWhenNotPlayable() {
+        #expect(AetherEngine.backgroundAction(isAudioBackend: false, hasSoftwareHost: false, keepVideoAlive: false, state: .loading) == .doNothing)
+    }
 }

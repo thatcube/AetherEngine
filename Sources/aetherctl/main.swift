@@ -240,6 +240,21 @@ if first == "seektest" {
     exit(runSeekTest(url: parseSourceURL(urlArg), seeks: seeks, gapMs: gapMs, settleSeconds: settle))
 }
 
+// SW-path background-audio keepalive harness (iOS background audio on the software decode path).
+if first == "bgaudio" {
+    var rest = Array(args.dropFirst(2))
+    let fg = takeDoubleFlag("--fg", from: &rest) ?? 3.0
+    let bg = takeDoubleFlag("--bg", from: &rest) ?? 6.0
+    guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
+        print("ERROR: bgaudio requires a <url> argument")
+        print("Usage: aetherctl bgaudio [--fg N] [--bg N] <url>")
+        exit(64)
+    }
+    rest.removeAll { $0 == urlArg }
+    rejectStrayFlags(rest, subcommand: "bgaudio")
+    exit(runBackgroundAudio(url: parseSourceURL(urlArg), fgSeconds: fg, bgSeconds: bg))
+}
+
 if first == "smbtest" {
     var rest = Array(args.dropFirst(2))
     let reads = takeIntFlag("--reads", from: &rest) ?? 64
