@@ -595,6 +595,7 @@ final class HLSLocalServer: @unchecked Sendable {
                 return send404(fd: fd, path: normalizedPath, reason: "unparseable subtitle playlist path")
             }
             let subBody = Self.buildSubtitleMediaPlaylistText(ordinal: parsed.ordinal, provider: prov)
+            EngineLog.emit("[PiPDiag] SERVE playlist ord=\(parsed.ordinal) bytes=\(subBody.utf8.count)", category: .engine)
             return send200(fd: fd, path: normalizedPath,
                            data: Data(subBody.utf8),
                            contentType: "application/vnd.apple.mpegurl")
@@ -605,6 +606,8 @@ final class HLSLocalServer: @unchecked Sendable {
                   let vtt = provider?.nativeSubtitleVTT(ordinal: parsed.ordinal, segmentIndex: seg) else {
                 return send404(fd: fd, path: normalizedPath, reason: "no subtitle segment for \(normalizedPath)")
             }
+            let cueCount = vtt.components(separatedBy: " --> ").count - 1
+            EngineLog.emit("[PiPDiag] SERVE vtt ord=\(parsed.ordinal) seg=\(seg) cues=\(cueCount) bytes=\(vtt.utf8.count)", category: .engine)
             return send200(fd: fd, path: normalizedPath,
                            data: Data(vtt.utf8),
                            contentType: "text/vtt")
