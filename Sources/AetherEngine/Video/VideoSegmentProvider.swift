@@ -559,7 +559,6 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         // of AVPlayer's prefetch so the window is already filled.
         let store = nativeSubStores[ordinal]
         let cues = store.cuesInWindow(start: start, end: end)
-        EngineLog.emit("[PiPSubsDiag] ord=\(ordinal) seg=\(segmentIndex) win=[\(String(format: "%.1f", start)),\(String(format: "%.1f", end))) inWin=\(cues.count) readMax=\(String(format: "%.1f", store.readMaxCueEnd()))", category: .hlsServer)
         // Absolute media-timeline cue times + MPEGTS:0 identity map. Flip to segment-relative here (one line:
         // relativeToStart: true) if on-device PiP shows subtitles shifted by the segment start. See WebVTTBuilder.segment.
         return WebVTTBuilder.segment(cues: cues, segmentStart: start)

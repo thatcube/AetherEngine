@@ -401,6 +401,15 @@ extension AetherEngine {
             }
             .store(in: &nativeCancellables)
 
+        // #15 (dual-renderer): re-assert the persistent native subtitle selection FROM LOAD on every item
+        // readyToPlay (initial load + audio-switch item rebuilds), so AVKit's legible renderer attaches to it
+        // at first establishment instead of on a later dynamic selection (which hits the renderer-attach
+        // quirk). No-op unless the host set a persistent ordinal.
+        host.$isReady
+            .filter { $0 }
+            .sink { [weak self] _ in self?.applyPersistentNativeSubtitleSelection() }
+            .store(in: &nativeCancellables)
+
         // appliesPerFrameHDRDisplayMetadata unconditionally true: DV P5 has no HDR10 base layer, so the per-frame RPU is what AVPlayer's tone-mapper needs on a non-DV panel (DrHurt #4 2026-05-26). Prior servingMasterPlaylist gate broke P5. Apple's default is also true; explicit write surfaces the live value in diagnostics.
         // forwardBufferDuration default (4 s): deep buffer lets AVPlayer race to the live edge and hit the transcode warm-up gap head-on (-12888); 4 s PACES consumption. Verified: 8 s worsened startup pause (8-10 s vs ~1 s).
         // Live REJOIN: skip initial seek so AVPlayer picks edge-minus-holdback instead; seek-to-0 against the re-served backlog wedged the reloaded item in waitingToPlay (device repro: tvOS 26, Jellyfin stream.ts). See LiveReloadPolicy.

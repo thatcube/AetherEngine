@@ -605,7 +605,6 @@ final class HLSLocalServer: @unchecked Sendable {
                   let vtt = provider?.nativeSubtitleVTT(ordinal: parsed.ordinal, segmentIndex: seg) else {
                 return send404(fd: fd, path: normalizedPath, reason: "no subtitle segment for \(normalizedPath)")
             }
-            EngineLog.emit("[PiPSubsDiag] served subs ord=\(parsed.ordinal) seg=\(seg) bytes=\(vtt.utf8.count)", category: .hlsServer)
             return send200(fd: fd, path: normalizedPath,
                            data: Data(vtt.utf8),
                            contentType: "text/vtt")

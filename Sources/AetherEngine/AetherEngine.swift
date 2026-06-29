@@ -220,6 +220,16 @@ public final class AetherEngine: ObservableObject {
     /// Hosts use this to populate a picker and call `setNativeSubtitleSelected(track:)`.
     @Published public internal(set) var nativeSubtitleTracks: [NativeSubtitleTrack] = []
 
+    /// #15 (dual-renderer): true when the native WebVTT subtitle rendition is actually REACHABLE by AVPlayer,
+    /// i.e. prepareNativeSubtitles declared a text track AND the session is serving a MASTER playlist (the
+    /// rendition lives only in a master). The host reads this to decide whether to drive native-from-load
+    /// subtitle selection (PiP); media-direct sources (e.g. DV5 on a non-DV panel) have no reachable rendition,
+    /// so the host keeps its on-frame overlay only. False on the SW path / idle / remote-HLS.
+    public var nativeSubtitleRenditionReachable: Bool {
+        guard let session = nativeVideoSession else { return false }
+        return session.enableNativeSubtitleTrackForSession && session.servingMasterPlaylist
+    }
+
     /// True for a live session (`LoadOptions.isLive`). Cleared in stopInternal so it can't bleed into the next VOD load.
     @Published public private(set) var isLive: Bool = false
 
@@ -555,6 +565,13 @@ public final class AetherEngine: ObservableObject {
     /// so a session that never selects a native track pays no standing side-demuxer cost. Cleared on stop/clear.
     var nativeSubtitleReaderParams: (url: URL, stores: [NativeSubtitleCueStore])?
 
+    /// #15 (dual-renderer): the native subtitle ordinal the host wants rendered FROM LOAD (in both fullscreen
+    /// and PiP), independent of PiP state. Re-asserted at every item readyToPlay via a SINGLE legible
+    /// selection so the renderer attaches at first establishment, sidestepping the mid-playback
+    /// renderer-attach quirk. nil = none. Set by `setNativeSubtitlePersistent(forSourceStreamIndex:)`;
+    /// cleared on stop/clear.
+    var persistentNativeSubtitleOrdinal: Int?
+
     /// Per-session subtitle event log counter. Caps diagnostic output; reset on each load.
     var subtitleCueDiagnosticCount: Int = 0
 
@@ -785,6 +802,7 @@ public final class AetherEngine: ObservableObject {
         nativeSubtitleTrackTable = []
         nativeSubtitleTracks = []
         nativeSubtitleReaderParams = nil
+        persistentNativeSubtitleOrdinal = nil
         metadata = nil
         fontAttachments = []
         discTitles = []
@@ -1865,6 +1883,7 @@ public final class AetherEngine: ObservableObject {
         nativeSubtitleTrackTable = []
         nativeSubtitleTracks = []
         nativeSubtitleReaderParams = nil
+        persistentNativeSubtitleOrdinal = nil
         cancelNativeSubtitleReaders()
         nativeSubtitleRenditionAvailable = false
         cancelSidecarTask(channel: .secondary)

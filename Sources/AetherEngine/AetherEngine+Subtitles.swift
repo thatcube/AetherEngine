@@ -667,6 +667,7 @@ extension AetherEngine {
         sidecarASSHeader = nil
         isLoadingSubtitles = false
         cancelNativeSubtitleReaders()
+        persistentNativeSubtitleOrdinal = nil
         nativeVideoSession?.nativeSubtitleCueStoresForSession.forEach { $0.clear() }
         nativeVideoSession?.nativeSubtitleCueStoresForSession = []
         nativeVideoSession?.nativeSubtitleLanguagesForSession = []
@@ -971,5 +972,74 @@ extension AetherEngine {
             return
         }
         setNativeSubtitleSelected(track: ordinal)
+    }
+
+    /// #15 (dual-renderer): declare the native WebVTT subtitle track (by SOURCE stream index) that AVKit
+    /// should render FROM LOAD, in both fullscreen and PiP. Unlike `setNativeSubtitleForPiP`, the selection is
+    /// PERSISTENT: it is re-asserted at every item readyToPlay (initial load + audio-switch item rebuilds) via
+    /// a SINGLE legible select (no deselect/reselect dance), so the legible renderer attaches at first
+    /// establishment instead of on a later dynamic selection (which hits the renderer-attach quirk). The host
+    /// pairs this with `AVPlayerItem.textStyleRules` to style the native track transparent in fullscreen (where
+    /// its own overlay draws) and visible in PiP. Maps the source stream index to the native ordinal; nil (or a
+    /// source with no native text equivalent: bitmap PGS/DVB, CEA-608/708, or sidecar) clears the selection.
+    public func setNativeSubtitlePersistent(forSourceStreamIndex idx: Int?) {
+        let ordinal = idx.flatMap { streamIndex in
+            nativeSubtitleTrackTable.firstIndex(where: { $0.sourceStreamIndex == streamIndex })
+        }
+        persistentNativeSubtitleOrdinal = ordinal
+        guard ordinal != nil else {
+            cancelNativeSubtitleReaders()
+            // Deselect any legible option currently active.
+            guard let item = currentAVPlayer?.currentItem else { return }
+            Task { @MainActor in
+                guard let group = try? await item.asset.loadMediaSelectionGroup(for: .legible) else { return }
+                item.select(nil, in: group)
+            }
+            return
+        }
+        // Readers are lazy: start them on the first persistent selection (idle otherwise).
+        if nativeSubtitleReadersTask == nil, let params = nativeSubtitleReaderParams {
+            startNativeSubtitleReaders(url: params.url, stores: params.stores)
+        }
+        // Apply now if the item is already ready (mid-session subtitle switch); otherwise the readyToPlay
+        // sink applies it when the item establishes (the true from-load path).
+        applyPersistentNativeSubtitleSelection()
+    }
+
+    /// #15 (dual-renderer): select the persistent native legible option on the current item with a SINGLE
+    /// select (no deselect/reselect re-assert), pinning manual media-selection criteria so AVKit doesn't
+    /// override the explicit choice. Called at each item readyToPlay (from load) and on a mid-session switch.
+    /// No-op when no persistent ordinal is set or no item/legible group is available.
+    func applyPersistentNativeSubtitleSelection() {
+        guard let ordinal = persistentNativeSubtitleOrdinal,
+              let item = currentAVPlayer?.currentItem else { return }
+        let tracks = nativeSubtitleTracks
+        Task { @MainActor in
+            currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically = false
+            guard let group = try? await item.asset.loadMediaSelectionGroup(for: .legible),
+                  !group.options.isEmpty else { return }
+            // Rank-based mapping (mirrors setNativeSubtitleSelected): pick the option matching the ordinal,
+            // disambiguating same-language duplicates by rank, with a positional fallback.
+            var selected: AVMediaSelectionOption?
+            if ordinal < tracks.count, let lang = tracks[ordinal].language {
+                let rank = NativeSubtitleTrack.sameLanguageRank(of: ordinal, in: tracks)
+                let sameLangOptions = group.options.filter { $0.extendedLanguageTag?.hasPrefix(lang) == true }
+                if rank < sameLangOptions.count { selected = sameLangOptions[rank] }
+            }
+            if selected == nil, ordinal < group.options.count { selected = group.options[ordinal] }
+            guard let option = selected else { return }
+            // Pre-fill the near window so AVPlayer fetches populated .vtt segments instead of racing the
+            // just-started reader (off the loopback connection, not blocking the .vtt handler).
+            if let stores = nativeSubtitleReaderParams?.stores, ordinal < stores.count {
+                let store = stores[ordinal]
+                let target = currentTime + 5.0
+                let deadline = Date().addingTimeInterval(6.0)
+                while store.readMaxCueEnd() < target, Date() < deadline {
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+            }
+            // SINGLE select (from-load): the renderer attaches to this selection at first establishment.
+            item.select(option, in: group)
+        }
     }
 }
