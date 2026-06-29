@@ -113,6 +113,15 @@ public struct LoadOptions: Sendable, Equatable {
     /// `setNativeSubtitleSelected`. Default empty (#73).
     public var preferredSubtitleLanguages: [String]
 
+    /// #15 (dual-renderer): SOURCE stream index of the subtitle the host wants rendered NATIVELY from LOAD
+    /// (the WebVTT legible rendition for PiP), resolved by the host before load() from its own policy. The
+    /// engine maps it to a native ordinal after start() and selects the legible option as soon as the media
+    /// selection group is available, i.e. BEFORE the first frame / before AVKit establishes its render pipeline,
+    /// so the caption renderer attaches from the start (sidesteps the mid-playback renderer-attach quirk).
+    /// Isolated from the overlay path (does NOT activate `subtitleCues`); the host keeps driving its on-frame
+    /// overlay. Honored only when `prepareNativeSubtitles` is set and a MASTER playlist is served. nil = none.
+    public var nativeSubtitleFromLoadStreamIndex: Int? = nil
+
     /// ENGINE-INTERNAL: marks this load as a live REJOIN (`reloadAtCurrentPosition`). Not settable from the public initializer. When true, the native load path skips its explicit initial seek so AVPlayer picks edge-minus-holdback (see `LiveReloadPolicy`); without it the reloaded item can wedge in `waitingToPlay` against Jellyfin's re-served backlog. Meaningful only when `isLive` is true.
     var isLiveRejoin: Bool = false
 
@@ -133,7 +142,8 @@ public struct LoadOptions: Sendable, Equatable {
         probesize: Int64? = nil,
         maxAnalyzeDuration: Int64? = nil,
         preferredAudioLanguages: [String] = [],
-        preferredSubtitleLanguages: [String] = []
+        preferredSubtitleLanguages: [String] = [],
+        nativeSubtitleFromLoadStreamIndex: Int? = nil
     ) {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
         self.suppressDisplayCriteria = suppressDisplayCriteria
@@ -152,6 +162,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.maxAnalyzeDuration = maxAnalyzeDuration
         self.preferredAudioLanguages = preferredAudioLanguages
         self.preferredSubtitleLanguages = preferredSubtitleLanguages
+        self.nativeSubtitleFromLoadStreamIndex = nativeSubtitleFromLoadStreamIndex
     }
 }
 

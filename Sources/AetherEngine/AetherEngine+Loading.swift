@@ -421,6 +421,19 @@ extension AetherEngine {
                   perFrameHDR: true,
                   skipInitialSeek: LiveReloadPolicy.skipInitialSeek(
                       isLive: isLive, isRejoin: liveRejoin))
+
+        // #15 (dual-renderer): TRUE from-load native subtitle selection. The host resolved (pre-load, from its
+        // own policy) the source stream index it wants rendered natively for PiP; select its legible option NOW,
+        // right after the item is created, so applyPersistentNativeSubtitleSelection awaits the media selection
+        // group and selects BEFORE the first frame / before AVKit establishes the render pipeline. That makes
+        // the caption renderer attach to the selection from the start instead of on a later dynamic selection
+        // (which hits the renderer-attach quirk). Gated on a reachable master; isolated from the overlay path.
+        if loadedOptions.prepareNativeSubtitles,
+           nativeSubtitleRenditionReachable,
+           let fromLoadIdx = loadedOptions.nativeSubtitleFromLoadStreamIndex {
+            EngineLog.emit("[PiPDiag] from-load native select request streamIndex=\(fromLoadIdx)", category: .engine)
+            setNativeSubtitlePersistent(forSourceStreamIndex: fromLoadIdx)
+        }
     }
 
     /// Activate AVAudioSession for renderer paths (SoftwarePlaybackHost, audio hosts) that have no AVPlayerViewController. Native path deliberately skips this: AVKit activates per playback so tvOS can auto-negotiate the HDMI route (issue #24).
