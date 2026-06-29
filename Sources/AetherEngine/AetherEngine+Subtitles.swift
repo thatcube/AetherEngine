@@ -990,7 +990,10 @@ extension AetherEngine {
         EngineLog.emit("[PiPDiag] setPersistent idx=\(idx.map(String.init) ?? "nil") -> ordinal=\(ordinal.map(String.init) ?? "nil") table=\(nativeSubtitleTrackTable.count) reachable=\(nativeSubtitleRenditionReachable) hasItem=\(currentAVPlayer?.currentItem != nil)", category: .engine)
         guard ordinal != nil else {
             cancelNativeSubtitleReaders()
-            // Deselect any legible option currently active.
+            // Clear the legible criteria (else AVKit keeps re-preferring the old language) and deselect.
+            currentAVPlayer?.setMediaSelectionCriteria(
+                AVPlayerMediaSelectionCriteria(preferredLanguages: [], preferredMediaCharacteristics: nil),
+                forMediaCharacteristic: .legible)
             guard let item = currentAVPlayer?.currentItem else { return }
             Task { @MainActor in
                 guard let group = try? await item.asset.loadMediaSelectionGroup(for: .legible) else { return }
@@ -1019,7 +1022,6 @@ extension AetherEngine {
         }
         let tracks = nativeSubtitleTracks
         Task { @MainActor in
-            currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically = false
             guard let group = try? await item.asset.loadMediaSelectionGroup(for: .legible),
                   !group.options.isEmpty else {
                 EngineLog.emit("[PiPDiag] applyPersistent NO-GROUP ordinal=\(ordinal)", category: .engine)
@@ -1049,13 +1051,20 @@ extension AetherEngine {
                     try? await Task.sleep(nanoseconds: 100_000_000)
                 }
             }
-            // Re-assert (deselect -> runloop hop -> reselect): AVKit overrides/does-not-render an explicit
-            // legible selection made programmatically unless re-asserted (the fix/pip-subs-reassert finding).
-            // A single select alone was observed to render NOWHERE (not even after a PiP round-trip).
-            item.select(nil, in: group)
-            try? await Task.sleep(nanoseconds: 100_000_000)
+            // Work WITH AVKit instead of against it. AVPlayerViewController's media-selection management
+            // (AVSmartSubtitlesController) actively reconciles/disables an explicitly-selected legible track
+            // when nothing is preferred (renditions are DEFAULT=NO/AUTOSELECT=NO) -- the cause of the flaky
+            // "needs toggling" + "disappears after ~2 s" behaviour. Setting a media-selection CRITERIA that
+            // prefers this legible language makes AVKit's own reconciliation KEEP it selected (and render it
+            // through its pipeline) instead of disabling it. The explicit select aligns the initial choice.
+            if let lang = option.extendedLanguageTag {
+                let criteria = AVPlayerMediaSelectionCriteria(preferredLanguages: [lang],
+                                                              preferredMediaCharacteristics: nil)
+                currentAVPlayer?.setMediaSelectionCriteria(criteria, forMediaCharacteristic: .legible)
+            }
+            currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically = true
             item.select(option, in: group)
-            EngineLog.emit("[PiPDiag] applyPersistent SELECTED (re-assert) ordinal=\(ordinal) lang=\(option.extendedLanguageTag ?? "?")", category: .engine)
+            EngineLog.emit("[PiPDiag] applyPersistent SELECTED (criteria) ordinal=\(ordinal) lang=\(option.extendedLanguageTag ?? "?")", category: .engine)
         }
     }
 }
