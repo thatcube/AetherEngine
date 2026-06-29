@@ -407,7 +407,10 @@ extension AetherEngine {
         // quirk). No-op unless the host set a persistent ordinal.
         host.$isReady
             .filter { $0 }
-            .sink { [weak self] _ in self?.applyPersistentNativeSubtitleSelection() }
+            .sink { [weak self] _ in
+                EngineLog.emit("[PiPDiag] readyToPlay reassert persistentOrdinal=\(self?.persistentNativeSubtitleOrdinal.map(String.init) ?? "nil") servingMaster=\(self?.nativeVideoSession?.servingMasterPlaylist == true) enableNativeSubs=\(self?.nativeVideoSession?.enableNativeSubtitleTrackForSession == true)", category: .engine)
+                self?.applyPersistentNativeSubtitleSelection()
+            }
             .store(in: &nativeCancellables)
 
         // appliesPerFrameHDRDisplayMetadata unconditionally true: DV P5 has no HDR10 base layer, so the per-frame RPU is what AVPlayer's tone-mapper needs on a non-DV panel (DrHurt #4 2026-05-26). Prior servingMasterPlaylist gate broke P5. Apple's default is also true; explicit write surfaces the live value in diagnostics.

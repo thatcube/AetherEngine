@@ -987,6 +987,7 @@ extension AetherEngine {
             nativeSubtitleTrackTable.firstIndex(where: { $0.sourceStreamIndex == streamIndex })
         }
         persistentNativeSubtitleOrdinal = ordinal
+        EngineLog.emit("[PiPDiag] setPersistent idx=\(idx.map(String.init) ?? "nil") -> ordinal=\(ordinal.map(String.init) ?? "nil") table=\(nativeSubtitleTrackTable.count) reachable=\(nativeSubtitleRenditionReachable) hasItem=\(currentAVPlayer?.currentItem != nil)", category: .engine)
         guard ordinal != nil else {
             cancelNativeSubtitleReaders()
             // Deselect any legible option currently active.
@@ -1012,12 +1013,19 @@ extension AetherEngine {
     /// No-op when no persistent ordinal is set or no item/legible group is available.
     func applyPersistentNativeSubtitleSelection() {
         guard let ordinal = persistentNativeSubtitleOrdinal,
-              let item = currentAVPlayer?.currentItem else { return }
+              let item = currentAVPlayer?.currentItem else {
+            EngineLog.emit("[PiPDiag] applyPersistent SKIP ordinal=\(persistentNativeSubtitleOrdinal.map(String.init) ?? "nil") hasItem=\(currentAVPlayer?.currentItem != nil)", category: .engine)
+            return
+        }
         let tracks = nativeSubtitleTracks
         Task { @MainActor in
             currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically = false
             guard let group = try? await item.asset.loadMediaSelectionGroup(for: .legible),
-                  !group.options.isEmpty else { return }
+                  !group.options.isEmpty else {
+                EngineLog.emit("[PiPDiag] applyPersistent NO-GROUP ordinal=\(ordinal)", category: .engine)
+                return
+            }
+            EngineLog.emit("[PiPDiag] applyPersistent group opts=\(group.options.count) ordinal=\(ordinal)", category: .engine)
             // Rank-based mapping (mirrors setNativeSubtitleSelected): pick the option matching the ordinal,
             // disambiguating same-language duplicates by rank, with a positional fallback.
             var selected: AVMediaSelectionOption?
@@ -1027,7 +1035,10 @@ extension AetherEngine {
                 if rank < sameLangOptions.count { selected = sameLangOptions[rank] }
             }
             if selected == nil, ordinal < group.options.count { selected = group.options[ordinal] }
-            guard let option = selected else { return }
+            guard let option = selected else {
+                EngineLog.emit("[PiPDiag] applyPersistent NO-OPTION ordinal=\(ordinal) opts=\(group.options.count)", category: .engine)
+                return
+            }
             // Pre-fill the near window so AVPlayer fetches populated .vtt segments instead of racing the
             // just-started reader (off the loopback connection, not blocking the .vtt handler).
             if let stores = nativeSubtitleReaderParams?.stores, ordinal < stores.count {
@@ -1040,6 +1051,7 @@ extension AetherEngine {
             }
             // SINGLE select (from-load): the renderer attaches to this selection at first establishment.
             item.select(option, in: group)
+            EngineLog.emit("[PiPDiag] applyPersistent SELECTED ordinal=\(ordinal) lang=\(option.extendedLanguageTag ?? "?")", category: .engine)
         }
     }
 }
