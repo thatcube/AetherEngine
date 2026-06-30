@@ -944,16 +944,27 @@ extension AetherEngine {
                 selected = group.options[ordinal]
             }
             guard let option = selected else { return }
-            // #15: pre-fill the near window BEFORE selecting, so AVPlayer fetches a populated rendition instead
-            // of racing the just-started reader (empty .vtt). Done here (off the loopback connection) rather
-            // than blocking the .vtt handler, which serializes the connection and stalls the legible pipeline.
+            // #15: pre-fill BEFORE selecting, so AVPlayer fetches a populated rendition instead of racing the
+            // reader (empty .vtt). Done here (off the loopback connection) rather than blocking the .vtt handler,
+            // which serializes the connection and stalls the legible pipeline.
+            // Sodalite#32: AVKit prefetches the ENTIRE forward subtitle window (~3 min observed) in ONE burst at
+            // selection and caches whatever it gets, never re-fetching a segment it already pulled. A +5s pre-fill
+            // left ~45/46 segments empty (device-confirmed). Pre-fill far enough ahead to cover that burst; break
+            // early when the reader stops making progress (EOF / read-ahead parked) so we never wait the full
+            // deadline for content with little remaining.
             if let stores = nativeSubtitleReaderParams?.stores, ordinal < stores.count {
                 let store = stores[ordinal]
-                let target = currentTime + 5.0
-                let deadline = Date().addingTimeInterval(6.0)
+                let target = currentTime + 240.0
+                let deadline = Date().addingTimeInterval(12.0)
+                var lastMax = -1.0
+                var stall = 0
                 while store.readMaxCueEnd() < target, Date() < deadline {
-                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    let m = store.readMaxCueEnd()
+                    if m <= lastMax { stall += 1 } else { stall = 0; lastMax = m }
+                    if stall >= 4 { break }
+                    try? await Task.sleep(nanoseconds: 150_000_000)
                 }
+                EngineLog.emit("[PiPDiag] pre-fill done: readMax=\(String(format: "%.1f", store.readMaxCueEnd())) target=\(String(format: "%.1f", target)) cues=\(store.cueCount)", category: .engine)
             }
             // #15: AVKit attaches the legible renderer to whatever selection is active when the rendering
             // pipeline is established; a selection made mid-playback updates state + downloads cues but is not
