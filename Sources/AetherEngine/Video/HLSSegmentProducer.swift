@@ -294,52 +294,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var firstActualVideoPts: Int64 = Int64.min
     private var loggedFirstLeadingDrop: Bool = false
 
-    // #92 diagnostics (VOD, HEVC): per-segment open-GOP witness. Confirms whether mid-stream segment
-    // keyframes are CRA (open-GOP) vs IDR, and whether segments carry RASL leading pictures whose PTS
-    // precedes their own keyframe (making the segment non-independent). Pure logging, no behaviour change.
-    private var dbg92Enabled: Bool = false
-    private var dbg92CurSeg: Int = Int.min
-    private var dbg92CurKfType: UInt8 = 0xFF
-    private var dbg92SegKfPts: Int64 = Int64.min
-    private var dbg92LeadingInSeg: Int = 0
-    private var dbg92FramesInSeg: Int = 0
-    private var dbg92IdrSegs: Int = 0
-    private var dbg92CraSegs: Int = 0
-    private var dbg92NonIndependentSegs: Int = 0
-    private var dbg92SegsSeen: Int = 0
-
-    /// #92: flush the accumulated open-GOP witness for the segment that just ended. Logs every
-    /// non-independent segment (CRA keyframe carrying RASL leading pictures, the smoking gun) plus the
-    /// first few segments verbatim, and a rolling aggregate every 50 segments to bound log volume.
-    private func emitDbg92SegmentSummary() {
-        guard dbg92Enabled, dbg92CurSeg != Int.min else { return }
-        dbg92SegsSeen += 1
-        if HEVCAccessUnitProbe.isIDR(dbg92CurKfType) { dbg92IdrSegs += 1 }
-        if HEVCAccessUnitProbe.isCRA(dbg92CurKfType) { dbg92CraSegs += 1 }
-        // A segment is independently decodable iff its FIRST sample is an IRAP. Open-GOP RASL that follow
-        // the IRAP in the same segment are fine (a fresh decode discards them via NoRaslOutputFlag); only
-        // a segment that starts on a non-IRAP (the pre-fix mid-GOP cut) is dependent on its predecessor.
-        let startsAtIRAP = HEVCAccessUnitProbe.isIRAP(dbg92CurKfType)
-        if !startsAtIRAP { dbg92NonIndependentSegs += 1 }
-        if dbg92SegsSeen <= 5 || !startsAtIRAP {
-            EngineLog.emit(
-                "[HLSSegmentProducer] #92 seg-\(dbg92CurSeg) "
-                + "keyframe=\(HEVCAccessUnitProbe.label(forSliceType: dbg92CurKfType)) "
-                + "frames=\(dbg92FramesInSeg) leadingRASL=\(dbg92LeadingInSeg) "
-                + "independent=\(startsAtIRAP ? "yes" : "NO")",
-                category: .session
-            )
-        }
-        if dbg92SegsSeen % 50 == 0 {
-            EngineLog.emit(
-                "[HLSSegmentProducer] #92 aggregate: segs=\(dbg92SegsSeen) "
-                + "IDR=\(dbg92IdrSegs) CRA=\(dbg92CraSegs) "
-                + "nonIndependent=\(dbg92NonIndependentSegs)",
-                category: .session
-            )
-        }
-    }
-
     /// Pre-gate drop counters; surface the "lädt unendlich" failure mode when the gate never opens.
     private var pregateVideoDropCount: Int = 0
     private var pregateWaitStart: Date?
@@ -597,8 +551,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
         self.segmentBoundaries = segmentBoundaries
         self.vodCutter = VODSegmentCutter(boundaries: segmentBoundaries, baseIndex: baseIndex)
         self.isLive = isLive
-        // #92: open-GOP witness only matters for the VOD keyframe-plan path on HEVC sources.
-        self.dbg92Enabled = !isLive && video.codecpar.pointee.codec_id == AV_CODEC_ID_HEVC
         self.liveCurrentSegmentIndex = baseIndex
         self.videoFallbackDurationPts = videoFallbackDurationPts
         self.audioFallbackDurationPts = audioFallbackDurationPts
@@ -1980,29 +1932,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                 + "shift=\(String(format: "%.3f", Double(shiftTicks) * tb))s",
                                 category: .session
                             )
-                        }
-                        // #92: per-segment open-GOP witness. The first packet routed to a new VOD segment
-                        // is that segment's boundary keyframe (kf.dts == kf.pts == plan boundary). Frames in
-                        // the segment whose PTS precedes the keyframe PTS are RASL leading pictures referencing
-                        // the previous GOP -> the segment is not independently decodable (see #92 analysis).
-                        if dbg92Enabled {
-                            if prevSeg != dbg92CurSeg {
-                                emitDbg92SegmentSummary()
-                                dbg92CurSeg = prevSeg
-                                dbg92SegKfPts = prev.pointee.pts
-                                dbg92FramesInSeg = 0
-                                dbg92LeadingInSeg = 0
-                                dbg92CurKfType = 0xFF
-                                if let data = prev.pointee.data, prev.pointee.size > 0 {
-                                    dbg92CurKfType = HEVCAccessUnitProbe.firstSliceNALType(
-                                        data, size: Int(prev.pointee.size)) ?? 0xFF
-                                }
-                            }
-                            dbg92FramesInSeg += 1
-                            if dbg92SegKfPts != Int64.min, prev.pointee.pts != Int64.min,
-                               prev.pointee.pts < dbg92SegKfPts {
-                                dbg92LeadingInSeg += 1
-                            }
                         }
                         if let muxer = ensureMuxer(forSegmentIndex: prevSeg) {
                             finalizeAndWriteVideo(prev, nextDts: packet.pointee.dts, muxer: muxer)
