@@ -915,13 +915,16 @@ final class HLSLocalServer: @unchecked Sendable {
             streamInfAttrs.append("CLOSED-CAPTIONS=\(cc)")
         }
         // #15: native WebVTT subtitle renditions (separate from the A/V variant; in-band timed text is
-        // non-conformant for HLS). DEFAULT/AUTOSELECT=NO so the host overlay stays in fullscreen and the
-        // native track is selected only in PiP. Orthogonal to the video VIDEO-RANGE/CODECS attributes.
+        // non-conformant for HLS). Orthogonal to the video VIDEO-RANGE/CODECS attributes.
+        // PROBE (Sodalite#32, DrHurt): the first rendition is DEFAULT=YES,AUTOSELECT=YES so AVKit
+        // auto-selects the legible track at load and OWNS selection end to end (matching DrHurt's working
+        // recipe), instead of the host force-selecting it (which AVSmartSubtitlesController disabled).
         let subRenditions = provider.nativeSubtitleRenditions
-        for r in subRenditions {
+        for (idx, r) in subRenditions.enumerated() {
             var mediaAttrs = ["TYPE=SUBTITLES", "GROUP-ID=\"subs\"", "NAME=\"\(r.name)\""]
             if let lang = r.language { mediaAttrs.append("LANGUAGE=\"\(lang)\"") }
-            mediaAttrs.append(contentsOf: ["DEFAULT=NO", "AUTOSELECT=NO", "URI=\"subs_\(r.ordinal).m3u8\""])
+            let isDefault = (idx == 0)
+            mediaAttrs.append(contentsOf: ["DEFAULT=\(isDefault ? "YES" : "NO")", "AUTOSELECT=YES", "URI=\"subs_\(r.ordinal).m3u8\""])
             lines.append("#EXT-X-MEDIA:\(mediaAttrs.joined(separator: ","))")
         }
         if !subRenditions.isEmpty {

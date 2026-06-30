@@ -320,6 +320,13 @@ extension AetherEngine {
                 let shift = session.playlistShiftSeconds
                 stores.forEach { $0.setShiftSeconds(shift) }
                 nativeSubtitleReaderParams = (url: url, stores: stores)
+                // Sodalite#32 probe: when the host lets AVKit own the legible selection (DEFAULT=YES rendition,
+                // no host `setNativeSubtitleSelected`), nothing would start the lazy readers, so the .vtt would be
+                // empty when AVKit fetches it. Start them eagerly here so the cue stores fill from load, the way a
+                // static VOD subtitle file is fully present up front.
+                if loadedOptions.eagerNativeSubtitleReaders {
+                    startNativeSubtitleReaders(url: url, stores: stores)
+                }
             }
         }
 
