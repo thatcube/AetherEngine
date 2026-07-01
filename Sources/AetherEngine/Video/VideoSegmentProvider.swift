@@ -61,6 +61,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// instead of one .vtt per video segment. The only AVPlayer-reliable sideload shape (Sodalite#32); requires
     /// eager readers (all cues available up front) and a bounded program (VOD).
     let nativeSubtitleWholeProgram: Bool
+    /// Current engine playlist shift (AVPlayer clock = source_pts - shift), read at serve time so whole-program
+    /// cues land on the same AVPlayer axis as the video even when the shift was not known at load (Sodalite#32).
+    private let currentShiftSeconds: @Sendable () -> Double
 
     /// Synchronous teardown + relaunch at the given absolute segment index.
     private let restartHandler: ((Int) -> Void)?
@@ -117,7 +120,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         nativeSubtitleStores: [NativeSubtitleCueStore] = [],
         nativeSubtitleLanguages: [String?] = [],
         nativeSubtitleDefaultOrdinal: Int = 0,
-        nativeSubtitleWholeProgram: Bool = false
+        nativeSubtitleWholeProgram: Bool = false,
+        currentShiftSeconds: @escaping @Sendable () -> Double = { 0 }
     ) {
         self.cache = cache
         self.segments = segments
@@ -137,6 +141,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         self.nativeSubLanguages = nativeSubtitleLanguages
         self.nativeSubtitleDefaultOrdinal = nativeSubtitleDefaultOrdinal
         self.nativeSubtitleWholeProgram = nativeSubtitleWholeProgram
+        self.currentShiftSeconds = currentShiftSeconds
     }
 
     /// Append a finalized live segment. Index must equal segments.count; out-of-order ignored.
@@ -565,8 +570,12 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             while !store.isFinished, Date() < deadline {
                 usleep(100_000)
             }
+            // Sodalite#32: the cues are stored at SOURCE pts; AVPlayer clock = source - shift. Apply the CURRENT
+            // engine shift (read now, not the possibly-zero load-time value) so cues land on the video's axis.
+            let shift = currentShiftSeconds()
+            store.setShiftSeconds(shift)
             let cues = store.allCues()
-            EngineLog.emit("[PiPSubsDiag] whole-program ord=\(ordinal) cues=\(cues.count) finished=\(store.isFinished)", category: .hlsServer)
+            EngineLog.emit("[PiPSubsDiag] whole-program ord=\(ordinal) cues=\(cues.count) finished=\(store.isFinished) shift=\(String(format: "%.2f", shift)) first=\(cues.first.map { String(format: "%.1f", $0.start) } ?? "-") last=\(cues.last.map { String(format: "%.1f", $0.end) } ?? "-")", category: .hlsServer)
             return WebVTTBuilder.segment(cues: cues, segmentStart: 0)
         }
         stateLock.lock()

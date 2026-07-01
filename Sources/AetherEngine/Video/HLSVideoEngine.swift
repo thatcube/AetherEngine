@@ -919,7 +919,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             nativeSubtitleStores: nativeSubtitleCueStoresForSession,
             nativeSubtitleLanguages: nativeSubtitleLanguagesForSession,
             nativeSubtitleDefaultOrdinal: nativeSubtitleDefaultOrdinal,
-            nativeSubtitleWholeProgram: nativeSubtitleWholeProgram
+            nativeSubtitleWholeProgram: nativeSubtitleWholeProgram,
+            currentShiftSeconds: { [weak self] in self?.playlistShiftSeconds ?? 0 }
         )
         self.provider = prov
         if isLiveSession {
