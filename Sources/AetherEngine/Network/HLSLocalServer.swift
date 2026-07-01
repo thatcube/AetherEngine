@@ -969,7 +969,9 @@ final class HLSLocalServer: @unchecked Sendable {
             lines.append("#EXT-X-TARGETDURATION:\(max(1, Int(ceil(total))))")
             lines.append("#EXT-X-MEDIA-SEQUENCE:0")
             lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
-            lines.append("#EXTINF:\(String(format: "%.3f", total)),")
+            // No trailing comma on EXTINF: the proven-working whole-file sideload omits it ("seems to break it"
+            // otherwise), and AVKit accepts it here. Sodalite#32.
+            lines.append("#EXTINF:\(String(format: "%.3f", total))")
             lines.append("subs_\(ordinal)_0.vtt")
             lines.append("#EXT-X-ENDLIST")
             return lines.joined(separator: "\n") + "\n"

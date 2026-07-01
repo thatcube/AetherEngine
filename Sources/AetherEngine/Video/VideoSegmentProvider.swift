@@ -576,7 +576,11 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             store.setShiftSeconds(shift)
             let cues = store.allCues()
             EngineLog.emit("[PiPSubsDiag] whole-program ord=\(ordinal) cues=\(cues.count) finished=\(store.isFinished) shift=\(String(format: "%.2f", shift)) first=\(cues.first.map { String(format: "%.1f", $0.start) } ?? "-") last=\(cues.last.map { String(format: "%.1f", $0.end) } ?? "-")", category: .hlsServer)
-            return WebVTTBuilder.segment(cues: cues, segmentStart: 0)
+            // PLAIN WebVTT, NO X-TIMESTAMP-MAP (matches the proven-working whole-file sideload). With the map,
+            // AVKit anchors cues to the fMP4 sample PTS (which diverges from currentTime over our loopback) and
+            // the subtitles render offset by the playback position; without it AVKit uses the cue times as the
+            // AVPlayer timeline directly (= our absolute cue axis). Sodalite#32.
+            return WebVTTBuilder.body(cues: cues)
         }
         stateLock.lock()
         guard segmentIndex >= 0, segmentIndex < segments.count else {
