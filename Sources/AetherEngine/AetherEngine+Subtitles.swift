@@ -707,7 +707,7 @@ extension AetherEngine {
     // MARK: - Native multi-track decode (#55, all-tracks)
 
     /// Launch the multi-decode reader that fills every text track's store in one side-demuxer pass (#55, all-tracks). Separate from the inline host-overlay path (subtitleCues). Idempotent: cancels any prior reader first. `stores` is ordinal-aligned with `nativeSubtitleTrackTable`.
-    func startNativeSubtitleReaders(url: URL, stores: [NativeSubtitleCueStore]) {
+    func startNativeSubtitleReaders(url: URL, stores: [NativeSubtitleCueStore], fromStart: Bool = false) {
         cancelNativeSubtitleReaders()
         var pairs: [(streamIndex: Int32, store: NativeSubtitleCueStore)] = []
         for (ordinal, entry) in nativeSubtitleTrackTable.enumerated() {
@@ -725,7 +725,9 @@ extension AetherEngine {
         let formatHint = customFormatHint
         let w = sourceVideoWidth > 0 ? sourceVideoWidth : 1920
         let h = sourceVideoHeight > 0 ? sourceVideoHeight : 1080
-        let startAt = sourceTime
+        // Sodalite#32: a whole-program .vtt must contain EVERY cue (0 -> EOF), so read from the start, not from
+        // the current playhead / resume position (which would drop all cues before it).
+        let startAt = fromStart ? 0.0 : sourceTime
         let reader = customClone
         // #76: same bounded-probe + active-title open as the inline reader.
         let probesize = loadedOptions.probesize
@@ -736,7 +738,7 @@ extension AetherEngine {
                 url: url, reader: reader, formatHint: formatHint, headers: headers,
                 pairs: pairs, startAt: startAt, videoWidth: w, videoHeight: h,
                 callerProbesize: probesize, callerMaxAnalyzeDuration: maxAnalyzeDuration,
-                selectTitleID: titleID
+                selectTitleID: titleID, readToEOF: fromStart
             )
         }
     }
@@ -756,7 +758,7 @@ extension AetherEngine {
         pairs: [(streamIndex: Int32, store: NativeSubtitleCueStore)],
         startAt: Double, videoWidth: Int32, videoHeight: Int32,
         callerProbesize: Int64? = nil, callerMaxAnalyzeDuration: Int64? = nil,
-        selectTitleID: Int? = nil
+        selectTitleID: Int? = nil, readToEOF: Bool = false
     ) async {
         let demuxer = Demuxer()
         let openProfile = DemuxerOpenProfile.subtitleSideDemuxer(
@@ -878,7 +880,9 @@ extension AetherEngine {
             // #15: keep the native readers ahead of AVPlayer's ~240s subtitle prefetch burst (larger lead than
             // the inline overlay reader), so the served .vtt segments carry cues instead of being fetched empty
             // and cached empty for the VOD rendition. Only runs while a native rendition is selected (PiP).
-            if let pktSeconds, pktSeconds > playheadSnapshot + Self.nativeSubtitleReadAheadSeconds {
+            // Sodalite#32: a whole-program .vtt must hold EVERY cue, so read straight to EOF without parking
+            // (cue data is tiny). markFinished after the loop lets the .vtt handler wait for a complete file.
+            if !readToEOF, let pktSeconds, pktSeconds > playheadSnapshot + Self.nativeSubtitleReadAheadSeconds {
                 while !Task.isCancelled {
                     guard let fresh = await MainActor.run(body: { [weak self] in self?.sourceTime }) else {
                         break readLoop
@@ -899,8 +903,14 @@ extension AetherEngine {
             }
         }
 
+        // Sodalite#32: reaching here without cancellation means the side demuxer hit EOF, so every cue for the
+        // whole program is now in the stores; signal completeness for the whole-program .vtt handler.
+        if readToEOF && !Task.isCancelled {
+            for pair in pairs { pair.store.markFinished() }
+        }
+
         EngineLog.emit(
-            "[AetherEngine] native subtitle readers exited (cancelled=\(Task.isCancelled)) totalCues=\(totalCues)",
+            "[AetherEngine] native subtitle readers exited (cancelled=\(Task.isCancelled)) totalCues=\(totalCues) readToEOF=\(readToEOF)",
             category: .engine
         )
     }

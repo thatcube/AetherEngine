@@ -354,8 +354,10 @@ extension AetherEngine {
                 // empty when AVKit fetches it. Start them eagerly here so the cue stores fill from load, the way a
                 // static VOD subtitle file is fully present up front.
                 if loadedOptions.eagerNativeSubtitleReaders {
-                    startNativeSubtitleReaders(url: url, stores: stores)
-                    EngineLog.emit("[PiPDiag] eager readers started: stores=\(stores.count)", category: .engine)
+                    // Sodalite#32: for a whole-program .vtt read from the start straight to EOF (no read-ahead
+                    // parking) so every cue is present and the store reports finished.
+                    startNativeSubtitleReaders(url: url, stores: stores, fromStart: session.nativeSubtitleWholeProgram)
+                    EngineLog.emit("[PiPDiag] eager readers started: stores=\(stores.count) fromStart=\(session.nativeSubtitleWholeProgram)", category: .engine)
                 }
             }
         }

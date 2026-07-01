@@ -558,21 +558,15 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         let store = nativeSubStores[ordinal]
         if nativeSubtitleWholeProgram {
             // Sodalite#32: serve the ENTIRE program's cues as one .vtt (the only AVPlayer-reliable sideload
-            // shape). AVKit fetches this VOD single-segment file ONCE and never re-fetches it, so wait for the
-            // eager reader to finish (cue-count plateau after it has produced) before returning, so the file is
-            // complete. Bounded; this is one fetch on the subtitle connection, not the per-segment pipeline.
-            var lastCount = -1
-            var stable = 0
-            let deadline = Date().addingTimeInterval(15.0)
-            while Date() < deadline {
-                let c = store.cueCount
-                if c > 0 && c == lastCount { stable += 1 } else { stable = 0 }
-                lastCount = c
-                if stable >= 8 { break }   // ~800ms with no new cues after producing => reader at EOF
+            // shape). AVKit fetches this VOD single-segment file ONCE and never re-fetches it, so it MUST be
+            // complete. Wait for the reader's definitive EOF signal (isFinished) rather than a cue-count plateau
+            // heuristic, which fired early during dialogue gaps and served a truncated file (device-confirmed).
+            let deadline = Date().addingTimeInterval(30.0)
+            while !store.isFinished, Date() < deadline {
                 usleep(100_000)
             }
             let cues = store.allCues()
-            EngineLog.emit("[PiPSubsDiag] whole-program ord=\(ordinal) cues=\(cues.count)", category: .hlsServer)
+            EngineLog.emit("[PiPSubsDiag] whole-program ord=\(ordinal) cues=\(cues.count) finished=\(store.isFinished)", category: .hlsServer)
             return WebVTTBuilder.segment(cues: cues, segmentStart: 0)
         }
         stateLock.lock()
