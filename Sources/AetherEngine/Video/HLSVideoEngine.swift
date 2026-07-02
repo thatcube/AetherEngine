@@ -65,7 +65,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     private let audioSourceStreamIndexOverride: Int32?
 
     var demuxer: Demuxer?
-    private var cache: SegmentCache?
+    var cache: SegmentCache?   // internal for the teardown-partial witness test
     var producer: HLSSegmentProducer?
     private var server: HLSLocalServer?
     var provider: VideoSegmentProvider?
@@ -96,6 +96,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// init moov always declares the mov_text track (#55). Set before `start()`.
     var enableNativeSubtitleTrackForSession: Bool = false
 
+    /// Native subtitle rendition marked DEFAULT=YES in the master (Sodalite#32). Set before `start()`; the
+    /// provider advertises this ordinal as the group default so a host-selected legible track renders.
+    var nativeSubtitleDefaultOrdinal: Int = 0
+
+    /// Serve the SUBTITLES rendition as one whole-program .vtt (Sodalite#32). Set before `start()`.
+    var nativeSubtitleWholeProgram: Bool = false
+
+    /// Source position (seconds) the playback stream started at (resume/seek). Device-confirmed AVKit anchors a
+    /// whole-program VOD .vtt's time 0 to the stream start, so whole-program cues shift by this so cue-for-source-S
+    /// lands at currentTime S (from-start = 0 = no shift). Set before `start()`. Sodalite#32.
+    var subtitleStreamStartSeconds: Double = 0
+
     /// One cue store per declared text track (#55, all-tracks), ordinal-aligned with
     /// `nativeSubtitleLanguagesForSession`. Re-threaded onto every producer restart so
     /// per-segment cue drain survives seek/audio-switch. Empty = no native subtitles active.
@@ -110,6 +122,38 @@ public final class HLSVideoEngine: @unchecked Sendable {
     var closedCaptionStreamIndexForSession: Int32 = -1
     var closedCaptionObserverForSession: (@Sendable (UnsafePointer<AVPacket>, AVRational) -> Void)?
 
+    /// Sodalite#32: ordinal-aligned source stream indices for the native subtitle cue stores (nil entry =
+    /// no demuxable stream, e.g. a sidecar). Drives the producer's subtitle tap: the pump keeps these
+    /// streams and hands their packets to the session tap, which decodes into the ordinal's store. Set
+    /// before start() by the host, or by the auto-attach/attach APIs.
+    var nativeSubtitleSourceStreamIndicesForSession: [Int32?] = []
+
+    /// Session-lifetime tap decode routes keyed by source stream index. Decoders persist across producer
+    /// restarts so their internal dedup absorbs the re-read overlap; the store dedups again on append.
+    /// Guarded by subtitleTapLock: an abandoned wedged producer's final packets can race the replacement
+    /// producer's tap.
+    private var subtitleTapRoutes: [Int32: (decoder: EmbeddedSubtitleDecoder, store: NativeSubtitleCueStore)] = [:]
+    private let subtitleTapLock = NSLock()
+
+    /// Sodalite#32 Phase 2: tap decoders honor the host's markup preference so the overlay can render
+    /// styled ASS from tap-fed cues; the WebVTT rendition strips the markup at serve time instead.
+    /// Set before start() (AetherEngine+Loading).
+    var preserveASSMarkupForSubtitleTap = false
+
+    /// Sodalite#32 Phase 2: decoded tap events, forwarded after the store append. AetherEngine routes
+    /// the ACTIVE track's events into the host overlay (subtitleCues), replacing the side reader.
+    var onSubtitleTapEvent: (@Sendable (Int32, EmbeddedSubtitleDecoder.SubtitleEvent) -> Void)?
+
+    var subtitleTapActive: Bool {
+        subtitleTapLock.lock(); defer { subtitleTapLock.unlock() }
+        return !subtitleTapRoutes.isEmpty
+    }
+
+    func subtitleTapCoversStream(_ idx: Int32) -> Bool {
+        subtitleTapLock.lock(); defer { subtitleTapLock.unlock() }
+        return subtitleTapRoutes[idx] != nil
+    }
+
     /// Request the native mov_text track in the init moov (#55). Call before `start()`.
     /// `aetherctl serve --native-subs N` uses this; a full session wires it automatically.
     public func requestNativeSubtitleTrack() {
@@ -117,20 +161,25 @@ public final class HLSVideoEngine: @unchecked Sendable {
     }
 
     /// Attach `count` fresh cue stores (one per declared text track) to the current producer (#55).
-    /// Call after `start()`. `languages` is ordinal-aligned, nil-padded to `count`.
-    public func attachNativeSubtitleStores(count: Int, languages: [String?] = []) {
+    /// Call after `start()`. `languages` and `sourceStreamIndices` are ordinal-aligned, nil-padded.
+    public func attachNativeSubtitleStores(count: Int, languages: [String?] = [],
+                                           sourceStreamIndices: [Int32?] = []) {
         guard count > 0 else { return }
         let stores = (0..<count).map { _ in NativeSubtitleCueStore() }
         let langs = (0..<count).map { i in i < languages.count ? languages[i] : nil }
+        let indices = (0..<count).map { i in i < sourceStreamIndices.count ? sourceStreamIndices[i] : nil }
         // Guard the session arrays under restartLock: a runtime attach (this call, host thread) otherwise
         // races the pump thread iterating them in handleVideoShiftKnown and makeProducer's read (#55).
         restartLock.lock()
         nativeSubtitleCueStoresForSession = stores
         nativeSubtitleLanguagesForSession = langs
+        nativeSubtitleSourceStreamIndicesForSession = indices
         let prod = producer
         restartLock.unlock()
+        rebuildSubtitleTapRoutes()
         prod?.subtitleCueStores = stores
         prod?.nativeSubtitleLanguages = langs
+        armSubtitleTap(on: prod)
     }
 
     /// Attach one store per non-bitmap subtitle track from the engine's demuxer (#55, all-tracks).
@@ -141,8 +190,70 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // (the libavcodec decoder name), so bitmap tracks leaked into the native mov_text store set.
         let text = (demuxer?.subtitleTrackInfos() ?? []).filter { !AetherEngine.isBitmapSubtitleCodec($0.codec) }
         let languages = text.map { $0.language }
-        attachNativeSubtitleStores(count: text.count, languages: languages)
+        attachNativeSubtitleStores(count: text.count, languages: languages,
+                                   sourceStreamIndices: text.map { Int32($0.id) })
         return languages
+    }
+
+    // MARK: - Subtitle pump tap (Sodalite#32)
+
+    /// (Re)build the session tap routes from the current stores + stream indices. One
+    /// EmbeddedSubtitleDecoder per demuxable text track, plain text (the native rendition carries no
+    /// markup). Decoders live for the session, not the producer, so a restart's re-read dedups.
+    private func rebuildSubtitleTapRoutes() {
+        subtitleTapLock.lock()
+        defer { subtitleTapLock.unlock() }
+        subtitleTapRoutes.removeAll()
+        guard let dem = demuxer else { return }
+        let w = savedVideoConfig.map { Int32($0.codecpar.pointee.width) } ?? 1920
+        let h = savedVideoConfig.map { Int32($0.codecpar.pointee.height) } ?? 1080
+        for (ordinal, sidx) in nativeSubtitleSourceStreamIndicesForSession.enumerated() {
+            guard let sidx, ordinal < nativeSubtitleCueStoresForSession.count,
+                  let stream = dem.stream(at: sidx),
+                  let decoder = EmbeddedSubtitleDecoder(stream: stream,
+                                                        sourceVideoWidth: w > 0 ? w : 1920,
+                                                        sourceVideoHeight: h > 0 ? h : 1080,
+                                                        preserveASSMarkup: preserveASSMarkupForSubtitleTap)
+            else { continue }
+            subtitleTapRoutes[sidx] = (decoder, nativeSubtitleCueStoresForSession[ordinal])
+        }
+        if !subtitleTapRoutes.isEmpty {
+            EngineLog.emit(
+                "[HLSVideoEngine] subtitle pump tap armed for streams \(subtitleTapRoutes.keys.sorted())",
+                category: .session
+            )
+        }
+    }
+
+    /// Wire the tap onto a producer (initial + every restart).
+    private func armSubtitleTap(on prod: HLSSegmentProducer?) {
+        guard let prod else { return }
+        subtitleTapLock.lock()
+        let indices = Set(subtitleTapRoutes.keys)
+        subtitleTapLock.unlock()
+        prod.subtitleTapStreamIndices = indices
+        if indices.isEmpty {
+            prod.subtitleTapObserver = nil
+        } else {
+            prod.subtitleTapObserver = { [weak self] idx, pkt, tb in
+                self?.handleSubtitleTapPacket(streamIndex: idx, packet: pkt, timeBase: tb)
+            }
+        }
+    }
+
+    /// Pump-thread callback: decode the tapped packet into its ordinal's cue store. Text subtitle decode
+    /// is a parse (microseconds), so it runs inline; the lock serializes an abandoned producer's tail
+    /// against the replacement producer.
+    private func handleSubtitleTapPacket(streamIndex: Int32, packet: UnsafeMutablePointer<AVPacket>,
+                                         timeBase: AVRational) {
+        subtitleTapLock.lock()
+        defer { subtitleTapLock.unlock() }
+        guard let route = subtitleTapRoutes[streamIndex] else { return }
+        if let event = route.decoder.decode(packet: packet, streamTimeBase: timeBase),
+           !event.cues.isEmpty {
+            route.store.appendCues(event.cues)
+            onSubtitleTapEvent?(streamIndex, event)
+        }
     }
 
     /// Per-frame fallback durations in source time_base for backfilling `pkt->duration`
@@ -278,6 +389,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Cue-prewarm seek deadline. MKV Cues resolve in under 1 s; a missing/out-of-bounds index
     /// degrades into a multi-GB linear scan. Beyond this, abort and build a uniform-stride plan.
     static let cuePrewarmTimeout: TimeInterval = 10.0
+
+    /// SegmentCache retention budget for a VOD session (#93 / Sodalite#32): capped at 2 GiB and
+    /// clamped to a quarter of the tmp volume's available capacity, so a nearly-full device never
+    /// trades playback headroom for seek history. Live passes 0 (window-only pruning; the sliding
+    /// playlist already dropped everything behind the window, so retention would serve nothing).
+    static func vodRetentionBudgetBytes(volumeAvailableBytes: Int64?) -> Int {
+        let cap = 2 << 30
+        guard let available = volumeAvailableBytes else { return cap }
+        return min(cap, max(0, Int(available / 4)))
+    }
 
     // MARK: - Measurement spike: sliding-window prototype (superseded)
     //
@@ -579,8 +700,19 @@ public final class HLSVideoEngine: @unchecked Sendable {
             dem.seek(to: 0)
         }
 
-        let segmentCache = SegmentCache()
+        let availableBytes = (try? URL(fileURLWithPath: NSTemporaryDirectory())
+            .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
+            .volumeAvailableCapacityForImportantUsage
+        let retentionBudget = isLiveSession
+            ? 0
+            : Self.vodRetentionBudgetBytes(volumeAvailableBytes: availableBytes)
+        let segmentCache = SegmentCache(retentionBudgetBytes: retentionBudget)
         self.cache = segmentCache
+        EngineLog.emit(
+            "[HLSVideoEngine] segment retention budget: \(retentionBudget / (1 << 20)) MiB "
+            + "(volumeAvailable=\(availableBytes.map { "\($0 / (1 << 20)) MiB" } ?? "unknown"))",
+            category: .session
+        )
 
         // DV P5 MP4 encoders can omit the HEVC SPS VUI and `colr` atom (#19 Wandering Earth 2 WEB-DL):
         // color_trc/primaries/space all unspecified, so AVPlayer's DV decoder won't engage on the dvh1
@@ -852,6 +984,27 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 : 1
         }
 
+        // #15: native subtitles requested but no host pre-populated the cue stores (the `aetherctl serve
+        // --native-subs` path). Auto-attach one store per non-bitmap text track BEFORE the producer is
+        // built: the producer's init applies the demuxer discard set, and the subtitle tap streams must
+        // be in it (Sodalite#32; a post-init arm only ever saw open-time queued packets). The host's
+        // full-session path sets these before start() (AetherEngine+Loading), so the isEmpty guard makes
+        // this a no-op there. makeProducer threads the stores + tap onto the producer.
+        if enableNativeSubtitleTrackForSession && nativeSubtitleCueStoresForSession.isEmpty {
+            let textTracks = dem.subtitleTrackInfos().filter { !AetherEngine.isBitmapSubtitleCodec($0.codec) }
+            if !textTracks.isEmpty {
+                nativeSubtitleCueStoresForSession = textTracks.map { _ in NativeSubtitleCueStore() }
+                nativeSubtitleLanguagesForSession = textTracks.map { $0.language }
+                nativeSubtitleSourceStreamIndicesForSession = textTracks.map { Int32($0.id) }
+                EngineLog.emit(
+                    "[HLSVideoEngine] #15 auto-attached \(nativeSubtitleCueStoresForSession.count) native "
+                    + "subtitle store(s) for the WebVTT rendition "
+                    + "(langs=\(nativeSubtitleLanguagesForSession.map { $0 ?? "und" }))",
+                    category: .session
+                )
+            }
+        }
+
         // 6b. Run the stream-copy / FLAC-bridge / video-only cascade.
         let prod: HLSSegmentProducer
         prod = try buildProducerWithAudioCascade(
@@ -863,29 +1016,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
         )
         self.producer = prod
         self.activeAudioSourceStreamIndex = savedAudioConfig != nil ? audioStreamIndex : -1
-
-        // #15: native subtitles requested but no host pre-populated the cue stores (the `aetherctl serve
-        // --native-subs` path). Auto-attach one store per non-bitmap text track HERE, before the provider is
-        // built, so the master advertises the WebVTT SUBTITLES rendition. The host's full-session path sets
-        // these before start() (AetherEngine+Loading), so the isEmpty guard makes this a no-op there and the
-        // tvOS/iOS host path stays byte-identical. The lazy readers that fill the stores are the host's job;
-        // exposure of the legible option only needs the rendition declared, not cues present.
-        if enableNativeSubtitleTrackForSession && nativeSubtitleCueStoresForSession.isEmpty {
-            let textTracks = dem.subtitleTrackInfos().filter { !AetherEngine.isBitmapSubtitleCodec($0.codec) }
-            if !textTracks.isEmpty {
-                let stores = textTracks.map { _ in NativeSubtitleCueStore() }
-                let langs = textTracks.map { $0.language }
-                nativeSubtitleCueStoresForSession = stores
-                nativeSubtitleLanguagesForSession = langs
-                prod.subtitleCueStores = stores
-                prod.nativeSubtitleLanguages = langs
-                EngineLog.emit(
-                    "[HLSVideoEngine] #15 auto-attached \(stores.count) native subtitle store(s) for the "
-                    + "WebVTT rendition (langs=\(langs.map { $0 ?? "und" }))",
-                    category: .session
-                )
-            }
-        }
 
         // 7. Wire provider, server, and URL.
         let manifestCodecs = audioHLSCodecs.map { "\(primaryCodecs),\($0)" } ?? primaryCodecs
@@ -910,7 +1040,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 self?.requestRestart(at: idx)
             },
             nativeSubtitleStores: nativeSubtitleCueStoresForSession,
-            nativeSubtitleLanguages: nativeSubtitleLanguagesForSession
+            nativeSubtitleLanguages: nativeSubtitleLanguagesForSession,
+            stripASSMarkupInVTT: preserveASSMarkupForSubtitleTap,
+            nativeSubtitleDefaultOrdinal: nativeSubtitleDefaultOrdinal,
+            nativeSubtitleWholeProgram: nativeSubtitleWholeProgram,
+            currentShiftSeconds: { [weak self] in (self?.playlistShiftSeconds ?? 0) + (self?.subtitleStreamStartSeconds ?? 0) }
         )
         self.provider = prov
         if isLiveSession {
@@ -1098,6 +1232,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
     }
 
     public func stop() {
+        // Sodalite#32: drop the tap routes first so a pump still draining its last packets no-ops
+        // instead of decoding into stores being torn down.
+        subtitleTapLock.lock()
+        subtitleTapRoutes.removeAll()
+        subtitleTapLock.unlock()
         // Snapshot resources under the lock, then clear instance state and hand them to a
         // detached cleanup task (#10: SwiftUI releases @State on main; detach avoids a 3 s freeze
         // while the pump exits a parked HTTP byte-range read).
@@ -1222,6 +1361,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             audioFallbackDurationPts: audioFallbackDurationPts,
             restartTargetVideoDts: videoTarget,
             closedCaptionStreamIndex: closedCaptionStreamIndexForSession,
+            subtitleTapStreamIndices: Set(nativeSubtitleSourceStreamIndicesForSession.compactMap { $0 }),
             desiredFirstVideoTfdtPts: desiredVideoTfdt,
             desiredFirstAudioTfdtPts: desiredAudioTfdt,
             segmentBoundaries: segmentBoundaries,
@@ -1253,6 +1393,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
         prod.subtitleCueStores = nativeSubtitleCueStoresForSession
         prod.nativeSubtitleLanguages = nativeSubtitleLanguagesForSession
         prod.closedCaptionObserver = closedCaptionObserverForSession   // #77
+        // Sodalite#32: build the tap routes lazily on the first producer that has stores + stream
+        // indices (the host sets both before start()), then wire the tap onto every producer.
+        subtitleTapLock.lock()
+        let routesEmpty = subtitleTapRoutes.isEmpty
+        subtitleTapLock.unlock()
+        if routesEmpty, !nativeSubtitleSourceStreamIndicesForSession.isEmpty,
+           !nativeSubtitleCueStoresForSession.isEmpty {
+            rebuildSubtitleTapRoutes()
+        }
+        armSubtitleTap(on: prod)
         return prod
     }
 

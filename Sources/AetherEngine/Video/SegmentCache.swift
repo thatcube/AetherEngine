@@ -15,6 +15,13 @@ final class SegmentCache: @unchecked Sendable {
     /// 20 covers Continuous-Audio handover refetches (~7-10 segments backward); smaller values
     /// cascaded into restart chains that reset the FLAC bridge PTS and caused audible glitches.
     private let backwardWindow: Int
+    /// Byte budget for retaining segments OUTSIDE the hard window (#93 / Sodalite#32). While the
+    /// cache's total footprint fits the budget, already-produced segments beyond the window stay
+    /// resident (evicted farthest-from-target first once it fills), so a backward seek into watched
+    /// content is a cache hit and never fires the producer restart that wedges slow sources (#93)
+    /// and detaches AVKit's PiP legible renderer (Sodalite#32). 0 = window-only legacy pruning
+    /// (live sessions, where the sliding playlist already dropped everything behind the window).
+    private let retentionBudgetBytes: Int
 
     private var entries: [Int: URL] = [:]
     /// Per-index byte ledger for _totalBytes. Stat-on-eviction was wrong when same index was
@@ -40,9 +47,10 @@ final class SegmentCache: @unchecked Sendable {
     private var _highestStoredIndex: Int = -1
 
     /// (10, 20)=30 entries, ~300 MB at 4K HDR HEVC ~10 MB/seg.
-    init(forwardWindow: Int = 10, backwardWindow: Int = 20) {
+    init(forwardWindow: Int = 10, backwardWindow: Int = 20, retentionBudgetBytes: Int = 0) {
         self.forwardWindow = forwardWindow
         self.backwardWindow = backwardWindow
+        self.retentionBudgetBytes = retentionBudgetBytes
 
         // aether-segments/ prefix lets sweepStaleSessionDirs() find sibling dirs from crashed sessions.
         let baseDir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
@@ -360,10 +368,40 @@ final class SegmentCache: @unchecked Sendable {
     /// hi anchors on highestStoredIndex so a transient backward refetch (AVPlayer audio handover)
     /// doesn't evict already-produced forward segments (repro: seg0..25 produced, refetch seg4 -> target=4
     /// pruned seg15+, stalled when playback reached seg15).
+    /// With a retention budget (#93 / Sodalite#32), entries outside that hard window survive,
+    /// nearest-to-target first, while the cache's total footprint fits the budget; the window itself
+    /// is never evicted even when it alone exceeds the budget. Nearest-first eviction from the far
+    /// ends keeps each side of the resident span contiguous, so the provider's residency gate
+    /// (a resident backward target = no producer restart) holds across the whole retained span.
     private func pruneOutsideWindow() -> [URL] {
         let lo = currentTargetIndex - backwardWindow
         let hi = max(currentTargetIndex + forwardWindow, _highestStoredIndex)
         var doomed: [URL] = []
+        if retentionBudgetBytes > 0 {
+            var extras: [(index: Int, bytes: Int)] = []
+            var keptBytes = 0
+            for (k, _) in entries {
+                let bytes = entryBytes[k] ?? 0
+                if k < lo || k > hi {
+                    extras.append((k, bytes))
+                } else {
+                    keptBytes += bytes
+                }
+            }
+            guard !extras.isEmpty else { return [] }
+            extras.sort { abs($0.index - currentTargetIndex) < abs($1.index - currentTargetIndex) }
+            for (k, bytes) in extras {
+                if keptBytes + bytes <= retentionBudgetBytes {
+                    keptBytes += bytes
+                } else if let url = entries[k] {
+                    _totalBytes -= bytes
+                    entryBytes.removeValue(forKey: k)
+                    entries.removeValue(forKey: k)
+                    doomed.append(url)
+                }
+            }
+            return doomed
+        }
         for (k, url) in entries {
             if k < lo || k > hi {
                 _totalBytes -= entryBytes[k] ?? byteSize(of: url)

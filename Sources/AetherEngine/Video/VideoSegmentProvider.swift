@@ -55,6 +55,18 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// Immutable references; each store is internally locked and filled lazily by the readers on selection.
     private let nativeSubStores: [NativeSubtitleCueStore]
     private let nativeSubLanguages: [String?]
+    /// Ordinal advertised as DEFAULT=YES in the master SUBTITLES group (Sodalite#32).
+    let nativeSubtitleDefaultOrdinal: Int
+    /// Serve the SUBTITLES rendition as ONE whole-program .vtt (single VOD segment spanning the full duration)
+    /// instead of one .vtt per video segment. The only AVPlayer-reliable sideload shape (Sodalite#32); requires
+    /// eager readers (all cues available up front) and a bounded program (VOD).
+    let nativeSubtitleWholeProgram: Bool
+    /// Current engine playlist shift (AVPlayer clock = source_pts - shift), read at serve time so whole-program
+    /// cues land on the same AVPlayer axis as the video even when the shift was not known at load (Sodalite#32).
+    private let currentShiftSeconds: @Sendable () -> Double
+    /// Sodalite#32 Phase 2: tap-fed stores can carry raw ASS event lines (the overlay renders the
+    /// styling); the WebVTT rendition must serve plain text, so strip at build time.
+    private let stripASSMarkupInVTT: Bool
 
     /// Synchronous teardown + relaunch at the given absolute segment index.
     private let restartHandler: ((Int) -> Void)?
@@ -109,7 +121,11 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         targetDurationFloorSeconds: Double? = nil,
         restartHandler: ((Int) -> Void)? = nil,
         nativeSubtitleStores: [NativeSubtitleCueStore] = [],
-        nativeSubtitleLanguages: [String?] = []
+        nativeSubtitleLanguages: [String?] = [],
+        stripASSMarkupInVTT: Bool = false,
+        nativeSubtitleDefaultOrdinal: Int = 0,
+        nativeSubtitleWholeProgram: Bool = false,
+        currentShiftSeconds: @escaping @Sendable () -> Double = { 0 }
     ) {
         self.cache = cache
         self.segments = segments
@@ -127,6 +143,10 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         self.restartHandler = restartHandler
         self.nativeSubStores = nativeSubtitleStores
         self.nativeSubLanguages = nativeSubtitleLanguages
+        self.stripASSMarkupInVTT = stripASSMarkupInVTT
+        self.nativeSubtitleDefaultOrdinal = nativeSubtitleDefaultOrdinal
+        self.nativeSubtitleWholeProgram = nativeSubtitleWholeProgram
+        self.currentShiftSeconds = currentShiftSeconds
     }
 
     /// Append a finalized live segment. Index must equal segments.count; out-of-order ignored.
@@ -545,6 +565,28 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// window is read straight off the segment plan rather than recomputed.
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String? {
         guard ordinal >= 0, ordinal < nativeSubStores.count else { return nil }
+        let store = nativeSubStores[ordinal]
+        if nativeSubtitleWholeProgram {
+            // Sodalite#32: serve the ENTIRE program's cues as one .vtt (the only AVPlayer-reliable sideload
+            // shape). AVKit fetches this VOD single-segment file ONCE and never re-fetches it, so it MUST be
+            // complete. Wait for the reader's definitive EOF signal (isFinished) rather than a cue-count plateau
+            // heuristic, which fired early during dialogue gaps and served a truncated file (device-confirmed).
+            let deadline = Date().addingTimeInterval(30.0)
+            while !store.isFinished, Date() < deadline {
+                usleep(100_000)
+            }
+            // Sodalite#32: the cues are stored at SOURCE pts; AVPlayer clock = source - shift. Apply the CURRENT
+            // engine shift (read now, not the possibly-zero load-time value) so cues land on the video's axis.
+            let shift = currentShiftSeconds()
+            store.setShiftSeconds(shift)
+            let cues = stripMarkupIfNeeded(store.allCues())
+            EngineLog.emit("[HLSVideoEngine] whole-program subtitle .vtt ord=\(ordinal) cues=\(cues.count) finished=\(store.isFinished) shift=\(String(format: "%.2f", shift)) first=\(cues.first.map { String(format: "%.1f", $0.start) } ?? "-") last=\(cues.last.map { String(format: "%.1f", $0.end) } ?? "-")", category: .hlsServer)
+            // PLAIN WebVTT, NO X-TIMESTAMP-MAP (matches the proven-working whole-file sideload). With the map,
+            // AVKit anchors cues to the fMP4 sample PTS (which diverges from currentTime over our loopback) and
+            // the subtitles render offset by the playback position; without it AVKit uses the cue times as the
+            // AVPlayer timeline directly (= our absolute cue axis). Sodalite#32.
+            return WebVTTBuilder.body(cues: cues)
+        }
         stateLock.lock()
         guard segmentIndex >= 0, segmentIndex < segments.count else {
             stateLock.unlock()
@@ -553,15 +595,34 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         let start = segments[segmentIndex].startSeconds
         let end = start + segments[segmentIndex].durationSeconds
         stateLock.unlock()
-        // #15: return immediately with whatever the reader has filled. Never block here: HLSLocalServer
-        // processes requests per-connection serially and AVPlayer uses only 1-3 connections, so holding the
-        // response serializes the legible-track pipeline. The native reader's large read-ahead keeps it ahead
-        // of AVPlayer's prefetch so the window is already filled.
-        let store = nativeSubStores[ordinal]
-        let cues = store.cuesInWindow(start: start, end: end)
-        EngineLog.emit("[PiPSubsDiag] ord=\(ordinal) seg=\(segmentIndex) win=[\(String(format: "%.1f", start)),\(String(format: "%.1f", end))) inWin=\(cues.count) readMax=\(String(format: "%.1f", store.readMaxCueEnd()))", category: .hlsServer)
+        // Sodalite#32: bounded, distance-aware readiness wait replacing the 25 s wait-for-isFinished. AVKit
+        // caches an empty-served window forever, so waiting is worth it; but blocking every fetch on a store
+        // that never finishes serialized the loopback connection AVPlayer also uses for video (device:
+        // scrubbing wedged while a rendition was selected). Wait only while the reader is plausibly about to
+        // cover THIS window (read head within the horizon, or still warming up), and only briefly.
+        let horizonSeconds = 30.0
+        let deadline = Date().addingTimeInterval(3.0)
+        while !store.isFinished,
+              store.readMaxCueEnd() < end,
+              end <= store.readMaxCueEnd() + horizonSeconds || store.readMaxCueEnd() <= 0,
+              Date() < deadline {
+            usleep(100_000)
+        }
+        let cues = stripMarkupIfNeeded(store.cuesInWindow(start: start, end: end))
+        EngineLog.emit("[HLSVideoEngine] subtitle .vtt ord=\(ordinal) seg=\(segmentIndex) win=[\(String(format: "%.1f", start)),\(String(format: "%.1f", end))) inWin=\(cues.count) readMax=\(String(format: "%.1f", store.readMaxCueEnd()))", category: .hlsServer, level: .verbose)
         // Absolute media-timeline cue times + MPEGTS:0 identity map. Flip to segment-relative here (one line:
         // relativeToStart: true) if on-device PiP shows subtitles shifted by the segment start. See WebVTTBuilder.segment.
         return WebVTTBuilder.segment(cues: cues, segmentStart: start)
+    }
+
+    /// Sodalite#32 Phase 2: see `stripASSMarkupInVTT`.
+    private func stripMarkupIfNeeded(
+        _ cues: [(start: Double, end: Double, text: String)]
+    ) -> [(start: Double, end: Double, text: String)] {
+        guard stripASSMarkupInVTT else { return cues }
+        return cues.compactMap { c in
+            guard let plain = SubtitleRectText.plainText(fromASSEventLine: c.text) else { return nil }
+            return (c.start, c.end, plain)
+        }
     }
 }

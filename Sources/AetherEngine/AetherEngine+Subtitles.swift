@@ -98,6 +98,27 @@ extension AetherEngine {
             return
         }
 
+        // Sodalite#32 Phase 2: text track covered by the producer's pump tap: the overlay is fed from
+        // the tap (backfill the already-harvested produced region now, live events forwarded by
+        // onSubtitleTapEvent). No side demuxer, so enabling subtitles over a remote source is instant.
+        subtitleTapOverlayStreamIndex = nil
+        if !isLive, let session = nativeVideoSession, session.subtitleTapCoversStream(Int32(index)) {
+            cancelSidecarTask()
+            cancelEmbeddedSubtitleReader()
+            isSubtitleActive = true
+            activeEmbeddedSubtitleStreamIndex = Int32(index)
+            activeSubtitleTrackIndex = index
+            subtitleTapOverlayStreamIndex = Int32(index)
+            subtitleCues = tapOverlayBackfill(streamIndex: Int32(index))
+            isLoadingSubtitles = false
+            EngineLog.emit(
+                "[AetherEngine] overlay fed by pump tap for stream=\(index) "
+                + "(backfilled \(subtitleCues.count) cues)",
+                category: .engine
+            )
+            return
+        }
+
         // Custom sources: side demuxer needs an independent cursor; no-op if reader cannot clone.
         var customClone: IOReader? = nil
         if isCustomSource {
@@ -497,6 +518,25 @@ extension AetherEngine {
 
     /// Apply a decoded event: PGS clear-event trim + sorted insert so the overlay lookup stays correct after backward scrubs.
     @MainActor
+    /// Sodalite#32 Phase 2: snapshot the tap store backing `streamIndex` for the overlay backfill.
+    func tapOverlayBackfill(streamIndex: Int32) -> [SubtitleCue] {
+        guard let session = nativeVideoSession,
+              let ord = nativeSubtitleTrackTable.firstIndex(where: { $0.sourceStreamIndex == Int(streamIndex) }),
+              ord < session.nativeSubtitleCueStoresForSession.count else { return [] }
+        return session.nativeSubtitleCueStoresForSession[ord].snapshotCues()
+    }
+
+    /// Sodalite#32 Phase 2: forward the ACTIVE tap-overlay track's decoded events into the host overlay
+    /// (subtitleCues), replacing the side reader's publish path. Called at load, before start().
+    func armSubtitleTapOverlayForwarding(on session: HLSVideoEngine) {
+        session.onSubtitleTapEvent = { [weak self] streamIndex, event in
+            Task { @MainActor [weak self] in
+                guard let self, self.subtitleTapOverlayStreamIndex == streamIndex else { return }
+                self.applySubtitleEvent(event, channel: .primary)
+            }
+        }
+    }
+
     private func applySubtitleEvent(_ event: EmbeddedSubtitleDecoder.SubtitleEvent, channel: SubtitleChannel) {
         guard isSubtitleActive(for: channel) else { return }
 
@@ -672,13 +712,19 @@ extension AetherEngine {
         subtitleCues = []
         sidecarASSHeader = nil
         isLoadingSubtitles = false
+        subtitleTapOverlayStreamIndex = nil
         cancelNativeSubtitleReaders()
-        nativeVideoSession?.nativeSubtitleCueStoresForSession.forEach { $0.clear() }
-        nativeVideoSession?.nativeSubtitleCueStoresForSession = []
-        nativeVideoSession?.nativeSubtitleLanguagesForSession = []
-        nativeVideoSession?.producer?.subtitleCueStores = []
-        nativeVideoSession?.producer?.nativeSubtitleLanguages = []
-        nativeSubtitleRenditionAvailable = false
+        // Sodalite#32 Phase 2: with the pump tap active the stores are the session's cue source of
+        // truth (the tap's decoder dedup would never refill a cleared store), so subtitles-off keeps
+        // them; only the reader-driven path tears them down.
+        if nativeVideoSession?.subtitleTapActive != true {
+            nativeVideoSession?.nativeSubtitleCueStoresForSession.forEach { $0.clear() }
+            nativeVideoSession?.nativeSubtitleCueStoresForSession = []
+            nativeVideoSession?.nativeSubtitleLanguagesForSession = []
+            nativeVideoSession?.producer?.subtitleCueStores = []
+            nativeVideoSession?.producer?.nativeSubtitleLanguages = []
+            nativeSubtitleRenditionAvailable = false
+        }
     }
 
     func cancelSidecarTask(channel: SubtitleChannel = .primary) {
@@ -707,8 +753,15 @@ extension AetherEngine {
     // MARK: - Native multi-track decode (#55, all-tracks)
 
     /// Launch the multi-decode reader that fills every text track's store in one side-demuxer pass (#55, all-tracks). Separate from the inline host-overlay path (subtitleCues). Idempotent: cancels any prior reader first. `stores` is ordinal-aligned with `nativeSubtitleTrackTable`.
-    func startNativeSubtitleReaders(url: URL, stores: [NativeSubtitleCueStore]) {
+    /// `readToEOF` reads straight through without the read-ahead parking and marks the stores finished at EOF.
+    /// `startAtSeconds` overrides the read anchor (default: the current playhead). Sodalite#32: eager readers
+    /// anchor at the SESSION START POSITION, not 0; a from-0 read behind a resume position spent the whole
+    /// session catching up over a remote link and never covered the playhead (device: readMax 48s vs playhead
+    /// 304s, every .vtt served empty).
+    func startNativeSubtitleReaders(url: URL, stores: [NativeSubtitleCueStore],
+                                    readToEOF: Bool = false, startAtSeconds: Double? = nil) {
         cancelNativeSubtitleReaders()
+        nativeSubtitleReadersRunToEOF = readToEOF
         var pairs: [(streamIndex: Int32, store: NativeSubtitleCueStore)] = []
         for (ordinal, entry) in nativeSubtitleTrackTable.enumerated() {
             guard ordinal < stores.count, let src = entry.sourceStreamIndex else { continue }
@@ -725,7 +778,7 @@ extension AetherEngine {
         let formatHint = customFormatHint
         let w = sourceVideoWidth > 0 ? sourceVideoWidth : 1920
         let h = sourceVideoHeight > 0 ? sourceVideoHeight : 1080
-        let startAt = sourceTime
+        let startAt = startAtSeconds ?? sourceTime
         let reader = customClone
         // #76: same bounded-probe + active-title open as the inline reader.
         let probesize = loadedOptions.probesize
@@ -736,7 +789,7 @@ extension AetherEngine {
                 url: url, reader: reader, formatHint: formatHint, headers: headers,
                 pairs: pairs, startAt: startAt, videoWidth: w, videoHeight: h,
                 callerProbesize: probesize, callerMaxAnalyzeDuration: maxAnalyzeDuration,
-                selectTitleID: titleID
+                selectTitleID: titleID, readToEOF: readToEOF
             )
         }
     }
@@ -747,6 +800,7 @@ extension AetherEngine {
         nativeSubtitleReadersTask = nil
         nativeSubtitleReadersDemuxer?.markClosed()
         nativeSubtitleReadersDemuxer = nil
+        nativeSubtitleReadersRunToEOF = false
     }
 
     /// Multi-stream side-demuxer pass: one EmbeddedSubtitleDecoder per text stream, writing to NativeSubtitleCueStores (not subtitleCues). Mirrors `runEmbeddedSubtitleReader` (prewarm, re-sample, -2 s lead-in, park). Always plain text: mov_text muxer carries no ASS markup.
@@ -756,7 +810,7 @@ extension AetherEngine {
         pairs: [(streamIndex: Int32, store: NativeSubtitleCueStore)],
         startAt: Double, videoWidth: Int32, videoHeight: Int32,
         callerProbesize: Int64? = nil, callerMaxAnalyzeDuration: Int64? = nil,
-        selectTitleID: Int? = nil
+        selectTitleID: Int? = nil, readToEOF: Bool = false
     ) async {
         let demuxer = Demuxer()
         let openProfile = DemuxerOpenProfile.subtitleSideDemuxer(
@@ -799,7 +853,9 @@ extension AetherEngine {
             demuxer.seek(to: duration * 0.5)
         }
         let freshPlayhead = await MainActor.run { [weak self] in self?.sourceTime }
-        let effectiveStart = max(startAt, freshPlayhead ?? startAt)
+        // Sodalite#32: a whole-program read must start at `startAt` (0) regardless of the playhead; the usual
+        // max-with-playhead (so the PiP reader doesn't start behind the playhead) would drop all cues before it.
+        let effectiveStart = readToEOF ? startAt : max(startAt, freshPlayhead ?? startAt)
         let seekTo = max(0, effectiveStart - 2.0)
         demuxer.seek(to: seekTo)
 
@@ -878,7 +934,9 @@ extension AetherEngine {
             // #15: keep the native readers ahead of AVPlayer's ~240s subtitle prefetch burst (larger lead than
             // the inline overlay reader), so the served .vtt segments carry cues instead of being fetched empty
             // and cached empty for the VOD rendition. Only runs while a native rendition is selected (PiP).
-            if let pktSeconds, pktSeconds > playheadSnapshot + Self.nativeSubtitleReadAheadSeconds {
+            // Sodalite#32: a whole-program .vtt must hold EVERY cue, so read straight to EOF without parking
+            // (cue data is tiny). markFinished after the loop lets the .vtt handler wait for a complete file.
+            if !readToEOF, let pktSeconds, pktSeconds > playheadSnapshot + Self.nativeSubtitleReadAheadSeconds {
                 while !Task.isCancelled {
                     guard let fresh = await MainActor.run(body: { [weak self] in self?.sourceTime }) else {
                         break readLoop
@@ -899,8 +957,14 @@ extension AetherEngine {
             }
         }
 
+        // Sodalite#32: reaching here without cancellation means the side demuxer hit EOF, so every cue for the
+        // whole program is now in the stores; signal completeness for the whole-program .vtt handler.
+        if readToEOF && !Task.isCancelled {
+            for pair in pairs { pair.store.markFinished() }
+        }
+
         EngineLog.emit(
-            "[AetherEngine] native subtitle readers exited (cancelled=\(Task.isCancelled)) totalCues=\(totalCues)",
+            "[AetherEngine] native subtitle readers exited (cancelled=\(Task.isCancelled)) totalCues=\(totalCues) readToEOF=\(readToEOF)",
             category: .engine
         )
     }
@@ -908,11 +972,13 @@ extension AetherEngine {
     /// Select or deselect the native mov_text track by ordinal (#55). nil deselects all. Matches by `extendedLanguageTag` first (language-rank-aware for same-language duplicates), falls back to positional index. No-op when no legible group or ordinal out of range.
     public func setNativeSubtitleSelected(track ordinal: Int?) {
         // #15: lazy readers — run the side-demuxer only while a native track is selected (PiP), idle otherwise.
+        // Sodalite#32: an eager read-to-EOF reader survives deselect (it is building whole-session coverage;
+        // cancelling it on PiP exit left the store frozen at ~48s and every later .vtt served empty).
         if ordinal != nil {
             if nativeSubtitleReadersTask == nil, let params = nativeSubtitleReaderParams {
                 startNativeSubtitleReaders(url: params.url, stores: params.stores)
             }
-        } else {
+        } else if !nativeSubtitleReadersRunToEOF {
             cancelNativeSubtitleReaders()
         }
         guard let item = currentAVPlayer?.currentItem else { return }
@@ -944,24 +1010,60 @@ extension AetherEngine {
                 selected = group.options[ordinal]
             }
             guard let option = selected else { return }
-            // #15: pre-fill the near window BEFORE selecting, so AVPlayer fetches a populated rendition instead
-            // of racing the just-started reader (empty .vtt). Done here (off the loopback connection) rather
-            // than blocking the .vtt handler, which serializes the connection and stalls the legible pipeline.
+            // #15: pre-fill BEFORE selecting, so AVPlayer fetches a populated rendition instead of racing the
+            // reader (empty .vtt). Done here (off the loopback connection) rather than blocking the .vtt handler,
+            // which serializes the connection and stalls the legible pipeline.
+            // Sodalite#32: AVKit prefetches the ENTIRE forward subtitle window (~3 min observed) in ONE burst at
+            // selection and caches whatever it gets, never re-fetching a segment it already pulled. A +5s pre-fill
+            // left ~45/46 segments empty (device-confirmed). Pre-fill far enough ahead to cover that burst; break
+            // early when the reader stops making progress (EOF / read-ahead parked) so we never wait the full
+            // deadline for content with little remaining.
             if let stores = nativeSubtitleReaderParams?.stores, ordinal < stores.count {
                 let store = stores[ordinal]
-                let target = currentTime + 5.0
-                let deadline = Date().addingTimeInterval(6.0)
+                let target = currentTime + 240.0
+                let deadline = Date().addingTimeInterval(15.0)
+                var lastMax = 0.0
+                var stall = 0
                 while store.readMaxCueEnd() < target, Date() < deadline {
-                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    let m = store.readMaxCueEnd()
+                    if m > lastMax {
+                        lastMax = m
+                        stall = 0
+                    } else if lastMax > 0 {
+                        // Only treat a flat readMax as "reader done/parked" AFTER it has started producing;
+                        // before the first cue lands (seek + demux latency) readMax is legitimately 0, and an
+                        // early break would skip the pre-fill entirely (Sodalite#32 regression).
+                        stall += 1
+                    }
+                    if stall >= 6 { break }   // ~900ms with no new cues after producing => EOF / read-ahead parked
+                    try? await Task.sleep(nanoseconds: 150_000_000)
                 }
+                EngineLog.emit("[AetherEngine] native subtitle pre-fill done: readMax=\(String(format: "%.1f", store.readMaxCueEnd())) target=\(String(format: "%.1f", target)) cues=\(store.cueCount)", category: .engine)
             }
             // #15: AVKit attaches the legible renderer to whatever selection is active when the rendering
             // pipeline is established; a selection made mid-playback updates state + downloads cues but is not
             // drawn until re-asserted. Deselect, hop one runloop, then reselect to force the renderer to attach
             // (documented workaround; the same effect a PiP round-trip had). Needs the manual-criteria pin above.
+            let itemID = String(UInt(bitPattern: ObjectIdentifier(item).hashValue) & 0xffff, radix: 16)
+            EngineLog.emit("[AetherEngine] native subtitle select: item=\(itemID) opt=\(option.displayName) groupOpts=\(group.options.count) criteriaAuto=\(currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically ?? true) itemIsCurrent=\(currentAVPlayer?.currentItem === item)", category: .engine)
             item.select(nil, in: group)
             try? await Task.sleep(nanoseconds: 100_000_000)
             item.select(option, in: group)
+            let after = item.currentMediaSelection.selectedMediaOption(in: group)?.displayName ?? "nil"
+            EngineLog.emit("[AetherEngine] native subtitle select done: selected=\(after) itemIsCurrent=\(currentAVPlayer?.currentItem === item)", category: .engine)
+            // Sodalite#32: a select landing inside a stall recovery gets dropped outright by AVFoundation
+            // (device: PiP entry 0.1s after waitingToPlay -> playing read back nil and STAYED nil; the same
+            // select succeeded on the previous entry). Re-assert briefly until it sticks or the item changes.
+            var retries = 0
+            while item.currentMediaSelection.selectedMediaOption(in: group) == nil,
+                  retries < 4,
+                  currentAVPlayer?.currentItem === item {
+                retries += 1
+                try? await Task.sleep(nanoseconds: 700_000_000)
+                item.select(option, in: group)
+                let retried = item.currentMediaSelection.selectedMediaOption(in: group)?.displayName ?? "nil"
+                EngineLog.emit("[AetherEngine] native subtitle select retry #\(retries): selected=\(retried)", category: .engine)
+            }
         }
     }
 

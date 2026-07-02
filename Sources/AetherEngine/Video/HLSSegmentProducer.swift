@@ -293,6 +293,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// PTS of first kept video packet (AV_PKT_FLAG_KEY); used to drop HEVC RASL leading B-frames (open-GOP CRA).
     private var firstActualVideoPts: Int64 = Int64.min
     private var loggedFirstLeadingDrop: Bool = false
+    /// Head-of-stream audio frames preceding the video anchor, dropped because the output
+    /// timeline starts at 0 and the muxer no longer absorbs negative timestamps.
+    private var droppedLeadingAudioCount: Int = 0
 
     /// Pre-gate drop counters; surface the "lädt unendlich" failure mode when the gate never opens.
     private var pregateVideoDropCount: Int = 0
@@ -435,6 +438,19 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
     }
 
+    /// Whether the pump-exit in-flight segment may be adopted into the cache. A teardown mid-VOD
+    /// (restart, wedge break, read error) leaves it PARTIAL: shorter content than the playlist's
+    /// EXTINF under a full segment's index, with video and audio ending at different interleave
+    /// drain points. Byte-budgeted retention keeps such a segment replayable (device: seeking back
+    /// to 0 played a teardown-partial with ~2 s of A/V split), so VOD adopts only the natural EOF
+    /// tail (a legitimately short final segment). Live always adopts: its playlist advertises the
+    /// ACTUAL duration via reportLiveSegmentFinalized, so a short live tail is not a lie.
+    static func shouldAdoptTeardownSegment(exitReason: PumpExitReason, isLive: Bool) -> Bool {
+        if isLive { return true }
+        if case .eof = exitReason { return true }
+        return false
+    }
+
     var onPumpFinished: (@Sendable (PumpExitReason) -> Void)?
 
     /// #65: reads whether AVPlayer currently wants to play (`timeControlStatus != .paused`), off the main
@@ -454,6 +470,18 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// never muxed (output byte-identical). Set via init so it's in the keep-set; observer attached after.
     var closedCaptionStreamIndex: Int32 = -1
     var closedCaptionObserver: (@Sendable (UnsafePointer<AVPacket>, AVRational) -> Void)?
+
+    /// Sodalite#32: text-subtitle tap, generalizing the #77 CC tap. Streams in this set are kept by the
+    /// pump (not discarded) and each of their packets is handed to `subtitleTapObserver` (with the
+    /// stream's time_base), then dropped below as a foreign packet — never muxed. The pump already reads
+    /// the source's full interleave, so harvesting subtitle packets here costs no extra bandwidth: the
+    /// session's cue stores fill for exactly the region the producer has produced, across restarts.
+    /// Set at init (BEFORE the discard block: a post-init assignment came too late, the demuxer had
+    /// already discarded the subtitle streams and only open-time queued packets ever reached the tap;
+    /// device repro: readMax frozen at 5.2s on a resumed remote MKV).
+    var subtitleTapStreamIndices: Set<Int32>
+    var subtitleTapObserver: (@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational) -> Void)?
+    private var subtitleTapTimeBases: [Int32: AVRational] = [:]
     private var closedCaptionStreamTimeBase = AVRational(num: 1, den: 1)
 
     /// Must be set before first allocateMuxer call. Enables mov_text track declaration in init moov (#55).
@@ -523,6 +551,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         audioFallbackDurationPts: Int64 = 0,
         restartTargetVideoDts: Int64 = Int64.min,
         closedCaptionStreamIndex: Int32 = -1,
+        subtitleTapStreamIndices: Set<Int32> = [],
         desiredFirstVideoTfdtPts: Int64,
         desiredFirstAudioTfdtPts: Int64 = 0,
         segmentBoundaries: [Int64],
@@ -541,6 +570,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
         self.videoStreamIndex = videoStreamIndex
         self.closedCaptionStreamIndex = closedCaptionStreamIndex   // #77: before the discard block below
+        self.subtitleTapStreamIndices = subtitleTapStreamIndices   // Sodalite#32: same reason
         self.videoConfig = video
         self.convertP7Active = video.convertP7ToProfile81
         self.audioConfig = audio
@@ -568,6 +598,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         if let side = sideAudioDemuxer {
             var keep: Set<Int32> = [videoStreamIndex]
             if closedCaptionStreamIndex >= 0 { keep.insert(closedCaptionStreamIndex) }   // #77
+            keep.formUnion(subtitleTapStreamIndices)   // Sodalite#32
             demuxer.discardAllStreamsExcept(keep)
             if let audio = audio {
                 side.discardAllStreamsExcept([audio.sourceStreamIndex])
@@ -578,12 +609,18 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 keep.insert(audio.sourceStreamIndex)
             }
             if closedCaptionStreamIndex >= 0 { keep.insert(closedCaptionStreamIndex) }   // #77
+            keep.formUnion(subtitleTapStreamIndices)   // Sodalite#32
             demuxer.discardAllStreamsExcept(keep)
         }
         // #77: cache the CC stream's time_base for the observer's PTS conversion.
         if closedCaptionStreamIndex >= 0 {
             closedCaptionStreamTimeBase = demuxer.stream(at: closedCaptionStreamIndex)?.pointee.time_base
                 ?? AVRational(num: 1, den: 1)
+        }
+        // Sodalite#32: same for the tapped subtitle streams.
+        for idx in subtitleTapStreamIndices {
+            subtitleTapTimeBases[idx] = demuxer.stream(at: idx)?.pointee.time_base
+                ?? AVRational(num: 1, den: 1000)
         }
 
         let audioDesc = audio.map { a -> String in
@@ -995,9 +1032,33 @@ final class HLSSegmentProducer: @unchecked Sendable {
         currentMuxerSegmentIndex = .min
     }
 
+    /// Finalize the muxer to release its context and staging file, but throw the partial segment
+    /// away instead of adopting it into the cache (see `shouldAdoptTeardownSegment`).
+    private func discardSessionMuxer() {
+        guard let muxer = currentMuxer else { return }
+        let idx = currentMuxerSegmentIndex
+        if let result = muxer.finalize() {
+            try? FileManager.default.removeItem(at: result.path)
+            EngineLog.emit(
+                "[HLSSegmentProducer] seg-\(idx).m4s partial at teardown (\(result.bytesWritten) B) discarded, not adopted",
+                category: .session
+            )
+        }
+        stateLock.lock()
+        currentMuxer = nil
+        stateLock.unlock()
+        currentMuxerSegmentIndex = .min
+    }
+
     deinit {
+        // Backstop for a pump that never exited normally; without an exit reason, a VOD in-flight
+        // segment is partial by definition, so only live may adopt here.
         if currentMuxer != nil {
-            finalizeSessionMuxerAndAdopt()
+            if isLive {
+                finalizeSessionMuxerAndAdopt()
+            } else {
+                discardSessionMuxer()
+            }
         }
     }
 
@@ -1293,6 +1354,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 // packet (the eia_608/c608 caption stream) and is dropped below — never muxed.
                 if pktStreamIdx == closedCaptionStreamIndex, let observe = closedCaptionObserver {
                     observe(packet, closedCaptionStreamTimeBase)
+                }
+                // Sodalite#32: hand tapped subtitle packets to the session's decode tap, then drop them
+                // below as foreign packets. Main demuxer only; side-demuxer indices alias a different space.
+                if origin == .main, subtitleTapStreamIndices.contains(pktStreamIdx),
+                   let observe = subtitleTapObserver {
+                    observe(pktStreamIdx, packet,
+                            subtitleTapTimeBases[pktStreamIdx] ?? AVRational(num: 1, den: 1000))
                 }
 
                 if packet.pointee.dts == Int64.min {
@@ -1799,8 +1867,18 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             )
                             pendingAudioInheritSeamOut = nil
                         } else {
-                            // Restart: snap to video keyframe tfdt (residual is sub-frame; part of HEVC-resume alignment stack).
-                            audioShiftPts = firstActualAudioDts - desiredFirstAudioTfdtPts
+                            // Restart: inherit the session mapping exactly like head-of-stream. The old snap onto
+                            // the video seam (firstActualAudioDts - desiredFirstAudioTfdtPts) compensated for the
+                            // fresh muxer zero-basing each restart epoch; with tfdt continuity (frag_discont) the
+                            // snap itself became the divergence: it moved audio off the source frame grid by up to
+                            // one frame per epoch and skewed the shift fold-back in segmentIndex(forSourcePts:) by
+                            // the same amount, so a restarted segment carried a different audio timeline (and a
+                            // different boundary frame) than continuous production.
+                            audioShiftPts = av_rescale_q(
+                                videoShiftPts,
+                                sourceVideoTimeBase,
+                                audioTb
+                            )
                         }
                         let gapInAudioTb: Int64
                         if restartTargetVideoDts == Int64.min {
@@ -1871,6 +1949,24 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     if packet.pointee.pts != Int64.min {
                         packet.pointee.pts -= activeShift
                     }
+                }
+
+                // Defense in depth: the audio gate anchors head-of-stream audio at the video anchor,
+                // so audio reaching here is non-negative in practice; rescale rounding between the
+                // gate target and the inherited shift (or an exotic source) can still yield a
+                // marginally negative out-dts. The muxer no longer absorbs negatives
+                // (avoid_negative_ts=disabled so restarts can continue the timeline; tfdt is
+                // unsigned), so drop such frames outright.
+                if !isVideoPkt, packet.pointee.dts != Int64.min, packet.pointee.dts < 0 {
+                    droppedLeadingAudioCount += 1
+                    if droppedLeadingAudioCount == 1 {
+                        EngineLog.emit(
+                            "[HLSSegmentProducer] dropping leading audio before the video anchor "
+                            + "(out dts=\(packet.pointee.dts)); the output timeline starts at 0",
+                            category: .session
+                        )
+                    }
+                    continue
                 }
 
                 if isVideoPkt {
@@ -2119,7 +2215,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
             }
         }
 
-        finalizeSessionMuxerAndAdopt()
+        if Self.shouldAdoptTeardownSegment(exitReason: exitReason, isLive: isLive) {
+            finalizeSessionMuxerAndAdopt()
+        } else {
+            discardSessionMuxer()
+        }
         let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - pumpStart.uptimeNanoseconds) / 1_000_000
         EngineLog.emit(
             "[HLSSegmentProducer] pump finished: reason=\(exitReason) "

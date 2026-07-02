@@ -274,6 +274,12 @@ public final class AetherEngine: ObservableObject {
     /// Hosts use this to populate a picker and call `setNativeSubtitleSelected(track:)`.
     @Published public internal(set) var nativeSubtitleTracks: [NativeSubtitleTrack] = []
 
+    /// Ordinal of the native subtitle rendition marked DEFAULT=YES in the master, resolved from
+    /// `LoadOptions.preferredSubtitleLanguages` (fallback 0). A programmatically-selected legible track only
+    /// renders if it is the master's default (AVKit's AVSmartSubtitlesController hides a non-default selection
+    /// as mute-only), so a host selecting a native track for PiP should select THIS ordinal (Sodalite#32).
+    @Published public internal(set) var nativeSubtitleDefaultOrdinal: Int = 0
+
     /// True for a live session (`LoadOptions.isLive`). Cleared in stopInternal so it can't bleed into the next VOD load.
     @Published public private(set) var isLive: Bool = false
 
@@ -605,6 +611,11 @@ public final class AetherEngine: ObservableObject {
     }
     var nativeSubtitleTrackTable: [NativeSubtitleTrackEntry] = []
 
+    /// Sodalite#32 Phase 2: source stream index of the embedded text track whose OVERLAY cues are fed
+    /// by the producer's pump tap (no side demuxer). nil = tap-overlay mode off (bitmap/CC/sidecar/live
+    /// selections keep the reader paths).
+    var subtitleTapOverlayStreamIndex: Int32?
+
     /// Detached reader that decodes ALL embedded text subtitle streams in one side-demuxer pass into their
     /// ordinal's NativeSubtitleCueStore (#55, all-tracks). Parallel to embeddedSubtitleTask (which drives
     /// subtitleCues for the active track with full styling). Cancelled on stop/clear/load.
@@ -618,6 +629,11 @@ public final class AetherEngine: ObservableObject {
     /// declared the mov_text track, but the readers only start on the first setNativeSubtitleSelected (PiP),
     /// so a session that never selects a native track pays no standing side-demuxer cost. Cleared on stop/clear.
     var nativeSubtitleReaderParams: (url: URL, stores: [NativeSubtitleCueStore])?
+
+    /// True while the running native readers were started in read-to-EOF (eager) mode (Sodalite#32).
+    /// Deselect must NOT cancel such a reader (it is building whole-session coverage for the next PiP
+    /// entry), and select must not replace it with a playhead-anchored parking reader.
+    var nativeSubtitleReadersRunToEOF = false
 
     /// Per-session subtitle event log counter. Caps diagnostic output; reset on each load.
     var subtitleCueDiagnosticCount: Int = 0
@@ -1502,6 +1518,10 @@ public final class AetherEngine: ObservableObject {
                 subtitleCues = []
                 ccCueSnapshot = []
                 closedCaptionTap?.requestReset()
+            } else if subtitleTapOverlayStreamIndex == streamIdx {
+                // Sodalite#32 Phase 2: tap-fed overlay; nothing to re-arm, the tap rides the producer
+                // across the seek. Re-backfill from the store so earlier-pruned cues reappear.
+                subtitleCues = tapOverlayBackfill(streamIndex: streamIdx)
             } else {
                 subtitleCues = []
                 // startEmbeddedSubtitleTask cancels + drains the prior reader, then reuses the open side demuxer

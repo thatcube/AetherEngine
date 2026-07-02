@@ -47,10 +47,10 @@ A scannable summary; the depth for each row lives in **[docs/formats.md](docs/fo
 | Surround | 5.1 / 7.1 with correct `AudioChannelLayout` |
 | Audio-only | `LoadOptions.audioOnly`: lean pipeline, no video machinery, system Now-Playing on tvOS / iOS |
 | Background audio | Audio keeps playing when the app backgrounds on iOS: native AVPlayer stays alive, the software path drops video and keeps decoding audio (`backgroundPlaybackEnabled` / `pictureInPictureActive`); tvOS tears down (wedge-safe) |
-| Subtitles | Text (SRT / ASS / SSA / VTT / mov_text) inline, bitmap (PGS / DVB / DVD) as `CGImage`, in-band CEA-608 closed captions (`eia_608` demuxable track, field-1), sidecar files, opt-in raw ASS markup + fonts; opt-in native legible menu (all text tracks as language-tagged tx3g traks for PiP / AirPlay / external display, `LoadOptions.prepareNativeSubtitles`) |
+| Subtitles | Text (SRT / ASS / SSA / VTT / mov_text) inline, bitmap (PGS / DVB / DVD) as `CGImage`, in-band CEA-608 closed captions (`eia_608` demuxable track, field-1), sidecar files, opt-in raw ASS markup + fonts; embedded-text cues harvested from the producer's own read (instant enable, no side-channel bandwidth); opt-in native WebVTT renditions (one per text track, language-tagged) so subtitles survive PiP / AirPlay / external display (`LoadOptions.prepareNativeSubtitles`) |
 | Frames | Off-playback `FrameExtractor`: `thumbnail` (scrub preview) + `snapshot` (frame-accurate) |
 | Metadata | `MediaMetadata` (title / artist / album / albumArtist + cover) parsed on load |
-| Seek | Producer restart for backward / far-forward; short forward scrubs ride the cached window |
+| Seek | VOD seeks into watched content are restart-free cache hits (byte-budgeted retention, 2 GiB cap); short forward scrubs ride the cached window; only never-produced targets restart the producer |
 | Streaming | One long-lived forward-streaming connection, reconnect-on-drop; CDN-stutter resilient; optional caller-bounded open-time probe budget (`LoadOptions.probesize` / `maxAnalyzeDuration`) to cut first-frame latency on sparse remote remuxes |
 | Live / DVR | Unbounded live + optional timeshift; direct HLS ingest with AES-128 clear-key and SSAI ad-pod handling |
 | Custom input | Play any byte source via the `IOReader` protocol (`load(source:)`) |
@@ -157,7 +157,7 @@ Subtitle cues land in raw source PTS; render the overlay against `player.sourceT
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "4.8.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "4.9.0")
 ```
 
 Two complementary samples ship in `Examples/`:
@@ -282,10 +282,10 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface — every `public` declaration in `Sources/AetherEngine/` — is the stability contract. **Major** removes / renames public symbols or breaks adopters; **Minor** adds public API or codec / format support; **Patch** fixes bugs with no public API change. `internal` types are not part of the contract.
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "4.8.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "4.9.0")
 ```
 
-Pin to `.upToNextMinor(from: "4.8.0")` for stricter teams that prefer to opt into minor bumps explicitly.
+Pin to `.upToNextMinor(from: "4.9.0")` for stricter teams that prefer to opt into minor bumps explicitly.
 
 ## Requirements
 
