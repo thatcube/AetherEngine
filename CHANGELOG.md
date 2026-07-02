@@ -8,6 +8,14 @@ Versioning follows [Semantic Versioning](https://semver.org). See
 [README › Stability and versioning](README.md#stability-and-versioning) for
 the public-API contract.
 
+## [4.9.1] - 2026-07-02
+
+### Fixed
+
+- **tvOS build.** The segment-retention free-space clamp queried `volumeAvailableCapacityForImportantUsage`, which does not exist on tvOS; tvOS now uses the plain `volumeAvailableCapacity` key.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.9.1))
+
 ## [4.9.0] - 2026-07-02
 
 ### Added

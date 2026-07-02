@@ -700,9 +700,17 @@ public final class HLSVideoEngine: @unchecked Sendable {
             dem.seek(to: 0)
         }
 
+        // volumeAvailableCapacityForImportantUsage is unavailable on tvOS; the plain capacity key
+        // exists on every platform and is close enough for the quarter-of-free-space clamp.
+        #if os(tvOS)
+        let availableBytes = (try? URL(fileURLWithPath: NSTemporaryDirectory())
+            .resourceValues(forKeys: [.volumeAvailableCapacityKey]))?
+            .volumeAvailableCapacity.map(Int64.init)
+        #else
         let availableBytes = (try? URL(fileURLWithPath: NSTemporaryDirectory())
             .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
             .volumeAvailableCapacityForImportantUsage
+        #endif
         let retentionBudget = isLiveSession
             ? 0
             : Self.vodRetentionBudgetBytes(volumeAvailableBytes: availableBytes)
