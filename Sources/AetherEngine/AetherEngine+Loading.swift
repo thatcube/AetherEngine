@@ -515,6 +515,8 @@ extension AetherEngine {
                 let fetchesAtStall = self.nativeVideoSession?.mediaFetchCountSnapshot ?? 0
                 self.stallReengageTask?.cancel()
                 self.stallReengageTask = Task { @MainActor [weak self, weak host] in
+                    // Stage 1: nudge seek. Device-proven to reach AVPlayer (rate re-asserts)
+                    // but NOT always to revive its loader; stage 2 covers that.
                     try? await Task.sleep(
                         nanoseconds: UInt64(Self.stallReengageGraceSeconds * 1_000_000_000))
                     guard !Task.isCancelled, let self, let host,
@@ -527,6 +529,18 @@ extension AetherEngine {
                     self.reengageStalledConsumer(
                         position: player.currentTime().seconds,
                         trigger: "stall + \(Int(Self.stallReengageGraceSeconds))s without fetches")
+                    // Stage 2: the -15628 loader poison ignores seeks; only a fresh item resets
+                    // it. Escalate when the consumer stays silent through a second grace window.
+                    let fetchesAfterNudge = self.nativeVideoSession?.mediaFetchCountSnapshot ?? 0
+                    try? await Task.sleep(
+                        nanoseconds: UInt64(Self.stallReengageGraceSeconds * 1_000_000_000))
+                    guard !Task.isCancelled, host.stallCount == count else { return }
+                    let fetchesFinal = self.nativeVideoSession?.mediaFetchCountSnapshot ?? 0
+                    guard fetchesFinal == fetchesAfterNudge,
+                          let player2 = self.currentAVPlayer,
+                          player2.timeControlStatus == .waitingToPlayAtSpecifiedRate,
+                          player2.currentItem?.status != .failed else { return }
+                    self.reloadStalledConsumerItem(position: player2.currentTime().seconds)
                 }
             }
             .store(in: &nativeCancellables)

@@ -667,6 +667,27 @@ public final class AetherEngine: ObservableObject {
         host.play()
     }
 
+    /// Last-resort consumer revival (#93 residual): device-proven that after a -15628 errorLog
+    /// the nudge seek reaches AVPlayer (rate re-asserts) yet its media loader stays dead, zero
+    /// GETs follow. Only a fresh AVPlayerItem resets the loader, the same effect as the user's
+    /// manual back-out. Same URL + same host (the #15 reuse path keeps AVKit/Control Center and
+    /// the AVPlayer instance alive); segments are in retention so the reload serves instantly.
+    /// Native subtitle rendition selection is per-item and is lost; acceptable against an
+    /// otherwise endless spinner.
+    func reloadStalledConsumerItem(position: Double) {
+        guard let host = nativeHost, let player = currentAVPlayer,
+              let url = (player.currentItem?.asset as? AVURLAsset)?.url else { return }
+        guard player.timeControlStatus != .paused else { return }
+        stallRecoveryWindowUntil = Date().addingTimeInterval(Self.stallRecoveryWindowSeconds)
+        EngineLog.emit(
+            "[AetherEngine] #65 nudge did not revive the consumer; reloading item at "
+            + "\(String(format: "%.2f", position))s (same URL, same host)",
+            category: .engine
+        )
+        host.load(url: url, startPosition: position)
+        host.play()
+    }
+
     /// Pure decision for the tcs sink (#93 residual): re-assert play() instead of latching a pause?
     nonisolated static func shouldReassertPlayDuringRecovery(
         statusIsPaused: Bool, engineStateIsPlaying: Bool,
