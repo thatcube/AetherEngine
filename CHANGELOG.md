@@ -8,7 +8,9 @@ Versioning follows [Semantic Versioning](https://semver.org). See
 [README › Stability and versioning](README.md#stability-and-versioning) for
 the public-API contract.
 
-## Unreleased
+## [4.10.0] - 2026-07-02
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.10.0))
 
 ### Added
 
@@ -21,7 +23,8 @@ the public-API contract.
 - A pump-tap-fed subtitle selection kept forwarding cues into the overlay after switching to a sidecar file (stale tap-overlay stream index).
 - **iOS HDR/DV master routing.** The master-vs-media gate required a tvOS-style panel-in-HDR signal, so every HDR/DV film on iPhone routed media-direct and PiP subtitles silently never worked for them; iOS now treats `AVPlayer.eligibleForHDRPlayback` as panel readiness.
 - **Subtitle rendition names and selection.** Duplicate same-language rendition NAMEs collapsed AVFoundation's legible options, and the option matcher compared raw container tags against normalized language tags, selecting a wrong-language rendition in PiP. Names are unique now, forced tracks declare `FORCED=YES`, and matching goes through the ISO-synonym table with no cross-language fallback.
-- **Backward-seek restart latency cluster (#93 residual).** The wedged-restart fresh reopen no longer re-pays the full first-open probe budget; waiting segment fetches ride an in-flight restart instead of burning fixed retry budgets into 503s (and never re-fire restarts at stale indices); lazy native subtitle readers defer while a restart is executing instead of competing for the starved link.
+- **Backward-seek restart latency cluster (#93 residual).** The wedged-restart fresh reopen no longer re-pays the full first-open probe budget; waiting segment fetches ride an in-flight restart instead of burning fixed retry budgets into 503s; lazy native subtitle readers defer while a restart is executing instead of competing for the starved link. Fetch-fired restarts are now heavily guarded: a re-request for the index a restart just targeted waits for the fresh producer instead of tearing it down, an index the active producer's forward march covers never fires or backstops (a backstop re-fire killed a 75% complete capture on device), and a request superseded by a newer declared target (a skip-storm orphan AVPlayer has already abandoned) never fires at all.
+- **Terminal stall self-recovery (#93 residual).** After a CoreMedia -15628 error AVPlayer's media loader can die silently: playbackStalled, then zero segment requests while waitingToPlay, and the item never fails, leaving an endless spinner only a manual back-out cleared. Every stall now arms a fetch-counter watchdog: a consumer still silent after a grace window gets a zero-tolerance nudge seek, and if the loader stays dead, an in-place item reload on the same host (AVKit, PiP, and Control Center survive; retention serves the reload instantly). A spurious `.paused` (rate 0, no wait reason, no user action) during recovery is re-asserted with play() instead of latched as a user pause, which previously suspended the producer's wedge breaker and parked the session forever.
 
 ## [4.9.1] - 2026-07-02
 
