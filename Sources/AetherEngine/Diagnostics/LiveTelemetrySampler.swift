@@ -229,7 +229,7 @@ final class LiveTelemetrySampler {
             + "ready=\((engine.nativeHost?.playerLayer.isReadyForDisplay ?? false) ? "y" : "n") "
             + "thermal=\(thermal) net=\(netMbps.map { String(format: "%.1f", $0) } ?? "-") "
             + "restarts=\(engine.producerRestartCount)",
-            category: .engine
+            category: .engine, level: .verbose
         )
     }
 

@@ -126,7 +126,7 @@ public actor FrameExtractor {
                 + "took=\(String(format: "%.0f", ms))ms bytes=\(bytes) "
                 + "reopened=\(wasOpen ? "n" : "y") image=\(image == nil ? "nil" : "ok") "
                 + "cancelled=\(token.isCancelled ? "y" : "n")",
-                category: .swPlayback
+                category: .swPlayback, level: .verbose
             )
             return FrameResult(image: image)
         }
