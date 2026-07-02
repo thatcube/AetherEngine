@@ -3,8 +3,8 @@ import Foundation
 @testable import AetherEngine
 
 private final class MasterMockProvider: HLSSegmentProvider, @unchecked Sendable {
-    let renditions: [(ordinal: Int, language: String?, name: String)]
-    init(renditions: [(ordinal: Int, language: String?, name: String)]) { self.renditions = renditions }
+    let renditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)]
+    init(renditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)]) { self.renditions = renditions }
     func initSegment() -> Data? { Data([0x00]) }
     func mediaSegment(at index: Int) -> Data? { Data([0x00]) }
     var segmentCount: Int { 1 }
@@ -12,7 +12,7 @@ private final class MasterMockProvider: HLSSegmentProvider, @unchecked Sendable 
     var playlistType: HLSPlaylistType { .vod }
     var masterCodecs: String? { "hvc1.1.6.L120.90,mp4a.40.2" }
     var masterVideoRange: HLSVideoRange? { .sdr }
-    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String)] { renditions }
+    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] { renditions }
 }
 
 /// VOD provider with a fixed segment count + per-segment cue windows for the windowed subtitle playlist.
@@ -34,7 +34,7 @@ private final class WindowedSubsProvider: HLSSegmentProvider, @unchecked Sendabl
     var playlistType: HLSPlaylistType { .vod }
     var masterCodecs: String? { "hvc1.1.6.L120.90,mp4a.40.2" }
     var masterVideoRange: HLSVideoRange? { .sdr }
-    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String)] { [(0, "eng", "English")] }
+    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] { [(0, "eng", "English", false)] }
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String? {
         guard ordinal == 0, segmentIndex >= 0, segmentIndex < segCount else { return nil }
         let start = Double(segmentIndex) * segDuration
@@ -122,12 +122,22 @@ struct SubtitleRenditionPlaylistTests {
 
     @Test("master declares SUBTITLES rendition + group when native subs present")
     func masterHasSubtitleRendition() {
-        let provider = MasterMockProvider(renditions: [(0, "eng", "English")])
+        let provider = MasterMockProvider(renditions: [(0, "eng", "English", false)])
         let m = HLSLocalServer.buildMasterPlaylistText(provider: provider)
         #expect(m.contains("#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\""))
         #expect(m.contains("LANGUAGE=\"eng\""))
         #expect(m.contains("URI=\"subs_0.m3u8\""))
         #expect(m.contains("SUBTITLES=\"subs\""))
+        #expect(!m.contains("FORCED"))
+    }
+
+    @Test("forced rendition carries FORCED=YES; full rendition does not")
+    func masterForcedAttribute() {
+        let provider = MasterMockProvider(renditions: [(0, "ger", "Deutsch", true),
+                                                       (1, "ger", "Deutsch 2", false)])
+        let m = HLSLocalServer.buildMasterPlaylistText(provider: provider)
+        #expect(m.contains("NAME=\"Deutsch\",LANGUAGE=\"ger\",DEFAULT=NO,AUTOSELECT=NO,FORCED=YES,URI=\"subs_0.m3u8\""))
+        #expect(m.contains("NAME=\"Deutsch 2\",LANGUAGE=\"ger\",DEFAULT=NO,AUTOSELECT=NO,URI=\"subs_1.m3u8\""))
     }
 
     @Test("master omits SUBTITLES when no native subs")

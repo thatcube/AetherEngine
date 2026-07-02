@@ -169,6 +169,13 @@ public struct LoadOptions: Sendable, Equatable {
     /// `setNativeSubtitleSelected`. Default empty (#73).
     public var preferredSubtitleLanguages: [String]
 
+    /// External subtitle files to register at load (AetherEngine#88). Each appears in
+    /// `subtitleTracks` (id = `externalSubtitleTrackIDBase` + array index, `isExternal == true`),
+    /// participates in `preferredSubtitleLanguages` ranking, and, with `prepareNativeSubtitles`,
+    /// joins the native WebVTT rendition (PiP). Tracks added later via `addExternalSubtitleTrack`
+    /// are overlay-only until the next load. Default empty.
+    public var externalSubtitles: [ExternalSubtitleTrack]
+
     /// ENGINE-INTERNAL: marks this load as a live REJOIN (`reloadAtCurrentPosition`). Not settable from the public initializer. When true, the native load path skips its explicit initial seek so AVPlayer picks edge-minus-holdback (see `LiveReloadPolicy`); without it the reloaded item can wedge in `waitingToPlay` against Jellyfin's re-served backlog. Meaningful only when `isLive` is true.
     var isLiveRejoin: Bool = false
 
@@ -191,7 +198,8 @@ public struct LoadOptions: Sendable, Equatable {
         probesize: Int64? = nil,
         maxAnalyzeDuration: Int64? = nil,
         preferredAudioLanguages: [String] = [],
-        preferredSubtitleLanguages: [String] = []
+        preferredSubtitleLanguages: [String] = [],
+        externalSubtitles: [ExternalSubtitleTrack] = []
     ) {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
         self.suppressDisplayCriteria = suppressDisplayCriteria
@@ -212,6 +220,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.maxAnalyzeDuration = maxAnalyzeDuration
         self.preferredAudioLanguages = preferredAudioLanguages
         self.preferredSubtitleLanguages = preferredSubtitleLanguages
+        self.externalSubtitles = externalSubtitles
     }
 }
 
@@ -351,7 +360,11 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
     /// ASS / SSA tracks only: `[Script Info]` + `[V4+ Styles]` + `[Events]` format line from codec extradata. Hosts rendering ASS styling themselves (see `LoadOptions.preserveASSMarkup`) need it to resolve style references. nil for all other track kinds.
     public let assHeader: String?
 
-    public init(id: Int, name: String, codec: String, language: String?, channels: Int = 0, isDefault: Bool, isForced: Bool = false, isHearingImpaired: Bool = false, isCommentary: Bool = false, isAtmos: Bool = false, assHeader: String? = nil) {
+    /// True for host-registered external subtitle tracks (AetherEngine#88); their `id` is synthetic
+    /// (`AetherEngine.externalSubtitleTrackIDBase` + ordinal), not an AVStream index.
+    public let isExternal: Bool
+
+    public init(id: Int, name: String, codec: String, language: String?, channels: Int = 0, isDefault: Bool, isForced: Bool = false, isHearingImpaired: Bool = false, isCommentary: Bool = false, isAtmos: Bool = false, assHeader: String? = nil, isExternal: Bool = false) {
         self.id = id
         self.name = name
         self.codec = codec
@@ -363,6 +376,7 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
         self.isCommentary = isCommentary
         self.isAtmos = isAtmos
         self.assHeader = assHeader
+        self.isExternal = isExternal
     }
 }
 

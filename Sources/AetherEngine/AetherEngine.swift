@@ -551,6 +551,11 @@ public final class AetherEngine: ObservableObject {
     /// Read by AetherEngine+FrameExtractor.
     private(set) var loadedOptions: LoadOptions = .init()
 
+    #if DEBUG
+    /// Test-only: install LoadOptions without a load (#88 unit tests exercise selection gating).
+    func setLoadedOptionsForTesting(_ options: LoadOptions) { loadedOptions = options }
+    #endif
+
     /// In-flight sidecar decode task. Cancelled on clear/track-switch to prevent stale cue overwrites.
     var sidecarTask: Task<Void, Never>?
 
@@ -602,14 +607,43 @@ public final class AetherEngine: ObservableObject {
     /// matches the request; a new load / title switch / clear tears it down and clears the key (#76 part 2).
     var activeSubtitleSideDemuxerKey: String?
 
-    /// One entry per native mov_text track in muxer-declaration order (#55). Built from probed subtitleTracks
-    /// (non-bitmap, source order) at load; sidecar entries appended at runtime. sourceStreamIndex is nil for sidecars;
-    /// language is ISO 639-2. Ordinal = position in array. Empty means native subs disabled. Cleared on stop/load.
+    /// One entry per native mov_text track in muxer-declaration order (#55). Built at load from the merged
+    /// subtitleTracks (probed non-bitmap streams + load-declared external tracks, #88). sourceStreamIndex is
+    /// nil for external entries, whose synthetic id lives in externalID; language is ISO 639-2. Ordinal =
+    /// position in array. Empty means native subs disabled. Cleared on stop/load.
     struct NativeSubtitleTrackEntry: Sendable {
         let sourceStreamIndex: Int?
+        var externalID: Int? = nil
         let language: String?
+        /// Container FORCED disposition; declared as FORCED=YES on the WebVTT rendition so
+        /// AVFoundation distinguishes same-language forced/full pairs.
+        var isForced: Bool = false
     }
     var nativeSubtitleTrackTable: [NativeSubtitleTrackEntry] = []
+
+    /// Whole-file decode tasks filling native stores for load-declared external tracks (#88).
+    var externalNativeStoreFillTask: Task<Void, Never>? = nil
+
+    #if DEBUG
+    /// Test-only store override for the external instant-backfill path (#88); production reads the
+    /// live session's stores.
+    var testHookNativeStores: [NativeSubtitleCueStore]? = nil
+    func testHookInstallNativeStores(_ stores: [NativeSubtitleCueStore]) { testHookNativeStores = stores }
+    #endif
+
+    /// External subtitle registrations by synthetic TrackInfo id (AetherEngine#88). Cleared on
+    /// load()/stop() alongside subtitleTracks.
+    var externalSubtitleRegistry: [Int: ExternalSubtitleTrack] = [:]
+    var nextExternalSubtitleOrdinal = 0
+    /// True once the host made an explicit subtitle choice this session (select / sidecar / clear).
+    /// Gates the preferred-language re-run after a late external add, so a user who turned
+    /// subtitles off does not get them re-enabled (#88).
+    var hostExplicitSubtitleAction = false
+    /// Synthetic id of the external track active on the secondary channel, nil when the secondary
+    /// is off or embedded (#88).
+    var activeSecondaryExternalSubtitleTrackID: Int? = nil
+    /// Base for synthetic external-subtitle TrackInfo ids; far above any real AVStream index.
+    public static let externalSubtitleTrackIDBase = 100_000
 
     /// Sodalite#32 Phase 2: source stream index of the embedded text track whose OVERLAY cues are fed
     /// by the producer's pump tap (no side demuxer). nil = tap-overlay mode off (bitmap/CC/sidecar/live
@@ -863,6 +897,12 @@ public final class AetherEngine: ObservableObject {
         clock.progress = 0
         audioTracks = []
         subtitleTracks = []
+        externalSubtitleRegistry = [:]
+        nextExternalSubtitleOrdinal = 0
+        hostExplicitSubtitleAction = false
+        activeSecondaryExternalSubtitleTrackID = nil
+        externalNativeStoreFillTask?.cancel()
+        externalNativeStoreFillTask = nil
         nativeSubtitleTrackTable = []
         nativeSubtitleTracks = []
         nativeSubtitleReaderParams = nil
@@ -988,6 +1028,9 @@ public final class AetherEngine: ObservableObject {
         sourceVideoFormat = detectedFormat
         audioTracks = probedAudioTracks
         subtitleTracks = probedSubtitleTracks
+        // #88: load-declared external tracks join the list now, BEFORE preferred-language selection
+        // and the native rendition table are built from it.
+        for track in options.externalSubtitles { registerExternalSubtitleTrack(track) }
         metadata = probeOpened ? probe.mediaMetadata() : nil
         fontAttachments = probeOpened ? probe.fontAttachmentInfos() : []
         // Disc titles/chapters off the probe demuxer (post-detach, on MainActor) so the host can populate
@@ -1587,6 +1630,12 @@ public final class AetherEngine: ObservableObject {
         metadata = nil
         audioTracks = []
         subtitleTracks = []
+        externalSubtitleRegistry = [:]
+        nextExternalSubtitleOrdinal = 0
+        hostExplicitSubtitleAction = false
+        activeSecondaryExternalSubtitleTrackID = nil
+        externalNativeStoreFillTask?.cancel()
+        externalNativeStoreFillTask = nil
         // Font attachments are session-scoped but must survive stopInternal (audio-track-switch skips the probe;
         // clearing in stopInternal would leave the session with an empty font list after any audio switch).
         fontAttachments = []

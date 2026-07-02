@@ -1,5 +1,17 @@
 import Foundation
 
+// MARK: - Native subtitle rendition metadata
+
+/// Per-rendition master-playlist metadata (#15): NAME must be unique within the subtitle group
+/// (HLS requirement; duplicates make AVFoundation collapse same-language renditions into one
+/// legible option), FORCED carries the container disposition into EXT-X-MEDIA. Built once at load
+/// by `AetherEngine.nativeSubtitleRenditionInfos(for:)`.
+struct NativeSubtitleRenditionInfo: Sendable, Equatable {
+    let language: String?
+    let name: String
+    let isForced: Bool
+}
+
 // MARK: - Live window sizing
 
 /// Single source of truth for sliding live window size. Playlist firstVisible and cache evictBelow
@@ -55,6 +67,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// Immutable references; each store is internally locked and filled lazily by the readers on selection.
     private let nativeSubStores: [NativeSubtitleCueStore]
     private let nativeSubLanguages: [String?]
+    private let nativeSubRenditionInfos: [NativeSubtitleRenditionInfo]
     /// Ordinal advertised as DEFAULT=YES in the master SUBTITLES group (Sodalite#32).
     let nativeSubtitleDefaultOrdinal: Int
     /// Serve the SUBTITLES rendition as ONE whole-program .vtt (single VOD segment spanning the full duration)
@@ -122,6 +135,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         restartHandler: ((Int) -> Void)? = nil,
         nativeSubtitleStores: [NativeSubtitleCueStore] = [],
         nativeSubtitleLanguages: [String?] = [],
+        nativeSubtitleRenditionInfos: [NativeSubtitleRenditionInfo] = [],
         stripASSMarkupInVTT: Bool = false,
         nativeSubtitleDefaultOrdinal: Int = 0,
         nativeSubtitleWholeProgram: Bool = false,
@@ -143,6 +157,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         self.restartHandler = restartHandler
         self.nativeSubStores = nativeSubtitleStores
         self.nativeSubLanguages = nativeSubtitleLanguages
+        self.nativeSubRenditionInfos = nativeSubtitleRenditionInfos
         self.stripASSMarkupInVTT = stripASSMarkupInVTT
         self.nativeSubtitleDefaultOrdinal = nativeSubtitleDefaultOrdinal
         self.nativeSubtitleWholeProgram = nativeSubtitleWholeProgram
@@ -550,12 +565,19 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 
     // MARK: - Native subtitle renditions (#15)
 
-    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String)] {
+    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] {
         guard !nativeSubStores.isEmpty else { return [] }
         return nativeSubStores.indices.map { i in
+            // Session-built infos carry deduped NAMEs + forced dispositions; the legacy per-ordinal
+            // fallback stays for constructions that pass only languages (duplicate names collapse
+            // AVFoundation's legible options, so real sessions should always pass infos).
+            if i < nativeSubRenditionInfos.count {
+                let info = nativeSubRenditionInfos[i]
+                return (ordinal: i, language: info.language, name: info.name, isForced: info.isForced)
+            }
             let lang = i < nativeSubLanguages.count ? nativeSubLanguages[i] : nil
             let name = lang.flatMap { Locale.current.localizedString(forIdentifier: $0) } ?? "Subtitle \(i + 1)"
-            return (ordinal: i, language: lang, name: name)
+            return (ordinal: i, language: lang, name: name, isForced: false)
         }
     }
 

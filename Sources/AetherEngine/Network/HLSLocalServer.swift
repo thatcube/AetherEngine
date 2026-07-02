@@ -53,7 +53,8 @@ protocol HLSSegmentProvider: AnyObject {
 
     /// Native subtitle renditions (#15): one per text track, for the master EXT-X-MEDIA:TYPE=SUBTITLES tags
     /// and the /subs_{N} endpoints. Empty unless prepareNativeSubtitles is on and the cue stores are threaded.
-    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String)] { get }
+    /// NAMEs must be unique within the group (duplicates collapse AVFoundation's legible options).
+    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] { get }
     /// Ordinal advertised as DEFAULT=YES in the master SUBTITLES group (Sodalite#32).
     var nativeSubtitleDefaultOrdinal: Int { get }
     /// Serve the SUBTITLES rendition as one whole-program .vtt (single VOD segment) instead of per-video-segment (Sodalite#32).
@@ -92,7 +93,7 @@ extension HLSSegmentProvider {
     var masterAverageBandwidth: Int? { nil }
     var masterHDCPLevel: String? { nil }
     var masterClosedCaptions: String? { nil }
-    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String)] { [] }
+    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] { [] }
     var nativeSubtitleDefaultOrdinal: Int { 0 }
     var nativeSubtitleWholeProgram: Bool { false }
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String? { nil }
@@ -930,7 +931,12 @@ final class HLSLocalServer: @unchecked Sendable {
         for r in subRenditions {
             var mediaAttrs = ["TYPE=SUBTITLES", "GROUP-ID=\"subs\"", "NAME=\"\(r.name)\""]
             if let lang = r.language { mediaAttrs.append("LANGUAGE=\"\(lang)\"") }
-            mediaAttrs.append(contentsOf: ["DEFAULT=NO", "AUTOSELECT=NO", "URI=\"subs_\(r.ordinal).m3u8\""])
+            mediaAttrs.append(contentsOf: ["DEFAULT=NO", "AUTOSELECT=NO"])
+            // FORCED distinguishes same-language forced/full pairs in the legible group. AUTOSELECT
+            // stays NO despite the authoring-spec pairing recommendation: the on-frame overlay owns
+            // fullscreen subtitles, AVKit must never self-engage a rendition (Sodalite#32).
+            if r.isForced { mediaAttrs.append("FORCED=YES") }
+            mediaAttrs.append("URI=\"subs_\(r.ordinal).m3u8\"")
             lines.append("#EXT-X-MEDIA:\(mediaAttrs.joined(separator: ","))")
         }
         if !subRenditions.isEmpty {

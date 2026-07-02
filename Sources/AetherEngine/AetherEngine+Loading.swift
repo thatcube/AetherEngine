@@ -255,12 +255,15 @@ extension AetherEngine {
             }
         }
         // prepareNativeSubtitles + non-bitmap text tracks: flag gates allocateMuxer SubtitleConfig; must be set before start() (#55).
-        // Each text track becomes one mov_text track in the init moov (#55, all-tracks). Sidecar entries append at runtime; this table is embedded-only.
+        // Each text track becomes one mov_text track in the init moov (#55, all-tracks). Load-declared external
+        // tracks are already merged into subtitleTracks and join the table (#88); VOD only, a live program's
+        // renditions cannot cover an unbounded timeline. Runtime sidecar selections stay table-less.
         // Bitmap codecs excluded via the shared decoder-name classifier (a prior exact-match Set used descriptor
         // names that never matched TrackInfo.codec's decoder names, so PGS/DVB/DVD leaked in as mov_text).
         // Exclude in-band CEA-608/708 (#77): no demuxable packets to mux into mov_text; served by the CC tap.
         var textTracks = subtitleTracks.filter {
             !Self.isBitmapSubtitleCodec($0.codec) && !Self.isEmbeddedClosedCaptionCodec($0.codec)
+                && (!$0.isExternal || !loadedOptions.isLive)
         }
         // Sodalite#32: AVKit reliably renders only the FIRST native subtitle rendition (ordinal 0 / subs_0);
         // device-confirmed that a programmatic selection of a later rendition is fetched then dropped after one
@@ -274,18 +277,17 @@ extension AetherEngine {
             }
         }
         nativeSubtitleTrackTable = textTracks.map { track in
-            NativeSubtitleTrackEntry(sourceStreamIndex: track.id, language: track.language)
+            NativeSubtitleTrackEntry(sourceStreamIndex: track.isExternal ? nil : track.id,
+                                     externalID: track.isExternal ? track.id : nil,
+                                     language: track.language,
+                                     isForced: track.isForced)
         }
-        // displayName = locale's language name or "Subtitle <n>" (1-based). Uses Locale.current like AVKit's built-in labels.
-        nativeSubtitleTracks = nativeSubtitleTrackTable.enumerated().map { ordinal, entry in
-            let name: String
-            if let lang = entry.language,
-               let localizedName = Locale.current.localizedString(forIdentifier: lang) {
-                name = localizedName
-            } else {
-                name = "Subtitle \(ordinal + 1)"
-            }
-            return NativeSubtitleTrack(ordinal: ordinal, language: entry.language, displayName: name)
+        // Rendition metadata built ONCE (unique NAMEs + FORCED); the published track list and the
+        // master's EXT-X-MEDIA tags must agree, and duplicate names collapse AVFoundation's
+        // legible options (device: 3 declared renditions, 2 options, wrong-language selection).
+        let renditionInfos = Self.nativeSubtitleRenditionInfos(for: nativeSubtitleTrackTable)
+        nativeSubtitleTracks = renditionInfos.enumerated().map { ordinal, info in
+            NativeSubtitleTrack(ordinal: ordinal, language: info.language, displayName: info.name)
         }
         let hasTextSubtitleTrack = !nativeSubtitleTrackTable.isEmpty
         session.enableNativeSubtitleTrackForSession = loadedOptions.prepareNativeSubtitles && hasTextSubtitleTrack
@@ -304,6 +306,7 @@ extension AetherEngine {
         if session.enableNativeSubtitleTrackForSession, !nativeSubtitleTrackTable.isEmpty {
             session.nativeSubtitleCueStoresForSession = nativeSubtitleTrackTable.map { _ in NativeSubtitleCueStore() }
             session.nativeSubtitleLanguagesForSession = nativeSubtitleTrackTable.map { $0.language }
+            session.nativeSubtitleRenditionInfosForSession = renditionInfos
             // Sodalite#32: stream indices arm the producer's subtitle pump tap, which harvests cue packets
             // from the main pump's existing read (no side-channel bandwidth) for the produced region.
             session.nativeSubtitleSourceStreamIndicesForSession = nativeSubtitleTrackTable.map { $0.sourceStreamIndex.map(Int32.init) }
@@ -362,6 +365,9 @@ extension AetherEngine {
                 let shift = session.playlistShiftSeconds
                 stores.forEach { $0.setShiftSeconds(shift) }
                 nativeSubtitleReaderParams = (url: url, stores: stores)
+                // #88: load-declared external tracks fill their stores with one whole-file decode
+                // each (no side demuxer); embedded tracks keep the pump-tap / reader paths below.
+                startExternalNativeStoreFill(session: session)
                 // Sodalite#32: the producer's pump tap fills these stores for the whole produced region at
                 // zero side-channel bandwidth, so the eager at-load readers (which competed with playback
                 // for the remote link at startup) are only a fallback for sessions whose tap could not arm

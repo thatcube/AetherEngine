@@ -73,6 +73,7 @@ extension AetherEngine {
 
     /// Activate an embedded subtitle stream via a side Demuxer. Side demuxer is used because the main HLS pump races ~60-80 s ahead mid-playback and discards the subtitle packets; seeking the side demuxer to the playhead is cheaper than re-reading the main pump. Re-seeks on `engine.seek`. Supports text codecs (SubRip / ASS / SSA / WebVTT / mov_text) and bitmap codecs (PGS / DVB / DVD / XSUB).
     public func selectSubtitleTrack(index: Int) {
+        hostExplicitSubtitleAction = true
         selectSubtitleTrack(index: index, startAt: sourceTime)
     }
 
@@ -80,6 +81,12 @@ extension AetherEngine {
     /// `sourceTime`; the preferred-subtitle-language auto-select at load passes the resume position so the side
     /// demuxer seeks to the playhead instead of burst-reading from byte 0 on a resumed mid-file load (#73).
     func selectSubtitleTrack(index: Int, startAt: Double) {
+        // #88: external ids route onto the sidecar decode path; no side demuxer, no loadedURL needed.
+        if let external = externalSubtitleRegistry[index] {
+            selectExternalSubtitleTrack(id: index, track: external)
+            return
+        }
+        guard index < Self.externalSubtitleTrackIDBase else { return }  // unknown external id: no-op
         guard let url = loadedURL else { return }
 
         // #77: in-band CEA-608/708 is fed by the always-on producer CC tap (set up at load), not a side
@@ -148,7 +155,8 @@ extension AetherEngine {
     /// A no-op when the list is empty, no track matches, or the host already activated a subtitle. The resolved
     /// index is published via `activeSubtitleTrackIndex`. Independent of `prepareNativeSubtitles`. (#73)
     func applyPreferredSubtitleSelection(startAnchor: Double?, sourceDuration: Double?) {
-        guard !loadedOptions.preferredSubtitleLanguages.isEmpty, !isSubtitleActive else { return }
+        guard !loadedOptions.preferredSubtitleLanguages.isEmpty, !isSubtitleActive,
+              !hostExplicitSubtitleAction else { return }
         guard let index = Self.selectSubtitleIndex(
             tracks: subtitleTracks,
             preferredLanguages: loadedOptions.preferredSubtitleLanguages
@@ -166,8 +174,19 @@ extension AetherEngine {
         selectSubtitleTrack(index: Int(index), startAt: anchor > 0 ? anchor : sourceTime)
     }
 
-    /// Activate an embedded subtitle stream as the secondary companion track (issue #47). Text-only; bitmap codecs are rejected. Runs a second side demuxer concurrently.
+    /// Activate an embedded subtitle stream as the secondary companion track (issue #47). Text-only; bitmap codecs are rejected. Runs a second side demuxer concurrently. External ids (#88) route onto the secondary sidecar decode.
     public func selectSecondarySubtitleTrack(index: Int) {
+        hostExplicitSubtitleAction = true
+        if let external = externalSubtitleRegistry[index] {
+            cancelSidecarTask(channel: .secondary)
+            cancelEmbeddedSubtitleReader(channel: .secondary)
+            activeSecondaryEmbeddedSubtitleStreamIndex = -1
+            activeSecondaryExternalSubtitleTrackID = index
+            startSecondarySidecarDecode(url: external.url, httpHeaders: external.httpHeaders)
+            return
+        }
+        guard index < Self.externalSubtitleTrackIDBase else { return }
+        activeSecondaryExternalSubtitleTrackID = nil
         guard let url = loadedURL else { return }
         var customClone: IOReader? = nil
         if isCustomSource {
@@ -620,13 +639,124 @@ extension AetherEngine {
         }
     }
 
-    /// Fetch and decode a sidecar subtitle file (.srt / .ass / .vtt / .ssa) via `SubtitleDecoder.decodeFile`, replacing `subtitleCues` atomically. `httpHeaders` nil forwards `LoadOptions.httpHeaders` (same auth as the media, #32).
+    // MARK: - External subtitle tracks (#88)
+
+    /// Register an external subtitle file as a first-class track (AetherEngine#88): it appears in
+    /// `subtitleTracks` with a synthetic id and `isExternal == true` and is selectable via
+    /// `selectSubtitleTrack(index:)`. Overlay-only (no native WebVTT rendition / PiP); declare via
+    /// `LoadOptions.externalSubtitles` for rendition eligibility. If `preferredSubtitleLanguages`
+    /// is set, nothing is active, and the host made no explicit choice yet, the preference re-runs
+    /// so a late-added matching track auto-activates.
+    @discardableResult
+    public func addExternalSubtitleTrack(_ track: ExternalSubtitleTrack) -> TrackInfo {
+        let info = registerExternalSubtitleTrack(track)
+        applyPreferredSubtitleSelection(startAnchor: sourceTime,
+                                        sourceDuration: duration > 0 ? duration : nil)
+        return info
+    }
+
+    /// Registration without the preference re-run; the load path runs its own selection at load end.
+    @discardableResult
+    func registerExternalSubtitleTrack(_ track: ExternalSubtitleTrack) -> TrackInfo {
+        let id = Self.externalSubtitleTrackIDBase + nextExternalSubtitleOrdinal
+        nextExternalSubtitleOrdinal += 1
+        externalSubtitleRegistry[id] = track
+        let info = track.makeTrackInfo(id: id, fallbackNumber: nextExternalSubtitleOrdinal)
+        subtitleTracks.append(info)
+        return info
+    }
+
+    /// #88: activate a registered external track. A finished native store holds the whole file's
+    /// cues (decoded plain-text at load), so the overlay backfills instantly with no re-download.
+    /// Styled ASS wants raw markup, which the store strips, so it re-decodes via the sidecar path.
+    private func selectExternalSubtitleTrack(id: Int, track: ExternalSubtitleTrack) {
+        let codec = ExternalSubtitleTrack.codecName(url: track.url, formatHint: track.formatHint)
+        let wantsStyledASS = loadedOptions.preserveASSMarkup && codec == "ass"
+        if !wantsStyledASS,
+           let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: id, in: nativeSubtitleTrackTable),
+           let store = nativeStore(atOrdinal: ordinal),
+           store.isFinished, store.cueCount > 0 {
+            cancelSidecarTask()
+            cancelEmbeddedSubtitleReader()
+            activeEmbeddedSubtitleStreamIndex = -1
+            subtitleTapOverlayStreamIndex = nil
+            loadedSidecarURL = track.url
+            sidecarASSHeader = nil
+            isSubtitleActive = true
+            activeSubtitleTrackIndex = id
+            subtitleCues = store.snapshotCues()
+            isLoadingSubtitles = false
+            EngineLog.emit("[AetherEngine] external subtitle backfilled from finished store: id=\(id) cues=\(subtitleCues.count)", category: .engine)
+            return
+        }
+        startSidecarDecode(url: track.url, httpHeaders: track.httpHeaders, externalTrackID: id)
+    }
+
+    /// Store lookup for the external backfill: test-hook override first, else the live session's stores.
+    private func nativeStore(atOrdinal ordinal: Int) -> NativeSubtitleCueStore? {
+        #if DEBUG
+        if let hooked = testHookNativeStores, ordinal < hooked.count { return hooked[ordinal] }
+        #endif
+        guard let stores = nativeVideoSession?.nativeSubtitleCueStoresForSession,
+              ordinal < stores.count else { return nil }
+        return stores[ordinal]
+    }
+
+    /// #88: fill the native stores of load-declared external tracks with one whole-file decode each
+    /// (plain text, matching the WebVTT rendition), then markFinished so the .vtt handler can serve
+    /// complete files and the overlay select can backfill instantly. No side demuxer, no pacing.
+    func startExternalNativeStoreFill(session: HLSVideoEngine) {
+        externalNativeStoreFillTask?.cancel()
+        externalNativeStoreFillTask = nil
+        var jobs: [(url: URL, headers: [String: String], store: NativeSubtitleCueStore)] = []
+        for (ordinal, entry) in nativeSubtitleTrackTable.enumerated() {
+            guard let extID = entry.externalID,
+                  let track = externalSubtitleRegistry[extID],
+                  ordinal < session.nativeSubtitleCueStoresForSession.count else { continue }
+            jobs.append((track.url,
+                         track.httpHeaders ?? loadedOptions.httpHeaders,
+                         session.nativeSubtitleCueStoresForSession[ordinal]))
+        }
+        guard !jobs.isEmpty else { return }
+        externalNativeStoreFillTask = Task.detached(priority: .utility) { [jobs] in
+            for job in jobs {
+                if Task.isCancelled { return }
+                if let result = try? await SubtitleDecoder.decodeFile(url: job.url, httpHeaders: job.headers) {
+                    job.store.appendCues(result.cues)
+                    job.store.markFinished()
+                } else {
+                    EngineLog.emit("[AetherEngine] external native store fill failed: \(job.url.lastPathComponent)", category: .engine)
+                }
+            }
+        }
+    }
+
+    /// Unregister an external track: delist + drop the registry entry; an active selection
+    /// (primary or secondary) is cleared. Embedded ids no-op.
+    public func removeExternalSubtitleTrack(id: Int) {
+        guard externalSubtitleRegistry.removeValue(forKey: id) != nil else { return }
+        subtitleTracks.removeAll { $0.id == id }
+        if activeSubtitleTrackIndex == id { clearSubtitle() }
+        if activeSecondaryExternalSubtitleTrackID == id { clearSecondarySubtitle() }
+    }
+
+    /// Fetch and decode a sidecar subtitle file (.srt / .ass / .vtt / .ssa) via `SubtitleDecoder.decodeFile`, replacing `subtitleCues` atomically. `httpHeaders` nil forwards `LoadOptions.httpHeaders` (same auth as the media, #32). Prefer registering via `addExternalSubtitleTrack` + `selectSubtitleTrack` (#88), which keeps the track listed and `activeSubtitleTrackIndex` populated; this API stays for compatibility and one-shot use.
     public func selectSidecarSubtitle(url: URL, httpHeaders: [String: String]? = nil) {
+        hostExplicitSubtitleAction = true
+        startSidecarDecode(url: url, httpHeaders: httpHeaders, externalTrackID: nil)
+    }
+
+    /// Shared sidecar-decode start: the pre-#88 selectSidecarSubtitle body, parameterized on which
+    /// track id (if any) to publish as active. Also clears the pump-tap overlay stream so a prior
+    /// tap-fed selection stops forwarding into the sidecar's cues (latent pre-#88 bug: the tap
+    /// forward-guard matched the stale index and kept appending).
+    func startSidecarDecode(url: URL, httpHeaders: [String: String]?, externalTrackID: Int?) {
         cancelSidecarTask()
         // Sidecar replaces any active embedded stream.
         cancelEmbeddedSubtitleReader()
         activeEmbeddedSubtitleStreamIndex = -1
-        activeSubtitleTrackIndex = nil
+        activeSubtitleTrackIndex = externalTrackID
+        subtitleTapOverlayStreamIndex = nil
 
         loadedSidecarURL = url
         isSubtitleActive = true
@@ -669,10 +799,16 @@ extension AetherEngine {
 
     /// Decode a sidecar as the secondary companion track (issue #47), independent of the primary.
     public func selectSecondarySidecarSubtitle(url: URL, httpHeaders: [String: String]? = nil) {
+        hostExplicitSubtitleAction = true
         cancelSidecarTask(channel: .secondary)
         cancelEmbeddedSubtitleReader(channel: .secondary)
         activeSecondaryEmbeddedSubtitleStreamIndex = -1
+        activeSecondaryExternalSubtitleTrackID = nil
+        startSecondarySidecarDecode(url: url, httpHeaders: httpHeaders)
+    }
 
+    /// Shared secondary sidecar-decode start (#88): the pre-#88 selectSecondarySidecarSubtitle body.
+    func startSecondarySidecarDecode(url: URL, httpHeaders: [String: String]?) {
         loadedSecondarySidecarURL = url
         isSecondarySubtitleActive = true
         secondarySubtitleCues = []
@@ -703,6 +839,7 @@ extension AetherEngine {
 
     /// Disable primary subtitles, clear cues, cancel sidecar task + side demuxer, cancel multi-decode reader, clear native mov_text stores (#55, all-tracks). `nativeSubtitleTracks` is NOT cleared: the host needs the list to re-select after an audio/subtitle switch; only `stop()` / `load()` reset it.
     public func clearSubtitle() {
+        hostExplicitSubtitleAction = true
         cancelSidecarTask()
         cancelEmbeddedSubtitleReader()
         activeEmbeddedSubtitleStreamIndex = -1
@@ -741,9 +878,11 @@ extension AetherEngine {
     /// Turn the secondary subtitle off and clear its cues. Tears down
     /// the secondary sidecar decode task and the secondary side reader.
     public func clearSecondarySubtitle() {
+        hostExplicitSubtitleAction = true
         cancelSidecarTask(channel: .secondary)
         cancelEmbeddedSubtitleReader(channel: .secondary)
         activeSecondaryEmbeddedSubtitleStreamIndex = -1
+        activeSecondaryExternalSubtitleTrackID = nil
         loadedSecondarySidecarURL = nil
         isSecondarySubtitleActive = false
         secondarySubtitleCues = []
@@ -995,21 +1134,26 @@ extension AetherEngine {
                 item.select(nil, in: group)
                 return
             }
-            // Rank-based selection: a naive .first { hasPrefix(lang) } always returns the first same-language option regardless of requested ordinal. Compute the rank within same-language tracks and pick the matching AVFoundation option.
+            // Rank-based selection through the ISO-synonym matcher: AVFoundation normalizes HLS
+            // LANGUAGE tags (matroska "ger" reads back as extendedLanguageTag "de"), so the old
+            // prefix compare found nothing and its positional fallback selected a WRONG-LANGUAGE
+            // option (device: the second German track rendered the English rendition in PiP).
+            // Language-tagged tracks now select nothing on a failed match; only language-less
+            // tracks keep the positional fallback.
             var selected: AVMediaSelectionOption?
             if ordinal < tracks.count, let lang = tracks[ordinal].language {
                 let rank = NativeSubtitleTrack.sameLanguageRank(of: ordinal, in: tracks)
-                let sameLangOptions = group.options.filter {
-                    $0.extendedLanguageTag?.hasPrefix(lang) == true
+                let tags = group.options.map { $0.extendedLanguageTag }
+                if let idx = Self.nativeOptionIndex(forLanguage: lang, rank: rank, optionLanguageTags: tags) {
+                    selected = group.options[idx]
                 }
-                if rank < sameLangOptions.count {
-                    selected = sameLangOptions[rank]
-                }
-            }
-            if selected == nil, ordinal < group.options.count {
+            } else if ordinal < group.options.count {
                 selected = group.options[ordinal]
             }
-            guard let option = selected else { return }
+            guard let option = selected else {
+                EngineLog.emit("[AetherEngine] native subtitle select: no matching option for ordinal=\(ordinal) lang=\(ordinal < tracks.count ? (tracks[ordinal].language ?? "nil") : "?") groupOpts=\(group.options.count)", category: .engine)
+                return
+            }
             // #15: pre-fill BEFORE selecting, so AVPlayer fetches a populated rendition instead of racing the
             // reader (empty .vtt). Done here (off the loopback connection) rather than blocking the .vtt handler,
             // which serializes the connection and stalls the legible pipeline.
@@ -1067,13 +1211,61 @@ extension AetherEngine {
         }
     }
 
-    /// #15: select the native mov_text track matching the currently-active subtitle so AVKit renders it inside
-    /// the PiP window; nil deselects when PiP ends. Maps the active subtitle's source stream to the native
-    /// ordinal. No-op (no PiP subtitle) when the active subtitle has no native text equivalent: a bitmap
-    /// (PGS/DVB), CEA-608/708, or a sidecar track (sourceStreamIndex nil).
+    /// #88: ordinal of the table entry backing an active track id: embedded ids match
+    /// sourceStreamIndex, external ids match externalID.
+    static func nativeSubtitleOrdinal(forActiveTrack id: Int, in table: [NativeSubtitleTrackEntry]) -> Int? {
+        table.firstIndex { $0.sourceStreamIndex == id || $0.externalID == id }
+    }
+
+    /// Rendition metadata for the master's EXT-X-MEDIA tags. HLS requires NAME to be unique within
+    /// a group; duplicate names made AVFoundation collapse same-language renditions into ONE
+    /// legible option (device: three declared, groupOpts=2, and the second German track ended up
+    /// selecting the English option through the old positional fallback). Same-language duplicates
+    /// get a numbered suffix; the forced disposition is carried for FORCED=YES.
+    nonisolated static func nativeSubtitleRenditionInfos(
+        for entries: [NativeSubtitleTrackEntry]
+    ) -> [NativeSubtitleRenditionInfo] {
+        var counts: [String: Int] = [:]
+        return entries.enumerated().map { i, entry in
+            let base = entry.language.flatMap { Locale.current.localizedString(forIdentifier: $0) }
+                ?? "Subtitle \(i + 1)"
+            let n = (counts[base] ?? 0) + 1
+            counts[base] = n
+            return NativeSubtitleRenditionInfo(
+                language: entry.language,
+                name: n == 1 ? base : "\(base) \(n)",
+                isForced: entry.isForced
+            )
+        }
+    }
+
+    /// Index of the legible option backing (track language, same-language rank). AVFoundation
+    /// normalizes HLS LANGUAGE tags (matroska "ger" reads back as extendedLanguageTag "de", often
+    /// with a region subtag), so matching goes through the ISO-synonym table on the primary
+    /// subtag, not a prefix compare. Deliberately NO cross-language fallback: selecting a
+    /// wrong-language option is worse than selecting nothing (device: German pick rendered the
+    /// English rendition in PiP).
+    nonisolated static func nativeOptionIndex(
+        forLanguage language: String?, rank: Int, optionLanguageTags: [String?]
+    ) -> Int? {
+        guard let language, rank >= 0 else { return nil }
+        let matching = optionLanguageTags.indices.filter { idx in
+            guard let tag = optionLanguageTags[idx],
+                  let primary = tag.split(separator: "-").first else { return false }
+            return languageMatches(String(primary), language)
+        }
+        guard rank < matching.count else { return nil }
+        return matching[rank]
+    }
+
+    /// #15: select the native track matching the currently-active subtitle so AVKit renders it inside
+    /// the PiP window; nil deselects when PiP ends. Maps the active subtitle's source stream (embedded)
+    /// or synthetic id (load-declared external, #88) to the native ordinal. No-op (no PiP subtitle) when
+    /// the active subtitle has no native text equivalent: a bitmap (PGS/DVB), CEA-608/708, or a track
+    /// added after load (dynamic external / one-shot sidecar).
     public func setNativeSubtitleForPiP(_ active: Bool) {
         guard active, let activeIdx = activeSubtitleTrackIndex,
-              let ordinal = nativeSubtitleTrackTable.firstIndex(where: { $0.sourceStreamIndex == activeIdx })
+              let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: activeIdx, in: nativeSubtitleTrackTable)
         else {
             setNativeSubtitleSelected(track: nil)
             return

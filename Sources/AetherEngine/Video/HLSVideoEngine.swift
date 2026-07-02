@@ -117,6 +117,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// nil entry = no language box for that track.
     var nativeSubtitleLanguagesForSession: [String?] = []
 
+    /// Per-rendition master metadata parallel to the stores (unique NAMEs + FORCED dispositions);
+    /// empty falls back to per-ordinal locale names, which collapse in AVFoundation when a
+    /// language repeats. Built by `AetherEngine.nativeSubtitleRenditionInfos(for:)` at load.
+    var nativeSubtitleRenditionInfosForSession: [NativeSubtitleRenditionInfo] = []
+
     /// #77: in-band CC stream index + observer, re-threaded onto every producer so the tap survives
     /// seek/reload/wedge. Set before start(). -1 / nil = no CC tap.
     var closedCaptionStreamIndexForSession: Int32 = -1
@@ -1049,6 +1054,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             },
             nativeSubtitleStores: nativeSubtitleCueStoresForSession,
             nativeSubtitleLanguages: nativeSubtitleLanguagesForSession,
+            nativeSubtitleRenditionInfos: nativeSubtitleRenditionInfosForSession,
             stripASSMarkupInVTT: preserveASSMarkupForSubtitleTap,
             nativeSubtitleDefaultOrdinal: nativeSubtitleDefaultOrdinal,
             nativeSubtitleWholeProgram: nativeSubtitleWholeProgram,
@@ -1094,27 +1100,22 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // (AVErrorNoCompatibleAlternatesForExternalDisplay, Vincent test 2026-05-26, #4 #63).
         // DV8.1/8.4 on non-DV panels already downgrade to hvc1.* + strip DV side data above, so
         // the standard sourceIsHDR && panelReadyForHDR check routes them correctly.
-        let sourceIsHDR = videoRange != .sdr || effectiveDvMode
-        let panelReadyForHDR = panelIsInHDRMode
-        let dv5OnNonDVPanel = dvVariant == .profile5 && !effectiveDvMode
-        // #15: a SUBTITLES rendition lives only in a master. Force the master for routing-safe subtitled
-        // sources (SDR any panel, or HDR/DV on an HDR/DV panel where a master is already used) so PiP can show
-        // subtitles. HDR-on-SDR-panel and DV5-on-non-DV-panel stay media-direct (no PiP subs) to avoid
-        // -11848 / -11868; the subtitle rendition is orthogonal to the video VIDEO-RANGE/CODECS attributes.
+        // #15: a SUBTITLES rendition lives only in a master; the pure decision below forces the
+        // master for routing-safe subtitled sources so PiP can show subtitles.
         let hasNativeSubs = enableNativeSubtitleTrackForSession && !nativeSubtitleCueStoresForSession.isEmpty
-        // A SDR variant (VIDEO-RANGE=SDR) is routable on any panel, so the master is safe to force for it;
-        // HDR/DV only when the panel is HDR-ready. Gate on the ACTUAL videoRange, not sourceIsHDR: sourceIsHDR
-        // is inflated by effectiveDvMode (a device DV capability) even for SDR content, which wrongly sent SDR
-        // sources on DV-capable devices to media-direct, so the WebVTT rendition never appeared (#15).
-        let routingSafeForMaster = (videoRange == .sdr) || panelReadyForHDR
-        let useMasterPlaylist: Bool
-        if dv5OnNonDVPanel {
-            useMasterPlaylist = false
-        } else if hasNativeSubs && routingSafeForMaster {
-            useMasterPlaylist = true
-        } else {
-            useMasterPlaylist = sourceIsHDR && panelReadyForHDR
-        }
+        // iOS built-in panels engage EDR on demand once HDR content renders; the tvOS SDR-parked-
+        // panel failure mode (-11848) does not exist there, so HDR-eligibility is the readiness
+        // signal (Sodalite AE#88 retest: every HDR/DV film on iPhone routed media-direct and PiP
+        // subtitles silently never worked for them).
+        #if os(iOS)
+        let builtInPanelEngagesOnDemand = true
+        #else
+        let builtInPanelEngagesOnDemand = false
+        #endif
+        let useMasterPlaylist = Self.resolveUseMasterPlaylist(
+            videoRange: videoRange, dvVariant: dvVariant, effectiveDvMode: effectiveDvMode,
+            panelIsInHDRMode: panelIsInHDRMode, displaySupportsHDR: displaySupportsHDR,
+            hasNativeSubs: hasNativeSubs, builtInPanelEngagesOnDemand: builtInPanelEngagesOnDemand)
         let resolvedURL: URL? = useMasterPlaylist
             ? srv.playlistURL
             : srv.mediaPlaylistURL
@@ -1123,8 +1124,38 @@ public final class HLSVideoEngine: @unchecked Sendable {
             throw HLSVideoEngineError.openFailed(reason: "server URL not ready")
         }
         self.servingMasterPlaylist = useMasterPlaylist
-        EngineLog.emit("[HLSVideoEngine] serving on \(url.absoluteString) (dvModeAvailable=\(dvModeAvailable) effectiveDvMode=\(effectiveDvMode) panelIsHDR=\(panelIsInHDRMode) displaySupportsHDR=\(displaySupportsHDR) matchContent=\(matchContentEnabled) sourceIsHDR=\(sourceIsHDR) useMaster=\(useMasterPlaylist) videoRange=\(videoRange) dvVariant=\(dvVariant))")
+        EngineLog.emit("[HLSVideoEngine] serving on \(url.absoluteString) (dvModeAvailable=\(dvModeAvailable) effectiveDvMode=\(effectiveDvMode) panelIsHDR=\(panelIsInHDRMode) displaySupportsHDR=\(displaySupportsHDR) matchContent=\(matchContentEnabled) sourceIsHDR=\(videoRange != .sdr || effectiveDvMode) useMaster=\(useMasterPlaylist) videoRange=\(videoRange) dvVariant=\(dvVariant))")
         return url
+    }
+
+    /// Pure master-vs-media playlist routing decision (#4, #15, #63). A master claiming HDR while
+    /// the panel sits in SDR fails with -11848, so HDR/DV sources need a ready panel; a
+    /// single-variant DV P5 master has no backward-compat brand and non-DV panels reject it with
+    /// -11868, so it is always media-direct. SDR content is routable on any panel, so native
+    /// subtitles force the master there. `builtInPanelEngagesOnDemand` (iOS) treats
+    /// HDR-eligibility (`AVPlayer.eligibleForHDRPlayback`, passed as `displaySupportsHDR`) as
+    /// panel readiness: the built-in panel engages EDR when HDR content renders, and an
+    /// SDR-only device or route still reads ineligible and stays media-direct.
+    static func resolveUseMasterPlaylist(
+        videoRange: HLSVideoRange,
+        dvVariant: DVVariant,
+        effectiveDvMode: Bool,
+        panelIsInHDRMode: Bool,
+        displaySupportsHDR: Bool,
+        hasNativeSubs: Bool,
+        builtInPanelEngagesOnDemand: Bool
+    ) -> Bool {
+        let sourceIsHDR = videoRange != .sdr || effectiveDvMode
+        let panelReadyForHDR = panelIsInHDRMode
+            || (builtInPanelEngagesOnDemand && displaySupportsHDR)
+        let dv5OnNonDVPanel = dvVariant == .profile5 && !effectiveDvMode
+        // Gate on the ACTUAL videoRange, not sourceIsHDR: sourceIsHDR is inflated by
+        // effectiveDvMode (a device DV capability) even for SDR content, which wrongly sent SDR
+        // sources on DV-capable devices to media-direct, so the WebVTT rendition never appeared (#15).
+        let routingSafeForMaster = (videoRange == .sdr) || panelReadyForHDR
+        if dv5OnNonDVPanel { return false }
+        if hasNativeSubs && routingSafeForMaster { return true }
+        return sourceIsHDR && panelReadyForHDR
     }
 
     /// `true` when `start()` chose the master playlist (HDR/DV signaling). Read after `start()`.
