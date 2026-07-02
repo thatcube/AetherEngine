@@ -293,7 +293,7 @@ extension AetherEngine {
         // ASS; the WebVTT rendition strips at serve), and decoded tap events feed the overlay directly.
         session.preserveASSMarkupForSubtitleTap = loadedOptions.preserveASSMarkup
         armSubtitleTapOverlayForwarding(on: session)
-        EngineLog.emit("[PiPDiag] load: prepare=\(loadedOptions.prepareNativeSubtitles) eager=\(loadedOptions.eagerNativeSubtitleReaders) textTracks=\(nativeSubtitleTrackTable.count) enable=\(session.enableNativeSubtitleTrackForSession)", category: .engine)
+        EngineLog.emit("[AetherEngine] native subtitles: prepare=\(loadedOptions.prepareNativeSubtitles) eager=\(loadedOptions.eagerNativeSubtitleReaders) textTracks=\(nativeSubtitleTrackTable.count) enable=\(session.enableNativeSubtitleTrackForSession)", category: .engine)
 
         // #77: arm the in-band CC tap before start() so the first producer keeps the CC stream.
         setupClosedCaptionTapIfNeeded(session: session)
@@ -329,7 +329,7 @@ extension AetherEngine {
             // is served empty (the earlier windowed sparse-fetch was tested with an incomplete parking reader).
             session.nativeSubtitleWholeProgram = false
             session.subtitleStreamStartSeconds = startPosition ?? 0
-            EngineLog.emit("[PiPDiag] default native ordinal=\(defaultOrdinal) wholeProgram=\(session.nativeSubtitleWholeProgram) prefLangs=\(loadedOptions.nativeSubtitlePreferredLanguages) trackLangs=\(nativeSubtitleTrackTable.map { $0.language ?? "?" })", category: .engine)
+            EngineLog.emit("[AetherEngine] native subtitle default ordinal=\(defaultOrdinal) wholeProgram=\(session.nativeSubtitleWholeProgram) prefLangs=\(loadedOptions.nativeSubtitlePreferredLanguages) trackLangs=\(nativeSubtitleTrackTable.map { $0.language ?? "?" })", category: .engine)
         }
 
         // session.start() opens its own Demuxer + prewarm seek (~1-3 s on slow CDN); detach so @MainActor doesn't block.
@@ -376,9 +376,9 @@ extension AetherEngine {
                     let readEOF = !loadedOptions.isLive
                     startNativeSubtitleReaders(url: url, stores: stores,
                                                readToEOF: readEOF, startAtSeconds: startPosition ?? 0)
-                    EngineLog.emit("[PiPDiag] eager readers started: stores=\(stores.count) readToEOF=\(readEOF) startAt=\(String(format: "%.1f", startPosition ?? 0))", category: .engine)
+                    EngineLog.emit("[AetherEngine] native subtitle eager readers started: stores=\(stores.count) readToEOF=\(readEOF) startAt=\(String(format: "%.1f", startPosition ?? 0))", category: .engine)
                 } else if tapArmed {
-                    EngineLog.emit("[PiPDiag] pump tap active; eager readers skipped (lazy reader covers the select burst)", category: .engine)
+                    EngineLog.emit("[AetherEngine] pump tap active; eager readers skipped (lazy reader covers the select burst)", category: .engine)
                 }
             }
         }

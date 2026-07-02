@@ -1038,19 +1038,19 @@ extension AetherEngine {
                     if stall >= 6 { break }   // ~900ms with no new cues after producing => EOF / read-ahead parked
                     try? await Task.sleep(nanoseconds: 150_000_000)
                 }
-                EngineLog.emit("[PiPDiag] pre-fill done: readMax=\(String(format: "%.1f", store.readMaxCueEnd())) target=\(String(format: "%.1f", target)) cues=\(store.cueCount)", category: .engine)
+                EngineLog.emit("[AetherEngine] native subtitle pre-fill done: readMax=\(String(format: "%.1f", store.readMaxCueEnd())) target=\(String(format: "%.1f", target)) cues=\(store.cueCount)", category: .engine)
             }
             // #15: AVKit attaches the legible renderer to whatever selection is active when the rendering
             // pipeline is established; a selection made mid-playback updates state + downloads cues but is not
             // drawn until re-asserted. Deselect, hop one runloop, then reselect to force the renderer to attach
             // (documented workaround; the same effect a PiP round-trip had). Needs the manual-criteria pin above.
             let itemID = String(UInt(bitPattern: ObjectIdentifier(item).hashValue) & 0xffff, radix: 16)
-            EngineLog.emit("[PiPDiag] select: item=\(itemID) opt=\(option.displayName) groupOpts=\(group.options.count) criteriaAuto=\(currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically ?? true) itemIsCurrent=\(currentAVPlayer?.currentItem === item)", category: .engine)
+            EngineLog.emit("[AetherEngine] native subtitle select: item=\(itemID) opt=\(option.displayName) groupOpts=\(group.options.count) criteriaAuto=\(currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically ?? true) itemIsCurrent=\(currentAVPlayer?.currentItem === item)", category: .engine)
             item.select(nil, in: group)
             try? await Task.sleep(nanoseconds: 100_000_000)
             item.select(option, in: group)
             let after = item.currentMediaSelection.selectedMediaOption(in: group)?.displayName ?? "nil"
-            EngineLog.emit("[PiPDiag] select done: selected=\(after) itemIsCurrent=\(currentAVPlayer?.currentItem === item)", category: .engine)
+            EngineLog.emit("[AetherEngine] native subtitle select done: selected=\(after) itemIsCurrent=\(currentAVPlayer?.currentItem === item)", category: .engine)
             // Sodalite#32: a select landing inside a stall recovery gets dropped outright by AVFoundation
             // (device: PiP entry 0.1s after waitingToPlay -> playing read back nil and STAYED nil; the same
             // select succeeded on the previous entry). Re-assert briefly until it sticks or the item changes.
@@ -1062,12 +1062,8 @@ extension AetherEngine {
                 try? await Task.sleep(nanoseconds: 700_000_000)
                 item.select(option, in: group)
                 let retried = item.currentMediaSelection.selectedMediaOption(in: group)?.displayName ?? "nil"
-                EngineLog.emit("[PiPDiag] select retry #\(retries): selected=\(retried)", category: .engine)
+                EngineLog.emit("[AetherEngine] native subtitle select retry #\(retries): selected=\(retried)", category: .engine)
             }
-            // Persistence probe: does AVSmartSubtitlesController drop it, or does it stay (renderer-attach issue)?
-            try? await Task.sleep(nanoseconds: 2_500_000_000)
-            let later = item.currentMediaSelection.selectedMediaOption(in: group)?.displayName ?? "nil"
-            EngineLog.emit("[PiPDiag] select +2.5s: selected=\(later) itemIsCurrent=\(currentAVPlayer?.currentItem === item)", category: .engine)
         }
     }
 

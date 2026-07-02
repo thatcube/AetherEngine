@@ -553,7 +553,6 @@ final class HLSLocalServer: @unchecked Sendable {
                 if firstTime { loggedMasterPlaylist = true }
                 stateLock.unlock()
                 if firstTime {
-                    EngineLog.emit("[PiPDiag] master served: subRenditions=\(provider?.nativeSubtitleRenditions.count ?? 0)", category: .hlsServer)
                     EngineLog.emit("[HLSLocalServer] master.m3u8 body:\n\(body)",
                                    category: .hlsServer)
                 }
@@ -601,7 +600,7 @@ final class HLSLocalServer: @unchecked Sendable {
             guard let parsed = Self.parseSubsPath(p), let prov = provider else {
                 return send404(fd: fd, path: normalizedPath, reason: "unparseable subtitle playlist path")
             }
-            EngineLog.emit("[PiPDiag] AVKit SELECTED rendition: fetched subs_\(parsed.ordinal).m3u8", category: .hlsServer)
+            EngineLog.emit("[HLSLocalServer] subtitle rendition selected: subs_\(parsed.ordinal).m3u8 fetched", category: .hlsServer)
             let subBody = Self.buildSubtitleMediaPlaylistText(ordinal: parsed.ordinal, provider: prov)
             return send200(fd: fd, path: normalizedPath,
                            data: Data(subBody.utf8),
@@ -613,7 +612,7 @@ final class HLSLocalServer: @unchecked Sendable {
                   let vtt = provider?.nativeSubtitleVTT(ordinal: parsed.ordinal, segmentIndex: seg) else {
                 return send404(fd: fd, path: normalizedPath, reason: "no subtitle segment for \(normalizedPath)")
             }
-            EngineLog.emit("[PiPSubsDiag] served subs ord=\(parsed.ordinal) seg=\(seg) bytes=\(vtt.utf8.count)", category: .hlsServer)
+            EngineLog.emit("[HLSLocalServer] served subtitle .vtt ord=\(parsed.ordinal) seg=\(seg) bytes=\(vtt.utf8.count)", category: .hlsServer, level: .verbose)
             return send200(fd: fd, path: normalizedPath,
                            data: Data(vtt.utf8),
                            contentType: "text/vtt")

@@ -580,7 +580,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             let shift = currentShiftSeconds()
             store.setShiftSeconds(shift)
             let cues = stripMarkupIfNeeded(store.allCues())
-            EngineLog.emit("[PiPSubsDiag] whole-program ord=\(ordinal) cues=\(cues.count) finished=\(store.isFinished) shift=\(String(format: "%.2f", shift)) first=\(cues.first.map { String(format: "%.1f", $0.start) } ?? "-") last=\(cues.last.map { String(format: "%.1f", $0.end) } ?? "-")", category: .hlsServer)
+            EngineLog.emit("[HLSVideoEngine] whole-program subtitle .vtt ord=\(ordinal) cues=\(cues.count) finished=\(store.isFinished) shift=\(String(format: "%.2f", shift)) first=\(cues.first.map { String(format: "%.1f", $0.start) } ?? "-") last=\(cues.last.map { String(format: "%.1f", $0.end) } ?? "-")", category: .hlsServer)
             // PLAIN WebVTT, NO X-TIMESTAMP-MAP (matches the proven-working whole-file sideload). With the map,
             // AVKit anchors cues to the fMP4 sample PTS (which diverges from currentTime over our loopback) and
             // the subtitles render offset by the playback position; without it AVKit uses the cue times as the
@@ -609,7 +609,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             usleep(100_000)
         }
         let cues = stripMarkupIfNeeded(store.cuesInWindow(start: start, end: end))
-        EngineLog.emit("[PiPSubsDiag] ord=\(ordinal) seg=\(segmentIndex) win=[\(String(format: "%.1f", start)),\(String(format: "%.1f", end))) inWin=\(cues.count) readMax=\(String(format: "%.1f", store.readMaxCueEnd()))", category: .hlsServer)
+        EngineLog.emit("[HLSVideoEngine] subtitle .vtt ord=\(ordinal) seg=\(segmentIndex) win=[\(String(format: "%.1f", start)),\(String(format: "%.1f", end))) inWin=\(cues.count) readMax=\(String(format: "%.1f", store.readMaxCueEnd()))", category: .hlsServer, level: .verbose)
         // Absolute media-timeline cue times + MPEGTS:0 identity map. Flip to segment-relative here (one line:
         // relativeToStart: true) if on-device PiP shows subtitles shifted by the segment start. See WebVTTBuilder.segment.
         return WebVTTBuilder.segment(cues: cues, segmentStart: start)

@@ -72,7 +72,7 @@ Matroska CodecPrivate doesn't usually carry the pre-parsed `dec3` / `dac3` box c
 
 ## Subtitles
 
-Subtitle packets are routed through the same demux loop as audio and video. No second AVIO connection, no full-file scan. Each packet decodes inline through `avcodec_decode_subtitle2` (the one exception is in-band CEA-608, which has no FFmpeg decoder and is handled by a producer tap, see below), the result lands in a single `[SubtitleCue]` published list:
+Subtitle cues come from the cheapest read available: embedded TEXT tracks are harvested by a tap on the segment producer's existing source read (their streams stay in the demuxer keep-set, each packet is observed then dropped, never muxed), so enabling them costs no second connection and no read-up, even on remote sources; bitmap tracks decode through a side demuxer positioned at the playhead; sidecars are fetched once. Each packet decodes through `avcodec_decode_subtitle2` (except in-band CEA-608, which has an in-house line-21 decoder, see below), and the result lands in a single `[SubtitleCue]` published list:
 
 - **Text codecs** (SubRip / ASS / SSA / WebVTT / mov_text) → `SubtitleCue.body = .text(String)`. ASS dialogue headers and override blocks (`{\an8}`, `{\b1}`, ...) are stripped; `\N` becomes a real newline so the host can render with regular text layout.
 - **Bitmap codecs** (PGS / HDMV PGS / DVB / DVD) → `.image(SubtitleImage)`. The indexed pixel plane is walked through its palette, premultiplied against alpha, and wrapped as a `CGImage`. Position is normalised in `[0..1]` against the source video frame so the host scales to any on-screen rect.
@@ -96,36 +96,37 @@ A single packet that carries multiple rects (PGS often emits signs/songs at the 
 
 Subtitle cues land in raw source PTS. On the native path, AVPlayer's HLS clock sits at `source_pts - producer.videoShiftPts` (the producer applies a per-session shift to align the first segment's tfdt with the playlist origin, and the shift can change on every restart). Render the overlay against `player.sourceTime` so cues match the spoken audio regardless of which producer session is active.
 
-### Native subtitle menu (tx3g / mov_text for PiP, AirPlay, and external display)
+### Native subtitle renditions (WebVTT for PiP, AirPlay, and external display)
 
-Host-rendered subtitle overlays are invisible in Picture-in-Picture, AirPlay, and external-display sessions because those paths render the `AVPlayerLayer` content only; the SwiftUI / UIKit view tree is not composited. The native subtitle track feature solves this by muxing all text subtitle tracks as separate `mov_text` (tx3g) traks directly into the fragmented-MP4 stream so AVFoundation exposes them as a standard legible `AVMediaSelection` group that travels with the stream everywhere `AVPlayer` goes, including PiP and AirPlay.
+Host-rendered subtitle overlays are invisible in Picture-in-Picture, AirPlay, and external-display sessions because those paths render the `AVPlayerLayer` content only; the SwiftUI / UIKit view tree is not composited. The engine therefore serves every text subtitle track as a real HLS `SUBTITLES` rendition over the loopback: the master playlist carries one language-tagged `EXT-X-MEDIA:TYPE=SUBTITLES` entry per track (`DEFAULT=NO,AUTOSELECT=NO`) plus `SUBTITLES="subs"` on the variant, backed by a per-track media playlist (`subs_N.m3u8`) whose WebVTT segments mirror the video segments 1:1. AVFoundation exposes the renditions as a standard legible `AVMediaSelection` group that travels with the stream everywhere `AVPlayer` goes, including PiP. (An earlier design muxed `mov_text`/tx3g traks into the fMP4 itself; in-band timed text is not HLS-conformant and AVPlayer rejected the stream, so the WebVTT rendition replaced it.)
 
-**Opt-in.** The feature is off by default (`LoadOptions.prepareNativeSubtitles = false`). When disabled, the muxer output is byte-identical to the prior behavior and `AVPlayerViewController` shows no subtitle menu.
+**Opt-in.** Off by default (`LoadOptions.prepareNativeSubtitles = false`): no renditions in the master, no legible menu, output identical to before.
 
-**All text tracks, not just the active one.** When `prepareNativeSubtitles` is `true` and the title has text subtitle tracks (embedded or sidecar), the engine declares one `mov_text` trak in the `init.mp4` moov per text track, each language-tagged (ISO 639-2), all with `disposition:default=0`. AVFoundation's legible group exposes every track as a selectable option. None is auto-displayed (`defaultOption` is `nil`); the host or the user's native AVPlayer menu chooses when to engage one. A single side-demuxer decode pass decodes all text streams in parallel into per-track bounded stores; memory is bounded by total cue count across all tracks.
+**Cue source: the producer pump tap.** The segment producer already reads the source's full interleave, so the text subtitle streams stay in its keep-set and every packet is handed to a session-level tap that decodes into per-track cue stores (the same pattern as the CEA-608 tap). Zero side-channel bandwidth, and coverage is by construction the produced region, across seeks and producer restarts. The host overlay for embedded text tracks is fed from the same stores (selection backfills instantly, live cues follow); a lazy per-selection reader still covers AVKit's ~240 s forward `.vtt` prefetch beyond the produced region.
 
-**Scope and format coverage.** Works on VOD with embedded text subtitles and sidecar files (SRT / VTT / ASS). Covers all SDR, HDR10, HLG, and Dolby Vision sources uniformly, including DV Profile 5 (which has no HLS master playlist, ruling out WebVTT in-manifest tracks). Bitmap subtitles (PGS / DVB / DVD) cannot become native text tracks; they remain host-rendered only. Live sources are out of scope for this release.
+**Routing scope.** A `SUBTITLES` rendition can only live in a master playlist, so native subtitles ride the master-routing rules: SDR sources on any panel, HDR / DV sources on HDR-ready panels. HDR-on-SDR-panel and DV Profile 5 on non-DV panels stay media-direct (no master, hence no native subtitles there); the host overlay still covers fullscreen. Bitmap subtitles (PGS / DVB / DVD) cannot become text renditions and stay host-rendered only. Live sources are out of scope.
 
-**Rich ASS styling note.** Every native track carries plain text (ASS/SSA markup stripped, same as every other text format). Rich ASS styling (positions, speaker colours, karaoke) is still host-rendered inline via `LoadOptions.preserveASSMarkup`; the native track in PiP / AirPlay falls back to the system caption style.
+**Rich ASS styling.** With `LoadOptions.preserveASSMarkup` the tap keeps raw ASS event lines so the host overlay renders full styling (positions, colours); the WebVTT renditions strip the markup at serve time, so PiP shows plain text in the system caption style.
 
-**Timing.** Cue PTS values written to the `mov_text` tracks are on the AVPlayer clock axis (`source_pts - producer.videoShiftPts`), so they stay in sync with the displayed frame regardless of producer restarts or seeks.
+**Timing.** Served cues are on the AVPlayer clock axis, and producer restarts are timeline-exact (see [architecture](architecture.md)), so cues stay in sync with the picture across seeks and restarts.
 
-**Selection: native menu.** AVPlayer's built-in legible menu enumerates all language-tagged tracks automatically. No host code is required for that path; selection works in PiP and AirPlay without any additional wiring.
+**Selection: deliberately not automatic.** The renditions ship `DEFAULT=NO,AUTOSELECT=NO` so AVKit never engages one on its own and a host overlay never double-renders in fullscreen. A host that shows AVKit's stock chrome can still let the user pick from the native legible menu; Sodalite-style hosts select programmatically per surface instead.
 
-**Selection: host-driven API.** Three members on `AetherEngine` drive the native subtitle menu programmatically:
+**Selection: host-driven API.** Three members on `AetherEngine` drive the native renditions programmatically:
 
 ```swift
 // true once cues from at least one text track are decoded into the native stores
 engine.$nativeSubtitleRenditionAvailable   // @Published var Bool
 
-// ordered list of all native mov_text tracks (ordinal, language tag, display name)
+// ordered list of all native subtitle renditions (ordinal, language tag, display name)
 engine.$nativeSubtitleTracks               // @Published var [NativeSubtitleTrack]
 
-// select a track by ordinal (nil deselects all); matches by language tag, positional fallback
+// select a rendition by ordinal (nil deselects); language-tag match, positional fallback.
+// Re-asserts automatically if AVFoundation drops the selection during a stall recovery.
 engine.setNativeSubtitleSelected(track ordinal: Int?)
 ```
 
-`NativeSubtitleTrack` carries `.ordinal` (position in the muxer declaration), `.language` (ISO 639-2 tag), and `.displayName` (localized name suitable for a picker label).
+`NativeSubtitleTrack` carries `.ordinal` (position in the rendition declaration), `.language` (ISO 639-2 tag), and `.displayName` (localized name suitable for a picker label).
 
 The recommended host pattern for PiP / AirPlay:
 
@@ -137,14 +138,13 @@ This avoids double subtitles during inline playback (where the host overlay is a
 
 **Device-verification checklist** (required before tagging a release):
 
-- Native menu lists every subtitle language with correct labels in AVPlayer's standard legible picker.
-- Selecting a language from the native menu displays it; switching languages (including in PiP) works.
-- Inline host ASS rendering unchanged: rich styling intact, no regression from the all-tracks decode pass.
-- No double subtitles while inline; no track is auto-displayed on session start.
-- Timing: no constant offset between audio and subtitle cues.
-- SDR, HDR10, and Dolby Vision picture behavior byte-identical to a session with `prepareNativeSubtitles = false` (the tx3g traks must not perturb video or audio).
-- DV Profile 5 source with a text subtitle: subtitle works via the native menu.
-- Memory bounded by total cue count across all tracks (not per-track allocation that grows with track count).
+- Selecting a rendition displays it in the PiP window and survives seeks (including seeks that restart the producer).
+- Inline host ASS rendering unchanged: rich styling intact, tap-fed cues appear instantly on selection.
+- No double subtitles while inline; no rendition is auto-selected on session start.
+- Timing: no constant offset between audio and subtitle cues, before and after seeks.
+- SDR / HDR10 picture behavior unchanged with `prepareNativeSubtitles = true` (the renditions only add master tags + subtitle endpoints).
+- HDR-on-SDR-panel and DV Profile 5 on non-DV panels still play (media-direct, no renditions there by design).
+- Memory bounded by total cue count across all tracks.
 
 ### Authored ASS styling
 
