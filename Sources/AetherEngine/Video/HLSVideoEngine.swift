@@ -108,6 +108,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// lands at currentTime S (from-start = 0 = no shift). Set before `start()`. Sodalite#32.
     var subtitleStreamStartSeconds: Double = 0
 
+    /// Source position (seconds, playlist axis) the session will start at (resume/seek). Set
+    /// before `start()`; anchors the FIRST producer at the matching segment instead of seg0
+    /// (#93 residual: the seg0 cold start was torn down unwatched on every resume, and the
+    /// fetch/restart race could 404 the item into a host reload). nil/0 keeps baseIndex 0.
+    var initialStartSeconds: Double?
+    /// Resolved in start() from `initialStartSeconds` once the segment plan exists.
+    private(set) var initialProducerBaseIndex: Int = 0
+
     /// One cue store per declared text track (#55, all-tracks), ordinal-aligned with
     /// `nativeSubtitleLanguagesForSession`. Re-threaded onto every producer restart so
     /// per-segment cue drain survives seek/audio-switch. Empty = no native subtitles active.
@@ -766,6 +774,20 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.savedVideoConfig = videoConfig
         self.segmentPlan = plan
 
+        // #93 residual: anchor the FIRST producer at the session's start position instead of seg0.
+        // A resume start otherwise produces seg0 (torn down and discarded seconds later when
+        // AVPlayer's initial seek fetches the resume segment), restarts, and the fetch/restart race
+        // can 404 the item into a host reload (device: double spinner). The baseIndex > 0 anchor is
+        // the battle-tested restart path (gate at plan[base].startPts, tfdt continuity per 4.9.1).
+        if !isLiveSession, let startSeconds = initialStartSeconds, startSeconds > 0 {
+            initialProducerBaseIndex = segmentIndexForPlaylistTime(startSeconds)
+            EngineLog.emit(
+                "[HLSVideoEngine] initial producer anchored at idx=\(initialProducerBaseIndex) "
+                + "(startPosition=\(String(format: "%.2f", startSeconds))s)",
+                category: .session
+            )
+        }
+
         // Fallback duration from avg_frame_rate for MKVs that drop TrackEntry DefaultDuration
         // (HandBrake/web-rip pipelines). Without it, trun.last.duration=0 and AVPlayer parks on
         // WaitingToMinimizeStallsReason. 25 fps / 1 ms TB = 40 ticks; 23.976 fps = 41 ticks.
@@ -1055,6 +1077,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
             restartActivity: isLiveSession ? nil : { [weak self] in
                 self?.restartInFlight ?? false
             },
+            // #93 residual: the first producer may be anchored at the resume segment; without this
+            // the cold-start heuristic (abs(index - lastRestartIndex) > 2) restarts it immediately.
+            initialRestartIndex: initialProducerBaseIndex,
             nativeSubtitleStores: nativeSubtitleCueStoresForSession,
             nativeSubtitleLanguages: nativeSubtitleLanguagesForSession,
             nativeSubtitleRenditionInfos: nativeSubtitleRenditionInfosForSession,
@@ -1086,7 +1111,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
         try srv.start()
         self.server = srv
 
-        // 8. Kick the pump.
+        // 8. Kick the pump. An anchored first producer (#93 residual) needs the demuxer positioned
+        // at the anchor BEFORE the pump reads, exactly like performRestart's pre-makeProducer seek:
+        // the gate only DROPS pre-target packets, so an unseeked pump would read (and discard) the
+        // whole file up to the resume point. Absolute source-PTS for the same reason as the
+        // restart path (relative playlist time lands a keyframe behind on non-zero startPts0).
+        if initialProducerBaseIndex > 0, initialProducerBaseIndex < plan.count {
+            let tb = savedVideoConfig?.timeBase ?? AVRational(num: 1, den: 1000)
+            let anchorSeconds = Double(plan[initialProducerBaseIndex].startPts) * Double(tb.num) / Double(tb.den)
+            dem.seek(to: anchorSeconds)
+        }
         prod.start()
 
         // URL routing: master playlist (VIDEO-RANGE=PQ + SUPPLEMENTAL-CODECS=dvh1) only when

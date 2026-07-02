@@ -335,6 +335,10 @@ extension AetherEngine {
             EngineLog.emit("[AetherEngine] native subtitle default ordinal=\(defaultOrdinal) wholeProgram=\(session.nativeSubtitleWholeProgram) prefLangs=\(loadedOptions.nativeSubtitlePreferredLanguages) trackLangs=\(nativeSubtitleTrackTable.map { $0.language ?? "?" })", category: .engine)
         }
 
+        // #93 residual: hand the resume position to the session so the FIRST producer anchors at
+        // the matching segment instead of producing seg0 into an immediate teardown.
+        session.initialStartSeconds = startPosition
+
         // session.start() opens its own Demuxer + prewarm seek (~1-3 s on slow CDN); detach so @MainActor doesn't block.
         var playbackURL = try await Task.detached(priority: .userInitiated) { [session] in
             try session.start()

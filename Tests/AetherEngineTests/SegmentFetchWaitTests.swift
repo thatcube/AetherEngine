@@ -31,13 +31,15 @@ struct SegmentFetchWaitTests {
     }
 
     private func makeProvider(cache: SegmentCache, recorder: Recorder, activity: ActivityFlag,
-                              slice: TimeInterval = 0.05, rideCap: TimeInterval = 1.0) -> VideoSegmentProvider {
+                              slice: TimeInterval = 0.05, rideCap: TimeInterval = 1.0,
+                              initialRestartIndex: Int = 0) -> VideoSegmentProvider {
         VideoSegmentProvider(
             cache: cache, segments: segments(60), codecsString: "hvc1", supplementalCodecs: nil,
             resolution: (1920, 1080), videoRange: .sdr, frameRate: 24.0, hdcpLevel: nil,
             sourceBitrate: 8_000_000,
             restartHandler: { idx in recorder.record(idx) },
             restartActivity: { activity.get() },
+            initialRestartIndex: initialRestartIndex,
             repositionWaitSlice: slice,
             repositionRideCapSeconds: rideCap
         )
@@ -75,6 +77,24 @@ struct SegmentFetchWaitTests {
         #expect(recorder.all.isEmpty)
         #expect(elapsed >= 0.3)
         #expect(elapsed < 2.0)
+    }
+
+    @Test("resume-anchored provider cold-waits at the anchor instead of restarting the producer")
+    func resumeAnchorColdStart() {
+        let cache = SegmentCache(forwardWindow: 10, backwardWindow: 10)
+        defer { cache.close() }
+        let recorder = Recorder()
+        let activity = ActivityFlag(false)
+        // #93 residual: the first producer anchors at the resume segment; without the matching
+        // initialRestartIndex the cold-start heuristic (abs(index - 0) > 2) restarted it immediately.
+        let provider = makeProvider(cache: cache, recorder: recorder, activity: activity,
+                                    initialRestartIndex: 40)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
+            cache.store(index: 40, data: Data(repeating: 0x11, count: 8))
+        }
+        let served = provider.mediaSegment(at: 40)
+        #expect(served != nil)
+        #expect(recorder.all.isEmpty)
     }
 
     @Test("without an in-flight restart the fixed-budget behavior is unchanged")

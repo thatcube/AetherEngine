@@ -132,7 +132,7 @@ extension HLSVideoEngine {
             } else {
                 self.savedAudioConfig = cfg
                 do {
-                    let prod = try makeProducer(baseIndex: 0)
+                    let prod = try makeProducer(baseIndex: initialProducerBaseIndex)
                     if sourceIsAtmos {
                         EngineLog.emit(
                             "[HLSVideoEngine] EAC3+JOC Atmos: stream-copy engaged; DD+/JOC bitstream "
@@ -179,7 +179,7 @@ extension HLSVideoEngine {
                     self.savedAudioConfig = cfg
                     self.audioBridge = bridge
                     do {
-                        let prod = try makeProducer(baseIndex: 0)
+                        let prod = try makeProducer(baseIndex: initialProducerBaseIndex)
                         let (hlsCodec, pipelineLabel): (String, String)
                         switch audioBridgeMode {
                         case .surroundCompat:
@@ -219,6 +219,6 @@ extension HLSVideoEngine {
         self.audioBridge = nil
         audioHLSCodecs = nil
         self.audioPipelineDescription = nil
-        return try makeProducer(baseIndex: 0)
+        return try makeProducer(baseIndex: initialProducerBaseIndex)
     }
 }

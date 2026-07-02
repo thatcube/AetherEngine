@@ -141,6 +141,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         targetDurationFloorSeconds: Double? = nil,
         restartHandler: ((Int) -> Void)? = nil,
         restartActivity: (() -> Bool)? = nil,
+        initialRestartIndex: Int = 0,
         repositionWaitSlice: TimeInterval = 8.0,
         repositionRideCapSeconds: TimeInterval = 90.0,
         nativeSubtitleStores: [NativeSubtitleCueStore] = [],
@@ -166,6 +167,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         self.sourceBitrate = sourceBitrate
         self.restartHandler = restartHandler
         self.restartActivity = restartActivity
+        self._lastRestartIndex = initialRestartIndex
         self.repositionWaitSlice = repositionWaitSlice
         self.repositionRideCapSeconds = repositionRideCapSeconds
         self.nativeSubStores = nativeSubtitleStores
