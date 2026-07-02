@@ -707,7 +707,7 @@ extension AetherEngine {
     // MARK: - Native multi-track decode (#55, all-tracks)
 
     /// Launch the multi-decode reader that fills every text track's store in one side-demuxer pass (#55, all-tracks). Separate from the inline host-overlay path (subtitleCues). Idempotent: cancels any prior reader first. `stores` is ordinal-aligned with `nativeSubtitleTrackTable`.
-    func startNativeSubtitleReaders(url: URL, stores: [NativeSubtitleCueStore]) {
+    func startNativeSubtitleReaders(url: URL, stores: [NativeSubtitleCueStore], fromStart: Bool = false) {
         cancelNativeSubtitleReaders()
         var pairs: [(streamIndex: Int32, store: NativeSubtitleCueStore)] = []
         for (ordinal, entry) in nativeSubtitleTrackTable.enumerated() {
@@ -725,7 +725,9 @@ extension AetherEngine {
         let formatHint = customFormatHint
         let w = sourceVideoWidth > 0 ? sourceVideoWidth : 1920
         let h = sourceVideoHeight > 0 ? sourceVideoHeight : 1080
-        let startAt = sourceTime
+        // Sodalite#32: a whole-program .vtt must contain EVERY cue (0 -> EOF), so read from the start, not from
+        // the current playhead / resume position (which would drop all cues before it).
+        let startAt = fromStart ? 0.0 : sourceTime
         let reader = customClone
         // #76: same bounded-probe + active-title open as the inline reader.
         let probesize = loadedOptions.probesize
@@ -736,7 +738,7 @@ extension AetherEngine {
                 url: url, reader: reader, formatHint: formatHint, headers: headers,
                 pairs: pairs, startAt: startAt, videoWidth: w, videoHeight: h,
                 callerProbesize: probesize, callerMaxAnalyzeDuration: maxAnalyzeDuration,
-                selectTitleID: titleID
+                selectTitleID: titleID, readToEOF: fromStart
             )
         }
     }
@@ -756,7 +758,7 @@ extension AetherEngine {
         pairs: [(streamIndex: Int32, store: NativeSubtitleCueStore)],
         startAt: Double, videoWidth: Int32, videoHeight: Int32,
         callerProbesize: Int64? = nil, callerMaxAnalyzeDuration: Int64? = nil,
-        selectTitleID: Int? = nil
+        selectTitleID: Int? = nil, readToEOF: Bool = false
     ) async {
         let demuxer = Demuxer()
         let openProfile = DemuxerOpenProfile.subtitleSideDemuxer(
@@ -799,7 +801,9 @@ extension AetherEngine {
             demuxer.seek(to: duration * 0.5)
         }
         let freshPlayhead = await MainActor.run { [weak self] in self?.sourceTime }
-        let effectiveStart = max(startAt, freshPlayhead ?? startAt)
+        // Sodalite#32: a whole-program read must start at `startAt` (0) regardless of the playhead; the usual
+        // max-with-playhead (so the PiP reader doesn't start behind the playhead) would drop all cues before it.
+        let effectiveStart = readToEOF ? startAt : max(startAt, freshPlayhead ?? startAt)
         let seekTo = max(0, effectiveStart - 2.0)
         demuxer.seek(to: seekTo)
 
@@ -878,7 +882,9 @@ extension AetherEngine {
             // #15: keep the native readers ahead of AVPlayer's ~240s subtitle prefetch burst (larger lead than
             // the inline overlay reader), so the served .vtt segments carry cues instead of being fetched empty
             // and cached empty for the VOD rendition. Only runs while a native rendition is selected (PiP).
-            if let pktSeconds, pktSeconds > playheadSnapshot + Self.nativeSubtitleReadAheadSeconds {
+            // Sodalite#32: a whole-program .vtt must hold EVERY cue, so read straight to EOF without parking
+            // (cue data is tiny). markFinished after the loop lets the .vtt handler wait for a complete file.
+            if !readToEOF, let pktSeconds, pktSeconds > playheadSnapshot + Self.nativeSubtitleReadAheadSeconds {
                 while !Task.isCancelled {
                     guard let fresh = await MainActor.run(body: { [weak self] in self?.sourceTime }) else {
                         break readLoop
@@ -899,8 +905,14 @@ extension AetherEngine {
             }
         }
 
+        // Sodalite#32: reaching here without cancellation means the side demuxer hit EOF, so every cue for the
+        // whole program is now in the stores; signal completeness for the whole-program .vtt handler.
+        if readToEOF && !Task.isCancelled {
+            for pair in pairs { pair.store.markFinished() }
+        }
+
         EngineLog.emit(
-            "[AetherEngine] native subtitle readers exited (cancelled=\(Task.isCancelled)) totalCues=\(totalCues)",
+            "[AetherEngine] native subtitle readers exited (cancelled=\(Task.isCancelled)) totalCues=\(totalCues) readToEOF=\(readToEOF)",
             category: .engine
         )
     }
@@ -944,24 +956,51 @@ extension AetherEngine {
                 selected = group.options[ordinal]
             }
             guard let option = selected else { return }
-            // #15: pre-fill the near window BEFORE selecting, so AVPlayer fetches a populated rendition instead
-            // of racing the just-started reader (empty .vtt). Done here (off the loopback connection) rather
-            // than blocking the .vtt handler, which serializes the connection and stalls the legible pipeline.
+            // #15: pre-fill BEFORE selecting, so AVPlayer fetches a populated rendition instead of racing the
+            // reader (empty .vtt). Done here (off the loopback connection) rather than blocking the .vtt handler,
+            // which serializes the connection and stalls the legible pipeline.
+            // Sodalite#32: AVKit prefetches the ENTIRE forward subtitle window (~3 min observed) in ONE burst at
+            // selection and caches whatever it gets, never re-fetching a segment it already pulled. A +5s pre-fill
+            // left ~45/46 segments empty (device-confirmed). Pre-fill far enough ahead to cover that burst; break
+            // early when the reader stops making progress (EOF / read-ahead parked) so we never wait the full
+            // deadline for content with little remaining.
             if let stores = nativeSubtitleReaderParams?.stores, ordinal < stores.count {
                 let store = stores[ordinal]
-                let target = currentTime + 5.0
-                let deadline = Date().addingTimeInterval(6.0)
+                let target = currentTime + 240.0
+                let deadline = Date().addingTimeInterval(15.0)
+                var lastMax = 0.0
+                var stall = 0
                 while store.readMaxCueEnd() < target, Date() < deadline {
-                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    let m = store.readMaxCueEnd()
+                    if m > lastMax {
+                        lastMax = m
+                        stall = 0
+                    } else if lastMax > 0 {
+                        // Only treat a flat readMax as "reader done/parked" AFTER it has started producing;
+                        // before the first cue lands (seek + demux latency) readMax is legitimately 0, and an
+                        // early break would skip the pre-fill entirely (Sodalite#32 regression).
+                        stall += 1
+                    }
+                    if stall >= 6 { break }   // ~900ms with no new cues after producing => EOF / read-ahead parked
+                    try? await Task.sleep(nanoseconds: 150_000_000)
                 }
+                EngineLog.emit("[PiPDiag] pre-fill done: readMax=\(String(format: "%.1f", store.readMaxCueEnd())) target=\(String(format: "%.1f", target)) cues=\(store.cueCount)", category: .engine)
             }
             // #15: AVKit attaches the legible renderer to whatever selection is active when the rendering
             // pipeline is established; a selection made mid-playback updates state + downloads cues but is not
             // drawn until re-asserted. Deselect, hop one runloop, then reselect to force the renderer to attach
             // (documented workaround; the same effect a PiP round-trip had). Needs the manual-criteria pin above.
+            let itemID = String(UInt(bitPattern: ObjectIdentifier(item).hashValue) & 0xffff, radix: 16)
+            EngineLog.emit("[PiPDiag] select: item=\(itemID) opt=\(option.displayName) groupOpts=\(group.options.count) criteriaAuto=\(currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically ?? true) itemIsCurrent=\(currentAVPlayer?.currentItem === item)", category: .engine)
             item.select(nil, in: group)
             try? await Task.sleep(nanoseconds: 100_000_000)
             item.select(option, in: group)
+            let after = item.currentMediaSelection.selectedMediaOption(in: group)?.displayName ?? "nil"
+            EngineLog.emit("[PiPDiag] select done: selected=\(after) itemIsCurrent=\(currentAVPlayer?.currentItem === item)", category: .engine)
+            // Persistence probe: does AVSmartSubtitlesController drop it, or does it stay (renderer-attach issue)?
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            let later = item.currentMediaSelection.selectedMediaOption(in: group)?.displayName ?? "nil"
+            EngineLog.emit("[PiPDiag] select +2.5s: selected=\(later) itemIsCurrent=\(currentAVPlayer?.currentItem === item)", category: .engine)
         }
     }
 

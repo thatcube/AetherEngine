@@ -19,10 +19,15 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
     private let lock = NSLock()
     private var cues: [SubtitleCue] = []
     private var shiftSeconds: Double = 0
+    private var finished = false
 
     init() {}
 
     func setShiftSeconds(_ s: Double) { lock.lock(); shiftSeconds = s; lock.unlock() }
+
+    /// Set once the reader has read the track to EOF, so a whole-program .vtt consumer knows every cue is present (Sodalite#32).
+    func markFinished() { lock.lock(); finished = true; lock.unlock() }
+    var isFinished: Bool { lock.lock(); defer { lock.unlock() }; return finished }
 
     func replaceCues(_ newCues: [SubtitleCue]) {
         lock.lock(); defer { lock.unlock() }
@@ -34,7 +39,7 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
         for c in extra { if case .text = c.body { cues.append(c) } }
     }
 
-    func clear() { lock.lock(); cues.removeAll(keepingCapacity: false); lock.unlock() }
+    func clear() { lock.lock(); cues.removeAll(keepingCapacity: false); finished = false; lock.unlock() }
 
     var cueCount: Int { lock.lock(); defer { lock.unlock() }; return cues.count }
 

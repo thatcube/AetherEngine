@@ -259,8 +259,19 @@ extension AetherEngine {
         // Bitmap codecs excluded via the shared decoder-name classifier (a prior exact-match Set used descriptor
         // names that never matched TrackInfo.codec's decoder names, so PGS/DVB/DVD leaked in as mov_text).
         // Exclude in-band CEA-608/708 (#77): no demuxable packets to mux into mov_text; served by the CC tap.
-        let textTracks = subtitleTracks.filter {
+        var textTracks = subtitleTracks.filter {
             !Self.isBitmapSubtitleCodec($0.codec) && !Self.isEmbeddedClosedCaptionCodec($0.codec)
+        }
+        // Sodalite#32: AVKit reliably renders only the FIRST native subtitle rendition (ordinal 0 / subs_0);
+        // device-confirmed that a programmatic selection of a later rendition is fetched then dropped after one
+        // segment. So move the preferred-language track to ordinal 0 and have the host select ordinal 0.
+        if !loadedOptions.nativeSubtitlePreferredLanguages.isEmpty {
+            for pref in loadedOptions.nativeSubtitlePreferredLanguages {
+                if let idx = textTracks.firstIndex(where: { AetherEngine.languageMatches($0.language, pref) }) {
+                    if idx != 0 { textTracks.insert(textTracks.remove(at: idx), at: 0) }
+                    break
+                }
+            }
         }
         nativeSubtitleTrackTable = textTracks.map { track in
             NativeSubtitleTrackEntry(sourceStreamIndex: track.id, language: track.language)
@@ -278,6 +289,7 @@ extension AetherEngine {
         }
         let hasTextSubtitleTrack = !nativeSubtitleTrackTable.isEmpty
         session.enableNativeSubtitleTrackForSession = loadedOptions.prepareNativeSubtitles && hasTextSubtitleTrack
+        EngineLog.emit("[PiPDiag] load: prepare=\(loadedOptions.prepareNativeSubtitles) eager=\(loadedOptions.eagerNativeSubtitleReaders) textTracks=\(nativeSubtitleTrackTable.count) enable=\(session.enableNativeSubtitleTrackForSession)", category: .engine)
 
         // #77: arm the in-band CC tap before start() so the first producer keeps the CC stream.
         setupClosedCaptionTapIfNeeded(session: session)
@@ -288,6 +300,29 @@ extension AetherEngine {
         if session.enableNativeSubtitleTrackForSession, !nativeSubtitleTrackTable.isEmpty {
             session.nativeSubtitleCueStoresForSession = nativeSubtitleTrackTable.map { _ in NativeSubtitleCueStore() }
             session.nativeSubtitleLanguagesForSession = nativeSubtitleTrackTable.map { $0.language }
+            // Sodalite#32: the native rendition matching the preferred subtitle language must be the master's
+            // DEFAULT=YES one, because a host-selected legible track only renders if it is the group default
+            // (AVKit hides a non-default selection as mute-only). Resolved here, before start() builds the
+            // master, so the default is correct on AVKit's first fetch; the host selects this same ordinal.
+            var defaultOrdinal = 0
+            for pref in loadedOptions.nativeSubtitlePreferredLanguages {
+                if let idx = nativeSubtitleTrackTable.firstIndex(where: { AetherEngine.languageMatches($0.language, pref) }) {
+                    defaultOrdinal = idx
+                    break
+                }
+            }
+            session.nativeSubtitleDefaultOrdinal = defaultOrdinal
+            nativeSubtitleDefaultOrdinal = defaultOrdinal
+            // Sodalite#32: with eager readers the whole cue set is available up front, so serve the rendition as
+            // one whole-program .vtt (the AVPlayer-reliable shape). VOD only (a live program has no fixed end).
+            // Sodalite#32: whole-program renders reliably but is anchored to the stream start, so it breaks on
+            // scrub (the loopback producer-restarts + re-anchors the video on seek, but AVKit keeps the cached
+            // VOD .vtt). Use the WINDOWED shape (per-segment, 1:1 with the video segments) which AVKit re-fetches
+            // at each position and is seek-robust; combined now with a COMPLETE store (read-to-EOF) so no window
+            // is served empty (the earlier windowed sparse-fetch was tested with an incomplete parking reader).
+            session.nativeSubtitleWholeProgram = false
+            session.subtitleStreamStartSeconds = startPosition ?? 0
+            EngineLog.emit("[PiPDiag] default native ordinal=\(defaultOrdinal) wholeProgram=\(session.nativeSubtitleWholeProgram) prefLangs=\(loadedOptions.nativeSubtitlePreferredLanguages) trackLangs=\(nativeSubtitleTrackTable.map { $0.language ?? "?" })", category: .engine)
         }
 
         // session.start() opens its own Demuxer + prewarm seek (~1-3 s on slow CDN); detach so @MainActor doesn't block.
@@ -320,6 +355,17 @@ extension AetherEngine {
                 let shift = session.playlistShiftSeconds
                 stores.forEach { $0.setShiftSeconds(shift) }
                 nativeSubtitleReaderParams = (url: url, stores: stores)
+                // Sodalite#32 probe: when the host lets AVKit own the legible selection (DEFAULT=YES rendition,
+                // no host `setNativeSubtitleSelected`), nothing would start the lazy readers, so the .vtt would be
+                // empty when AVKit fetches it. Start them eagerly here so the cue stores fill from load, the way a
+                // static VOD subtitle file is fully present up front.
+                if loadedOptions.eagerNativeSubtitleReaders {
+                    // Sodalite#32: read from the start straight to EOF (no read-ahead parking) so every windowed
+                    // segment is populated when AVKit fetches it. Cue data is tiny; decoupled from the .vtt shape.
+                    let readEOF = !loadedOptions.isLive
+                    startNativeSubtitleReaders(url: url, stores: stores, fromStart: readEOF)
+                    EngineLog.emit("[PiPDiag] eager readers started: stores=\(stores.count) fromStart=\(readEOF)", category: .engine)
+                }
             }
         }
 

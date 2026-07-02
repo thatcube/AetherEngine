@@ -54,6 +54,10 @@ protocol HLSSegmentProvider: AnyObject {
     /// Native subtitle renditions (#15): one per text track, for the master EXT-X-MEDIA:TYPE=SUBTITLES tags
     /// and the /subs_{N} endpoints. Empty unless prepareNativeSubtitles is on and the cue stores are threaded.
     var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String)] { get }
+    /// Ordinal advertised as DEFAULT=YES in the master SUBTITLES group (Sodalite#32).
+    var nativeSubtitleDefaultOrdinal: Int { get }
+    /// Serve the SUBTITLES rendition as one whole-program .vtt (single VOD segment) instead of per-video-segment (Sodalite#32).
+    var nativeSubtitleWholeProgram: Bool { get }
     /// WebVTT body for one subtitle SEGMENT (#15): cues whose window overlaps video segment `segmentIndex` of
     /// `ordinal`. nil if either index is out of range. The subtitle media playlist mirrors the video media
     /// playlist one segment per video segment, so the embedded reader (parked ~90s ahead of the playhead)
@@ -89,6 +93,8 @@ extension HLSSegmentProvider {
     var masterHDCPLevel: String? { nil }
     var masterClosedCaptions: String? { nil }
     var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String)] { [] }
+    var nativeSubtitleDefaultOrdinal: Int { 0 }
+    var nativeSubtitleWholeProgram: Bool { false }
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String? { nil }
     var liveTargetSegmentDuration: Double? { nil }
     var liveBlockingReloadEnabled: Bool { true }
@@ -547,6 +553,7 @@ final class HLSLocalServer: @unchecked Sendable {
                 if firstTime { loggedMasterPlaylist = true }
                 stateLock.unlock()
                 if firstTime {
+                    EngineLog.emit("[PiPDiag] master served: subRenditions=\(provider?.nativeSubtitleRenditions.count ?? 0)", category: .hlsServer)
                     EngineLog.emit("[HLSLocalServer] master.m3u8 body:\n\(body)",
                                    category: .hlsServer)
                 }
@@ -594,6 +601,7 @@ final class HLSLocalServer: @unchecked Sendable {
             guard let parsed = Self.parseSubsPath(p), let prov = provider else {
                 return send404(fd: fd, path: normalizedPath, reason: "unparseable subtitle playlist path")
             }
+            EngineLog.emit("[PiPDiag] AVKit SELECTED rendition: fetched subs_\(parsed.ordinal).m3u8", category: .hlsServer)
             let subBody = Self.buildSubtitleMediaPlaylistText(ordinal: parsed.ordinal, provider: prov)
             return send200(fd: fd, path: normalizedPath,
                            data: Data(subBody.utf8),
@@ -915,8 +923,10 @@ final class HLSLocalServer: @unchecked Sendable {
             streamInfAttrs.append("CLOSED-CAPTIONS=\(cc)")
         }
         // #15: native WebVTT subtitle renditions (separate from the A/V variant; in-band timed text is
-        // non-conformant for HLS). DEFAULT/AUTOSELECT=NO so the host overlay stays in fullscreen and the
-        // native track is selected only in PiP. Orthogonal to the video VIDEO-RANGE/CODECS attributes.
+        // non-conformant for HLS). Orthogonal to the video VIDEO-RANGE/CODECS attributes.
+        // Sodalite#32: DEFAULT=NO,AUTOSELECT=NO so AVKit never auto-selects a subtitle rendition in fullscreen
+        // (the on-frame overlay owns fullscreen subtitles). The host explicitly selects the matching rendition
+        // only on PiP entry and deselects it on PiP exit, so the two never double up.
         let subRenditions = provider.nativeSubtitleRenditions
         for r in subRenditions {
             var mediaAttrs = ["TYPE=SUBTITLES", "GROUP-ID=\"subs\"", "NAME=\"\(r.name)\""]
@@ -946,6 +956,24 @@ final class HLSLocalServer: @unchecked Sendable {
         let snapshot = provider.notePlaylistBuild()
         let count = snapshot.visibleCount
         let firstVisible = min(snapshot.firstVisible, count)
+
+        // Sodalite#32: whole-program shape — ONE VOD segment spanning the full duration, one .vtt with all cues.
+        // The only AVPlayer-reliable sideload structure; the per-segment window made AVKit fetch a couple of
+        // sparse segments and never render. TARGETDURATION/EXTINF = full program length (Apple rules 5.5/8.7).
+        if provider.nativeSubtitleWholeProgram {
+            var total = 0.0
+            for i in firstVisible..<count { total += provider.segmentDuration(at: i) }
+            var lines: [String] = ["#EXTM3U", "#EXT-X-VERSION:7"]
+            lines.append("#EXT-X-TARGETDURATION:\(max(1, Int(ceil(total))))")
+            lines.append("#EXT-X-MEDIA-SEQUENCE:0")
+            lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
+            // No trailing comma on EXTINF: the proven-working whole-file sideload omits it ("seems to break it"
+            // otherwise), and AVKit accepts it here. Sodalite#32.
+            lines.append("#EXTINF:\(String(format: "%.3f", total))")
+            lines.append("subs_\(ordinal)_0.vtt")
+            lines.append("#EXT-X-ENDLIST")
+            return lines.joined(separator: "\n") + "\n"
+        }
         let typeIsEvent = (provider.playlistType == .event && !snapshot.endlistAdded)
         let typeIsLive = (provider.playlistType == .live && !snapshot.endlistAdded)
 

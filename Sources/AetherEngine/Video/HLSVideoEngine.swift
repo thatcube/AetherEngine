@@ -96,6 +96,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// init moov always declares the mov_text track (#55). Set before `start()`.
     var enableNativeSubtitleTrackForSession: Bool = false
 
+    /// Native subtitle rendition marked DEFAULT=YES in the master (Sodalite#32). Set before `start()`; the
+    /// provider advertises this ordinal as the group default so a host-selected legible track renders.
+    var nativeSubtitleDefaultOrdinal: Int = 0
+
+    /// Serve the SUBTITLES rendition as one whole-program .vtt (Sodalite#32). Set before `start()`.
+    var nativeSubtitleWholeProgram: Bool = false
+
+    /// Source position (seconds) the playback stream started at (resume/seek). Device-confirmed AVKit anchors a
+    /// whole-program VOD .vtt's time 0 to the stream start, so whole-program cues shift by this so cue-for-source-S
+    /// lands at currentTime S (from-start = 0 = no shift). Set before `start()`. Sodalite#32.
+    var subtitleStreamStartSeconds: Double = 0
+
     /// One cue store per declared text track (#55, all-tracks), ordinal-aligned with
     /// `nativeSubtitleLanguagesForSession`. Re-threaded onto every producer restart so
     /// per-segment cue drain survives seek/audio-switch. Empty = no native subtitles active.
@@ -931,7 +943,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 self?.requestRestart(at: idx)
             },
             nativeSubtitleStores: nativeSubtitleCueStoresForSession,
-            nativeSubtitleLanguages: nativeSubtitleLanguagesForSession
+            nativeSubtitleLanguages: nativeSubtitleLanguagesForSession,
+            nativeSubtitleDefaultOrdinal: nativeSubtitleDefaultOrdinal,
+            nativeSubtitleWholeProgram: nativeSubtitleWholeProgram,
+            currentShiftSeconds: { [weak self] in (self?.playlistShiftSeconds ?? 0) + (self?.subtitleStreamStartSeconds ?? 0) }
         )
         self.provider = prov
         if isLiveSession {
@@ -1002,6 +1017,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             throw HLSVideoEngineError.openFailed(reason: "server URL not ready")
         }
         self.servingMasterPlaylist = useMasterPlaylist
+        EngineLog.emit("[PiPDiag] serving useMaster=\(useMasterPlaylist) videoRange=\(videoRange) hasNativeSubs=\(hasNativeSubs) routingSafe=\(routingSafeForMaster) dv5OnNonDV=\(dv5OnNonDVPanel)", category: .engine)
         EngineLog.emit("[HLSVideoEngine] serving on \(url.absoluteString) (dvModeAvailable=\(dvModeAvailable) effectiveDvMode=\(effectiveDvMode) panelIsHDR=\(panelIsInHDRMode) displaySupportsHDR=\(displaySupportsHDR) matchContent=\(matchContentEnabled) sourceIsHDR=\(sourceIsHDR) useMaster=\(useMasterPlaylist) videoRange=\(videoRange) dvVariant=\(dvVariant))")
         return url
     }
