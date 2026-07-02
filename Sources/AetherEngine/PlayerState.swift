@@ -351,7 +351,11 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
     /// ASS / SSA tracks only: `[Script Info]` + `[V4+ Styles]` + `[Events]` format line from codec extradata. Hosts rendering ASS styling themselves (see `LoadOptions.preserveASSMarkup`) need it to resolve style references. nil for all other track kinds.
     public let assHeader: String?
 
-    public init(id: Int, name: String, codec: String, language: String?, channels: Int = 0, isDefault: Bool, isForced: Bool = false, isHearingImpaired: Bool = false, isCommentary: Bool = false, isAtmos: Bool = false, assHeader: String? = nil) {
+    /// True for host-registered external subtitle tracks (AetherEngine#88); their `id` is synthetic
+    /// (`AetherEngine.externalSubtitleTrackIDBase` + ordinal), not an AVStream index.
+    public let isExternal: Bool
+
+    public init(id: Int, name: String, codec: String, language: String?, channels: Int = 0, isDefault: Bool, isForced: Bool = false, isHearingImpaired: Bool = false, isCommentary: Bool = false, isAtmos: Bool = false, assHeader: String? = nil, isExternal: Bool = false) {
         self.id = id
         self.name = name
         self.codec = codec
@@ -363,6 +367,7 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
         self.isCommentary = isCommentary
         self.isAtmos = isAtmos
         self.assHeader = assHeader
+        self.isExternal = isExternal
     }
 }
 
