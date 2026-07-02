@@ -666,10 +666,69 @@ extension AetherEngine {
         return info
     }
 
-    /// #88: activate a registered external track via the sidecar decode path. Task 4 adds the
-    /// finished-store instant backfill for load-declared tracks.
+    /// #88: activate a registered external track. A finished native store holds the whole file's
+    /// cues (decoded plain-text at load), so the overlay backfills instantly with no re-download.
+    /// Styled ASS wants raw markup, which the store strips, so it re-decodes via the sidecar path.
     private func selectExternalSubtitleTrack(id: Int, track: ExternalSubtitleTrack) {
+        let codec = ExternalSubtitleTrack.codecName(url: track.url, formatHint: track.formatHint)
+        let wantsStyledASS = loadedOptions.preserveASSMarkup && codec == "ass"
+        if !wantsStyledASS,
+           let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: id, in: nativeSubtitleTrackTable),
+           let store = nativeStore(atOrdinal: ordinal),
+           store.isFinished, store.cueCount > 0 {
+            cancelSidecarTask()
+            cancelEmbeddedSubtitleReader()
+            activeEmbeddedSubtitleStreamIndex = -1
+            subtitleTapOverlayStreamIndex = nil
+            loadedSidecarURL = track.url
+            sidecarASSHeader = nil
+            isSubtitleActive = true
+            activeSubtitleTrackIndex = id
+            subtitleCues = store.snapshotCues()
+            isLoadingSubtitles = false
+            EngineLog.emit("[AetherEngine] external subtitle backfilled from finished store: id=\(id) cues=\(subtitleCues.count)", category: .engine)
+            return
+        }
         startSidecarDecode(url: track.url, httpHeaders: track.httpHeaders, externalTrackID: id)
+    }
+
+    /// Store lookup for the external backfill: test-hook override first, else the live session's stores.
+    private func nativeStore(atOrdinal ordinal: Int) -> NativeSubtitleCueStore? {
+        #if DEBUG
+        if let hooked = testHookNativeStores, ordinal < hooked.count { return hooked[ordinal] }
+        #endif
+        guard let stores = nativeVideoSession?.nativeSubtitleCueStoresForSession,
+              ordinal < stores.count else { return nil }
+        return stores[ordinal]
+    }
+
+    /// #88: fill the native stores of load-declared external tracks with one whole-file decode each
+    /// (plain text, matching the WebVTT rendition), then markFinished so the .vtt handler can serve
+    /// complete files and the overlay select can backfill instantly. No side demuxer, no pacing.
+    func startExternalNativeStoreFill(session: HLSVideoEngine) {
+        externalNativeStoreFillTask?.cancel()
+        externalNativeStoreFillTask = nil
+        var jobs: [(url: URL, headers: [String: String], store: NativeSubtitleCueStore)] = []
+        for (ordinal, entry) in nativeSubtitleTrackTable.enumerated() {
+            guard let extID = entry.externalID,
+                  let track = externalSubtitleRegistry[extID],
+                  ordinal < session.nativeSubtitleCueStoresForSession.count else { continue }
+            jobs.append((track.url,
+                         track.httpHeaders ?? loadedOptions.httpHeaders,
+                         session.nativeSubtitleCueStoresForSession[ordinal]))
+        }
+        guard !jobs.isEmpty else { return }
+        externalNativeStoreFillTask = Task.detached(priority: .utility) { [jobs] in
+            for job in jobs {
+                if Task.isCancelled { return }
+                if let result = try? await SubtitleDecoder.decodeFile(url: job.url, httpHeaders: job.headers) {
+                    job.store.appendCues(result.cues)
+                    job.store.markFinished()
+                } else {
+                    EngineLog.emit("[AetherEngine] external native store fill failed: \(job.url.lastPathComponent)", category: .engine)
+                }
+            }
+        }
     }
 
     /// Unregister an external track: delist + drop the registry entry; an active selection
@@ -1147,13 +1206,20 @@ extension AetherEngine {
         }
     }
 
-    /// #15: select the native mov_text track matching the currently-active subtitle so AVKit renders it inside
-    /// the PiP window; nil deselects when PiP ends. Maps the active subtitle's source stream to the native
-    /// ordinal. No-op (no PiP subtitle) when the active subtitle has no native text equivalent: a bitmap
-    /// (PGS/DVB), CEA-608/708, or a sidecar track (sourceStreamIndex nil).
+    /// #88: ordinal of the table entry backing an active track id: embedded ids match
+    /// sourceStreamIndex, external ids match externalID.
+    static func nativeSubtitleOrdinal(forActiveTrack id: Int, in table: [NativeSubtitleTrackEntry]) -> Int? {
+        table.firstIndex { $0.sourceStreamIndex == id || $0.externalID == id }
+    }
+
+    /// #15: select the native track matching the currently-active subtitle so AVKit renders it inside
+    /// the PiP window; nil deselects when PiP ends. Maps the active subtitle's source stream (embedded)
+    /// or synthetic id (load-declared external, #88) to the native ordinal. No-op (no PiP subtitle) when
+    /// the active subtitle has no native text equivalent: a bitmap (PGS/DVB), CEA-608/708, or a track
+    /// added after load (dynamic external / one-shot sidecar).
     public func setNativeSubtitleForPiP(_ active: Bool) {
         guard active, let activeIdx = activeSubtitleTrackIndex,
-              let ordinal = nativeSubtitleTrackTable.firstIndex(where: { $0.sourceStreamIndex == activeIdx })
+              let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: activeIdx, in: nativeSubtitleTrackTable)
         else {
             setNativeSubtitleSelected(track: nil)
             return

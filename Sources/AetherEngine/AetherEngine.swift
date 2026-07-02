@@ -607,14 +607,26 @@ public final class AetherEngine: ObservableObject {
     /// matches the request; a new load / title switch / clear tears it down and clears the key (#76 part 2).
     var activeSubtitleSideDemuxerKey: String?
 
-    /// One entry per native mov_text track in muxer-declaration order (#55). Built from probed subtitleTracks
-    /// (non-bitmap, source order) at load; sidecar entries appended at runtime. sourceStreamIndex is nil for sidecars;
-    /// language is ISO 639-2. Ordinal = position in array. Empty means native subs disabled. Cleared on stop/load.
+    /// One entry per native mov_text track in muxer-declaration order (#55). Built at load from the merged
+    /// subtitleTracks (probed non-bitmap streams + load-declared external tracks, #88). sourceStreamIndex is
+    /// nil for external entries, whose synthetic id lives in externalID; language is ISO 639-2. Ordinal =
+    /// position in array. Empty means native subs disabled. Cleared on stop/load.
     struct NativeSubtitleTrackEntry: Sendable {
         let sourceStreamIndex: Int?
+        var externalID: Int? = nil
         let language: String?
     }
     var nativeSubtitleTrackTable: [NativeSubtitleTrackEntry] = []
+
+    /// Whole-file decode tasks filling native stores for load-declared external tracks (#88).
+    var externalNativeStoreFillTask: Task<Void, Never>? = nil
+
+    #if DEBUG
+    /// Test-only store override for the external instant-backfill path (#88); production reads the
+    /// live session's stores.
+    var testHookNativeStores: [NativeSubtitleCueStore]? = nil
+    func testHookInstallNativeStores(_ stores: [NativeSubtitleCueStore]) { testHookNativeStores = stores }
+    #endif
 
     /// External subtitle registrations by synthetic TrackInfo id (AetherEngine#88). Cleared on
     /// load()/stop() alongside subtitleTracks.
@@ -886,6 +898,8 @@ public final class AetherEngine: ObservableObject {
         nextExternalSubtitleOrdinal = 0
         hostExplicitSubtitleAction = false
         activeSecondaryExternalSubtitleTrackID = nil
+        externalNativeStoreFillTask?.cancel()
+        externalNativeStoreFillTask = nil
         nativeSubtitleTrackTable = []
         nativeSubtitleTracks = []
         nativeSubtitleReaderParams = nil
@@ -1617,6 +1631,8 @@ public final class AetherEngine: ObservableObject {
         nextExternalSubtitleOrdinal = 0
         hostExplicitSubtitleAction = false
         activeSecondaryExternalSubtitleTrackID = nil
+        externalNativeStoreFillTask?.cancel()
+        externalNativeStoreFillTask = nil
         // Font attachments are session-scoped but must survive stopInternal (audio-track-switch skips the probe;
         // clearing in stopInternal would leave the session with an empty font list after any audio switch).
         fontAttachments = []
