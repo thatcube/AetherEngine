@@ -64,6 +64,19 @@ struct DemuxerOpenProfile: Sendable {
         return copy
     }
 
+    /// Open profile for the #79 wedged-restart fresh reopen (#93 residual). The session already
+    /// probed the source at start (saved codec configs, built segment plan), so the reopen needs
+    /// only avformat_open_input's header/PMT parse plus a working seek index; find_stream_info
+    /// would re-pay the full probe budget over an already-starved link (device: a 44 s restart,
+    /// most of it in this reopen). Keeps the playback AVIO tuning for the sustained pump reads
+    /// that follow; the probe ceiling bounds the on-demand resolve fallback like the side demuxer.
+    static let restartReopen: DemuxerOpenProfile = {
+        var profile = playback.withProbeBudget(probesize: 4 * 1024 * 1024,
+                                               maxAnalyzeDuration: 5 * 1_000_000)
+        profile.skipStreamInfo = true
+        return profile
+    }()
+
     /// Open profile for the embedded subtitle side-demuxer (#76, #87). `EmbeddedSubtitleDecoder`
     /// needs only `codec_id` / `codec_type` (carried in the container header / MPEG-TS PMT,
     /// resolved by `avformat_open_input` itself) and seeds bitmap (PGS/DVB/DVD) canvas dims

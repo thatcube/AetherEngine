@@ -150,3 +150,21 @@ struct DemuxerProfileTests {
         #expect(DemuxerOpenProfile.playback.withProbeBudget(probesize: 1, maxAnalyzeDuration: nil).skipStreamInfo == false)
     }
 }
+
+/// #93 residual: the #79 wedged-restart fresh reopen paid the FULL first-open cost
+/// (find_stream_info probe budget) over an already-starved link; the session has the saved codec
+/// configs and the segment plan, so the reopen needs only the header/PMT parse plus a seek index.
+extension DemuxerProfileTests {
+    @Test("restartReopen skips find_stream_info and bounds the fallback probe")
+    func restartReopenProfile() {
+        let p = DemuxerOpenProfile.restartReopen
+        #expect(p.skipStreamInfo)
+        #expect(p.probesize < DemuxerOpenProfile.playback.probesize)
+        #expect(p.maxAnalyzeDuration < DemuxerOpenProfile.playback.maxAnalyzeDuration)
+        // Sustained pump reads follow the reopen: keep the playback AVIO tuning.
+        #expect(p.avioPrefetch == DemuxerOpenProfile.playback.avioPrefetch)
+        #expect(p.avioChunkSize == DemuxerOpenProfile.playback.avioChunkSize)
+        #expect(p.avioRequestTimeout == DemuxerOpenProfile.playback.avioRequestTimeout)
+        #expect(p.avioMaxRetries == DemuxerOpenProfile.playback.avioMaxRetries)
+    }
+}
