@@ -294,10 +294,23 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         return cache.peekURL(index: index)
     }
 
+    /// Total media-segment requests seen (both serve paths). The #65 consumer re-engage watchdog
+    /// reads this after a wedge re-anchor: an unchanged count means AVPlayer stopped requesting
+    /// entirely and needs a host-side nudge (#93 residual).
+    var mediaFetchCount: UInt64 {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _mediaFetchCount
+    }
+    private var _mediaFetchCount: UInt64 = 0
+
     /// Shared by mediaSegment(at:) and mediaSegmentURL(at:). Without sharing, back-scrubs served
     /// via sendfile (cache hits) skip the proactive restart entirely, leaving seg-11+ to fall into
     /// a reactive prune-gap restart with AVPlayer's buffer at its thinnest.
     private func handleTargetChange(to index: Int) {
+        stateLock.lock()
+        _mediaFetchCount += 1
+        stateLock.unlock()
         let previousTarget = cache.targetIndex
         cache.declareTarget(index)
 

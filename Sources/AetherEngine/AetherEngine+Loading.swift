@@ -217,6 +217,27 @@ extension AetherEngine {
         // #65 pause false-positive: let the producer read AVPlayer's play intent off-main so its backpressure
         // wedge detector suspends while the consumer is paused. Set before start() so makeProducer captures it.
         session.playIntentProvider = { [playIntentMirror] in playIntentMirror.get() }
+        // #93 residual: after a wedge re-anchor with a consumer that stopped requesting entirely,
+        // nudge AVPlayer: a zero-tolerance seek to its own position rebuilds AVFoundation's loading
+        // pipeline (the effect a manual back-out had). Opens the spurious-pause window too, since
+        // the nudge can bounce the transport state.
+        session.onConsumerReengageNeeded = { [weak self] position in
+            Task { @MainActor [weak self] in
+                guard let self, let host = self.nativeHost,
+                      let player = self.currentAVPlayer, let item = player.currentItem else { return }
+                guard player.timeControlStatus != .paused else { return }
+                self.stallRecoveryWindowUntil = Date().addingTimeInterval(Self.stallRecoveryWindowSeconds)
+                EngineLog.emit(
+                    "[AetherEngine] #65 re-engaging stalled AVPlayer: nudge seek to "
+                    + "\(String(format: "%.2f", position))s",
+                    category: .engine
+                )
+                item.cancelPendingSeeks()
+                player.seek(to: CMTime(seconds: position, preferredTimescale: 600),
+                            toleranceBefore: .zero, toleranceAfter: .zero) { _ in }
+                host.play()
+            }
+        }
         session.onPlaylistShiftRebased = { [weak self] seconds, seamOutputSeconds in
             Task { @MainActor in
                 guard let self = self else { return }
@@ -452,8 +473,26 @@ extension AetherEngine {
             storeIn: &nativeCancellables
         )
         host.$timeControlStatus
-            .sink { [weak self] status in
+            .sink { [weak self, weak host] status in
                 guard let self = self else { return }
+                // #93 residual: during active stall recovery AVPlayer can drop a SPURIOUS .paused
+                // (rate 0, no wait reason, no user action). Latching it kills both recovery paths,
+                // so re-assert play() within the bounded window instead (see stallRecoveryWindowUntil).
+                if Self.shouldReassertPlayDuringRecovery(
+                    statusIsPaused: status == .paused,
+                    engineStateIsPlaying: self.state == .playing,
+                    now: Date(), windowUntil: self.stallRecoveryWindowUntil,
+                    reasserts: self.stallRecoveryReasserts
+                ) {
+                    self.stallRecoveryReasserts += 1
+                    EngineLog.emit(
+                        "[AetherEngine] #65 spurious pause during stall recovery; re-asserting play "
+                        + "(\(self.stallRecoveryReasserts)/\(Self.maxStallRecoveryReasserts))",
+                        category: .engine
+                    )
+                    host?.play()
+                    return
+                }
                 // #65 pause false-positive: mirror AVPlayer's play intent for the off-main producer wedge detector.
                 // != .paused covers both .playing and .waitingToPlay, so a deep rebuffer (wants to play, starved)
                 // still reads as play-intent and can legitimately trip the breaker; only a real pause suspends it.
@@ -471,6 +510,17 @@ extension AetherEngine {
                 @unknown default:
                     break
                 }
+            }
+            .store(in: &nativeCancellables)
+
+        // #93 residual: every stall opens the spurious-pause recovery window (a fresh stall resets
+        // the re-assert budget; the pause can trail the stall by tens of seconds while fetches stay silent).
+        host.$stallCount
+            .dropFirst()
+            .sink { [weak self] _ in
+                guard let self = self else { return }
+                self.stallRecoveryWindowUntil = Date().addingTimeInterval(Self.stallRecoveryWindowSeconds)
+                self.stallRecoveryReasserts = 0
             }
             .store(in: &nativeCancellables)
 

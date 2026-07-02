@@ -26,6 +26,9 @@ final class NativeAVPlayerHost {
     @Published private(set) var didReachEnd: Bool = false
     /// Mirrors avPlayer.timeControlStatus so the engine can reconcile when AVKit's transport bar, Control Center, or hardware buttons toggle the player externally (without this, engine state goes stale and play/pause presses are swallowed).
     @Published private(set) var timeControlStatus: AVPlayer.TimeControlStatus = .paused
+    /// Monotonic count of AVPlayerItem playbackStalled notifications (#93 residual): the engine
+    /// opens its spurious-pause recovery window on each stall.
+    @Published private(set) var stallCount: Int = 0
 
     // MARK: - Seek landing state
 
@@ -323,8 +326,10 @@ final class NativeAVPlayerHost {
             forName: AVPlayerItem.playbackStalledNotification,
             object: item,
             queue: .main
-        ) { _ in
+        ) { [weak self] _ in
             EngineLog.emit("[NativeAVPlayerHost] #\(sid) playbackStalled", category: .engine)
+            // #93 residual: the engine opens its spurious-pause recovery window on every stall.
+            self?.stallCount += 1
         }
         notificationObservers.append(stalledObs)
 

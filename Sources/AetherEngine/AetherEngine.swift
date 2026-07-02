@@ -629,6 +629,27 @@ public final class AetherEngine: ObservableObject {
     /// cancelNativeSubtitleReaders (deselect / clear / stop / load).
     var nativeSubtitleReaderDeferralTask: Task<Void, Never>? = nil
 
+    /// #93 residual spurious-pause window: after a playbackStalled notification (or a consumer
+    /// re-engage nudge), AVPlayer can drop to `.paused` with rate 0 and no wait reason WITHOUT any
+    /// user action (device: stall, -15628 errorLog, fetches stop, then the pause). Latching that as
+    /// a user pause kills both recovery paths (producer wedge breaker suspends, re-engage nudge
+    /// aborts on play intent). Within this bounded window a `.paused` transition is re-asserted
+    /// with play() instead of latched; a user pause outside recovery keeps the normal latch, and
+    /// the re-assert cap lets a determined in-window user pause win after two presses.
+    var stallRecoveryWindowUntil: Date = .distantPast
+    var stallRecoveryReasserts = 0
+    nonisolated static let stallRecoveryWindowSeconds: TimeInterval = 30
+    nonisolated static let maxStallRecoveryReasserts = 3
+
+    /// Pure decision for the tcs sink (#93 residual): re-assert play() instead of latching a pause?
+    nonisolated static func shouldReassertPlayDuringRecovery(
+        statusIsPaused: Bool, engineStateIsPlaying: Bool,
+        now: Date, windowUntil: Date, reasserts: Int
+    ) -> Bool {
+        statusIsPaused && engineStateIsPlaying && now < windowUntil
+            && reasserts < maxStallRecoveryReasserts
+    }
+
     #if DEBUG
     /// Test-only override for the session's restart-in-flight signal (#93 residual deferral tests).
     var testHookRestartInFlightOverride: Bool? = nil
@@ -913,6 +934,8 @@ public final class AetherEngine: ObservableObject {
         activeSecondaryExternalSubtitleTrackID = nil
         externalNativeStoreFillTask?.cancel()
         externalNativeStoreFillTask = nil
+        stallRecoveryWindowUntil = .distantPast
+        stallRecoveryReasserts = 0
         nativeSubtitleTrackTable = []
         nativeSubtitleTracks = []
         nativeSubtitleReaderParams = nil

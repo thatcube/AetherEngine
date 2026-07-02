@@ -114,6 +114,27 @@ extension HLSVideoEngine {
         // coalescer's pending slot over any stale in-flight scrub target (else the producer settles at the
         // scrub target, not where the clock was reconciled to, and AVPlayer stays starved).
         requestRestart(at: idx, authoritative: true)
+
+        // #93 residual: the producer is re-anchored and can serve, but a stalled AVPlayer sometimes
+        // never resumes REQUESTING (zero GETs, waitingToMinimizeStalls forever, item never fails).
+        // Watch the provider's fetch counter through a grace window; if the consumer stays silent
+        // while it still wants to play, ask the host for a re-engage nudge.
+        let fetchesAtReanchor = provider?.mediaFetchCount ?? 0
+        let epoch = sessionEpochSnapshot()
+        Task.detached(priority: .userInitiated) { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(Self.consumerReengageGraceSeconds * 1_000_000_000))
+            guard let self, self.isSessionEpochCurrent(epoch) else { return }
+            let fetchesNow = self.provider?.mediaFetchCount ?? 0
+            guard fetchesNow == fetchesAtReanchor,
+                  self.playIntentProvider?() == true else { return }
+            EngineLog.emit(
+                "[HLSVideoEngine] #65 consumer re-engage: no segment fetch for "
+                + "\(Int(Self.consumerReengageGraceSeconds))s after wedge re-anchor "
+                + "(pos=\(String(format: "%.2f", pos))s); asking host to nudge AVPlayer",
+                category: .session
+            )
+            self.onConsumerReengageNeeded?(pos)
+        }
     }
 
     private func performLiveReopen(failedProducer: HLSSegmentProducer) async {

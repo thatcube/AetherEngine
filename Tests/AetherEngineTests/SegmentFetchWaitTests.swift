@@ -207,3 +207,37 @@ struct SegmentFetchWaitTests {
         #expect(recorder.all == [40])
     }
 }
+
+/// #93 residual: spurious-pause recovery decision + the provider fetch counter the re-engage
+/// watchdog keys on.
+extension SegmentFetchWaitTests {
+    @Test("provider counts media fetches across both serve paths")
+    func fetchCounter() {
+        let cache = SegmentCache(forwardWindow: 10, backwardWindow: 10)
+        defer { cache.close() }
+        let recorder = Recorder()
+        let provider = makeProvider(cache: cache, recorder: recorder, activity: .never())
+        #expect(provider.mediaFetchCount == 0)
+        cache.store(index: 5, data: Data(repeating: 0x33, count: 8))
+        _ = provider.mediaSegment(at: 5)
+        #expect(provider.mediaFetchCount == 1)
+    }
+
+    @Test("spurious pause re-asserts only inside the window, below the cap, while playing")
+    func reassertDecision() {
+        let now = Date()
+        let open = now.addingTimeInterval(10)
+        let closed = now.addingTimeInterval(-1)
+        #expect(AetherEngine.shouldReassertPlayDuringRecovery(
+            statusIsPaused: true, engineStateIsPlaying: true, now: now, windowUntil: open, reasserts: 0))
+        #expect(!AetherEngine.shouldReassertPlayDuringRecovery(
+            statusIsPaused: true, engineStateIsPlaying: true, now: now, windowUntil: closed, reasserts: 0))
+        #expect(!AetherEngine.shouldReassertPlayDuringRecovery(
+            statusIsPaused: true, engineStateIsPlaying: true, now: now, windowUntil: open,
+            reasserts: AetherEngine.maxStallRecoveryReasserts))
+        #expect(!AetherEngine.shouldReassertPlayDuringRecovery(
+            statusIsPaused: true, engineStateIsPlaying: false, now: now, windowUntil: open, reasserts: 0))
+        #expect(!AetherEngine.shouldReassertPlayDuringRecovery(
+            statusIsPaused: false, engineStateIsPlaying: true, now: now, windowUntil: open, reasserts: 0))
+    }
+}

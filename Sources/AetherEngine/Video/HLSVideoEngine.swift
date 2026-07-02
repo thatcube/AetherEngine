@@ -385,6 +385,28 @@ public final class HLSVideoEngine: @unchecked Sendable {
     var lastWedgeReanchorPosition = -Double.greatestFiniteMagnitude
     static let maxConsecutiveWedgeReanchors = 5
 
+    /// #93 residual: a stalled AVPlayer sometimes never resumes REQUESTING after a wedge re-anchor
+    /// (device: plain playback, one -15628 errorLog, then zero segment GETs while parked in
+    /// waitingToMinimizeStalls forever, item never fails). The served playlist alone cannot reach
+    /// it, so after this grace window with no fetch and intact play intent the engine asks the
+    /// host to re-engage the consumer (zero-tolerance nudge seek, the same effect a manual
+    /// back-out had). Fired at most once per re-anchor attempt; the re-anchor cap bounds the storm.
+    var onConsumerReengageNeeded: (@Sendable (Double) -> Void)?
+    static let consumerReengageGraceSeconds: TimeInterval = 6.0
+
+    /// Locked snapshot/compare of the session epoch so detached watchdogs can verify the session
+    /// they were armed for is still the live one (stop() bumps the epoch).
+    func sessionEpochSnapshot() -> UInt64 {
+        restartLock.lock()
+        defer { restartLock.unlock() }
+        return sessionEpoch
+    }
+    func isSessionEpochCurrent(_ epoch: UInt64) -> Bool {
+        restartLock.lock()
+        defer { restartLock.unlock() }
+        return sessionEpoch == epoch
+    }
+
     /// Bumped by `stop()` under `restartLock`. Restarts re-validate before installing the new
     /// producer; a mid-restart stop() wins and the restart unwinds.
     private var sessionEpoch: UInt64 = 0
