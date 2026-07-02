@@ -50,7 +50,7 @@ A scannable summary; the depth for each row lives in **[docs/formats.md](docs/fo
 | Subtitles | Text (SRT / ASS / SSA / VTT / mov_text) inline, bitmap (PGS / DVB / DVD) as `CGImage`, in-band CEA-608 closed captions (`eia_608` demuxable track, field-1), sidecar files, opt-in raw ASS markup + fonts; opt-in native legible menu (all text tracks as language-tagged tx3g traks for PiP / AirPlay / external display, `LoadOptions.prepareNativeSubtitles`) |
 | Frames | Off-playback `FrameExtractor`: `thumbnail` (scrub preview) + `snapshot` (frame-accurate) |
 | Metadata | `MediaMetadata` (title / artist / album / albumArtist + cover) parsed on load |
-| Seek | Producer restart for backward / far-forward; short forward scrubs ride the cached window |
+| Seek | VOD seeks into watched content are restart-free cache hits (byte-budgeted retention, 2 GiB cap); short forward scrubs ride the cached window; only never-produced targets restart the producer |
 | Streaming | One long-lived forward-streaming connection, reconnect-on-drop; CDN-stutter resilient; optional caller-bounded open-time probe budget (`LoadOptions.probesize` / `maxAnalyzeDuration`) to cut first-frame latency on sparse remote remuxes |
 | Live / DVR | Unbounded live + optional timeshift; direct HLS ingest with AES-128 clear-key and SSAI ad-pod handling |
 | Custom input | Play any byte source via the `IOReader` protocol (`load(source:)`) |

@@ -279,6 +279,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// degrades into a multi-GB linear scan. Beyond this, abort and build a uniform-stride plan.
     static let cuePrewarmTimeout: TimeInterval = 10.0
 
+    /// SegmentCache retention budget for a VOD session (#93 / Sodalite#32): capped at 2 GiB and
+    /// clamped to a quarter of the tmp volume's available capacity, so a nearly-full device never
+    /// trades playback headroom for seek history. Live passes 0 (window-only pruning; the sliding
+    /// playlist already dropped everything behind the window, so retention would serve nothing).
+    static func vodRetentionBudgetBytes(volumeAvailableBytes: Int64?) -> Int {
+        let cap = 2 << 30
+        guard let available = volumeAvailableBytes else { return cap }
+        return min(cap, max(0, Int(available / 4)))
+    }
+
     // MARK: - Measurement spike: sliding-window prototype (superseded)
     //
     // Sliding MEDIA-SEQUENCE is now unconditional for live (see `LiveWindowSizing`).
@@ -579,8 +589,19 @@ public final class HLSVideoEngine: @unchecked Sendable {
             dem.seek(to: 0)
         }
 
-        let segmentCache = SegmentCache()
+        let availableBytes = (try? URL(fileURLWithPath: NSTemporaryDirectory())
+            .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
+            .volumeAvailableCapacityForImportantUsage
+        let retentionBudget = isLiveSession
+            ? 0
+            : Self.vodRetentionBudgetBytes(volumeAvailableBytes: availableBytes)
+        let segmentCache = SegmentCache(retentionBudgetBytes: retentionBudget)
         self.cache = segmentCache
+        EngineLog.emit(
+            "[HLSVideoEngine] segment retention budget: \(retentionBudget / (1 << 20)) MiB "
+            + "(volumeAvailable=\(availableBytes.map { "\($0 / (1 << 20)) MiB" } ?? "unknown"))",
+            category: .session
+        )
 
         // DV P5 MP4 encoders can omit the HEVC SPS VUI and `colr` atom (#19 Wandering Earth 2 WEB-DL):
         // color_trc/primaries/space all unspecified, so AVPlayer's DV decoder won't engage on the dvh1
