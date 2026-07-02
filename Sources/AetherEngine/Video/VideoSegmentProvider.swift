@@ -83,6 +83,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 
     /// Synchronous teardown + relaunch at the given absolute segment index.
     private let restartHandler: ((Int) -> Void)?
+    /// True while the engine's restart coalescer has an in-flight run (#93 residual): waiting
+    /// fetches ride it instead of burning fixed retry budgets, and never re-fire at stale indices.
+    private let restartActivity: (() -> Bool)?
 
     /// Base index of the engine's current producer. Guards against stale-producer waits:
     /// abs(index - lastRestartIndex) <= 2 = cold start, wait; larger = restart needed.
@@ -100,9 +103,13 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 
     /// #50: re-asserting reposition wait. Sliced waits re-fire restart only when lastRestartIndex
     /// changed (orphan signature: #35 coalescer's single slot was overwritten by a newer scrub).
-    /// Slice is generous enough to absorb a cold 4K-HDR first-GOP decode.
-    private static let repositionWaitSlice: TimeInterval = 8.0
+    /// Slice is generous enough to absorb a cold 4K-HDR first-GOP decode. Instance lets so the
+    /// wait shape is testable without 8 s sleeps (#93 residual).
+    private let repositionWaitSlice: TimeInterval
     private static let repositionMaxWaits = 3
+    /// Hard cap on riding an in-flight restart (#93 residual): a fetch waits past the fixed
+    /// budget while a restart is genuinely executing, but never indefinitely.
+    private let repositionRideCapSeconds: TimeInterval
 
     // MARK: - Playlist state
 
@@ -133,6 +140,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         blockingReloadEnabled: Bool = true,
         targetDurationFloorSeconds: Double? = nil,
         restartHandler: ((Int) -> Void)? = nil,
+        restartActivity: (() -> Bool)? = nil,
+        repositionWaitSlice: TimeInterval = 8.0,
+        repositionRideCapSeconds: TimeInterval = 90.0,
         nativeSubtitleStores: [NativeSubtitleCueStore] = [],
         nativeSubtitleLanguages: [String?] = [],
         nativeSubtitleRenditionInfos: [NativeSubtitleRenditionInfo] = [],
@@ -155,6 +165,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         self.hdcpLevel = hdcpLevel
         self.sourceBitrate = sourceBitrate
         self.restartHandler = restartHandler
+        self.restartActivity = restartActivity
+        self.repositionWaitSlice = repositionWaitSlice
+        self.repositionRideCapSeconds = repositionRideCapSeconds
         self.nativeSubStores = nativeSubtitleStores
         self.nativeSubLanguages = nativeSubtitleLanguages
         self.nativeSubRenditionInfos = nativeSubtitleRenditionInfos
@@ -380,20 +393,33 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         if needsRestart, let restart = restartHandler {
             // #50: re-fire restart per slice only when lastRestartIndex changed (orphan: #35 coalescer
             // slot overwritten by newer scrub; producer settles elsewhere; plain 30 s wait 404s).
-            for attempt in 0..<Self.repositionMaxWaits {
-                if attempt == 0 || lastRestartIndex != index {
-                    EngineLog.emit(
-                        "[HLSVideoEngine] seg\(index): out-of-range fetch (cache.range=\(range.map { "\($0.0)..\($0.1)" } ?? "empty") highWater=\(highWater) attempt=\(attempt + 1)/\(Self.repositionMaxWaits)), restarting producer",
-                        category: .session
-                    )
-                    lastRestartIndex = index
-                    restart(index)
-                    // Reset highWater AFTER restart() returns (synchronous: old producer has exited).
-                    // Pre-restart reset would be clobbered by the old producer's final write re-bumping
-                    // highWater, re-arming producerPassedAndPruned and cascading into per-segment restarts.
-                    cache.resetHighWaterForRestart()
+            // #93 residual: while a restart is in flight, the fetch RIDES it (slices don't consume
+            // the fixed budget, bounded by repositionRideCapSeconds) and never fires its own,
+            // possibly stale, index into the coalescer's pending slot. The fixed budget applies
+            // only while no restart is executing.
+            let rideDeadline = DispatchTime.now() + repositionRideCapSeconds
+            var attempt = 0
+            while attempt < Self.repositionMaxWaits {
+                if restartActivity?() == true {
+                    if DispatchTime.now() > rideDeadline {
+                        break
+                    }
+                } else {
+                    if attempt == 0 || lastRestartIndex != index {
+                        EngineLog.emit(
+                            "[HLSVideoEngine] seg\(index): out-of-range fetch (cache.range=\(range.map { "\($0.0)..\($0.1)" } ?? "empty") highWater=\(highWater) attempt=\(attempt + 1)/\(Self.repositionMaxWaits)), restarting producer",
+                            category: .session
+                        )
+                        lastRestartIndex = index
+                        restart(index)
+                        // Reset highWater AFTER restart() returns (synchronous: old producer has exited).
+                        // Pre-restart reset would be clobbered by the old producer's final write re-bumping
+                        // highWater, re-arming producerPassedAndPruned and cascading into per-segment restarts.
+                        cache.resetHighWaterForRestart()
+                    }
+                    attempt += 1
                 }
-                if let bytes = cache.fetch(index: index, timeout: Self.repositionWaitSlice) {
+                if let bytes = cache.fetch(index: index, timeout: repositionWaitSlice) {
                     return logServed(index: index, bytes: bytes, totalStart: totalStart, restarted: true)
                 }
             }

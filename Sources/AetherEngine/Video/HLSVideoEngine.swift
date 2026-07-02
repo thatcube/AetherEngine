@@ -1052,6 +1052,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
             restartHandler: isLiveSession ? nil : { [weak self] idx in
                 self?.requestRestart(at: idx)
             },
+            restartActivity: isLiveSession ? nil : { [weak self] in
+                self?.restartInFlight ?? false
+            },
             nativeSubtitleStores: nativeSubtitleCueStoresForSession,
             nativeSubtitleLanguages: nativeSubtitleLanguagesForSession,
             nativeSubtitleRenditionInfos: nativeSubtitleRenditionInfosForSession,
@@ -1494,6 +1497,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Entry point from `VideoSegmentProvider` when AVPlayer requests a segment outside the LRU window.
     /// Coalesces burst seeks so only the in-flight restart + one final settled-target restart run (#35).
     /// init.mp4 is byte-deterministic for a fixed `StreamConfig` so AVPlayer's cached copy stays valid.
+    /// True while a coalesced restart run is executing (#93 residual: the provider's waiting
+    /// segment fetches ride this instead of burning fixed retry budgets, and skip re-firing
+    /// restarts at stale indices against the coalescer's newer target).
+    var restartInFlight: Bool {
+        restartLock.lock()
+        defer { restartLock.unlock() }
+        return restartCoalescer.isInFlight
+    }
+
     func requestRestart(at idx: Int, authoritative: Bool = false) {
         restartLock.lock()
         let shouldRun = restartCoalescer.begin(idx, authoritative: authoritative)

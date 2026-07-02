@@ -33,6 +33,10 @@ struct RestartCoalescer {
         return true
     }
 
+    /// True while a coalesced restart run is executing (#93 residual: segment fetches ride this
+    /// instead of burning fixed retry budgets against a progressing restart).
+    var isInFlight: Bool { inFlight }
+
     /// Returns next pending target, or `nil` when the burst has settled (clears in-flight flag).
     mutating func next(justRan idx: Int) -> Int? {
         if let p = pending, p != idx {
