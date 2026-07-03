@@ -8,6 +8,12 @@ Versioning follows [Semantic Versioning](https://semver.org). See
 [README › Stability and versioning](README.md#stability-and-versioning) for
 the public-API contract.
 
+## [Unreleased]
+
+### Fixed
+
+- **Stall recovery lands at the requested seek target (#93 retest).** A user seek that wedges never lands, so the frozen AVPlayer clock still reports the pre-seek position (#37 semantics); the recovery chain then nudged and reloaded at that frozen position, silently losing the seek (user seeks to 341.9 s, recovery resumes at 391.9 s). The unlanded seek target now survives the wedge as recovery intent: the nudge and the stage-2 item reload aim at it. The intent retires when the seek lands (rendered output reaches the target's neighbourhood), when playback resumes elsewhere (AVPlayer abandoned the seek; a later unrelated stall must not teleport to a stale target), and on load reset / stop.
+
 ## [4.11.0] - 2026-07-03
 
 ([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.11.0))

@@ -468,6 +468,29 @@ extension AetherEngine {
                 if Self.isSubtitleReanchorJump(from: self.renderedPositionMirror.get(), to: value) {
                     self.scheduleNativeSubtitleReanchor()
                 }
+                // #93 retest: retire the pending recovery seek target when it lands (rendered
+                // reaches its neighbourhood) or goes stale (organic progress far from it, i.e.
+                // AVPlayer abandoned the seek and playback runs elsewhere).
+                if let pending = self.pendingRecoverySeekClockTarget {
+                    if Self.pendingSeekLanded(rendered: value, target: pending) {
+                        self.pendingRecoverySeekClockTarget = nil
+                    } else {
+                        let prev = self.lastRenderedForPendingSeek
+                        if value > prev, value - prev < 1.0 {
+                            self.pendingSeekProgressAccum += (value - prev)
+                            if Self.isPendingSeekStale(progressWhilePending: self.pendingSeekProgressAccum) {
+                                EngineLog.emit(
+                                    "[AetherEngine] pending recovery seek target "
+                                    + String(format: "%.2f", pending)
+                                    + "s dropped (playback resumed elsewhere)",
+                                    category: .engine
+                                )
+                                self.pendingRecoverySeekClockTarget = nil
+                            }
+                        }
+                        self.lastRenderedForPendingSeek = value
+                    }
+                }
                 // #65: mirror AVPlayer's rendered (playlist-axis) position for off-main wedge re-anchoring.
                 self.renderedPositionMirror.set(value)
                 let shift = self.liveShiftSeams.last(where: { value >= $0.activateAt })?.shift
