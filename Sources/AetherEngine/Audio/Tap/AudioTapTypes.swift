@@ -15,7 +15,7 @@ public struct AudioTapBuffer: @unchecked Sendable {
 public extension AetherEngine {
     /// The fixed output format of the audio tap. Computed per call because `AVAudioFormat`
     /// is not Sendable and cannot be a stored static under strict concurrency.
-    static var audioTapFormat: AVAudioFormat {
+    nonisolated static var audioTapFormat: AVAudioFormat {
         AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1)!
     }
 }
