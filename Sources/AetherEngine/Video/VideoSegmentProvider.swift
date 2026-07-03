@@ -513,6 +513,27 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         return segments[index].durationSeconds
     }
 
+    /// #95 audio tap: index of the segment containing playlist-axis time `t` (cumulative EXTINF).
+    /// Clamps below 0 and past the end.
+    static func segmentIndex(forPlaylistTime t: Double, durations: [Double]) -> Int {
+        guard !durations.isEmpty, t > 0 else { return 0 }
+        var acc = 0.0
+        for (i, d) in durations.enumerated() {
+            acc += d
+            if t < acc { return i }
+        }
+        return durations.count - 1
+    }
+
+    func segmentIndex(forPlaylistTime t: Double) -> Int {
+        if isLive {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return Self.segmentIndex(forPlaylistTime: t, durations: segments.map { $0.durationSeconds })
+        }
+        return Self.segmentIndex(forPlaylistTime: t, durations: segments.map { $0.durationSeconds })
+    }
+
     func segmentIsDiscontinuous(at index: Int) -> Bool {
         if isLive {
             stateLock.lock()
