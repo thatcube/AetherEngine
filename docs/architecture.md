@@ -66,6 +66,17 @@ audioOnly == true
 
 On tvOS and iOS the AVPlayer audio host owns a persistent per-player `MPNowPlayingSession` (exposed via `audioNowPlayingSession`) so the system Now-Playing overlay stays bound to the app across a background pause, auto-publishes now-playing info from the player, and carries `externalMetadata`. The host survives across tracks and does not pause when the app backgrounds. All of this is gated `#if os(tvOS) || os(iOS)`; on macOS the path compiles and plays without the system session (a macOS host drives Now-Playing through the shared centers itself).
 
+### Audio tap (#95)
+
+`installAudioTap()` returns an `AsyncStream<AudioTapBuffer>` of decoded playback audio: mono Float32 48 kHz (`AetherEngine.audioTapFormat`), stamped with source-PTS seconds (`sourceTime`, same axis as `engine.sourceTime`), with a `discontinuity` flag on any gap (seek, eviction, track switch, drops under pressure). Intended for host-side speech features (live transcription via SpeechAnalyzer) and audio recognition (ShazamKit signatures).
+
+Native path: a loopback reader (`LoopbackAudioReader`) pulls the engine's own muxed fMP4 segments from the segment cache near the playhead and decodes their audio track out-of-band (libavcodec + libswresample, fresh per-segment demux context). Because it reads the mux, it follows the active audio track for free (the mux contains exactly the selected track, post-bridge), adds zero network load, and cannot stall playback by construction. Software path: the existing `AudioDecoder` PCM output is mirrored through an `AVAudioConverter` sink on `SoftwarePlaybackHost`. One tap per engine; re-install replaces the previous stream, and `load()` / `stop()` finish it (opt-in is per load; with no session or a video-only source the stream finishes immediately). Delivery is lossy under pressure (`bufferingNewest(64)`); live sources are best-effort.
+
+```
+native ──► SegmentCache (init + seg N) ──► mov demux ──► libavcodec ──► swr (mono 48k) ──► AsyncStream
+software ──► AudioDecoder CMSampleBuffers ──► AVAudioConverter (mono 48k) ──► AsyncStream
+```
+
 ### Playback status (`playbackPhase`)
 
 `AetherEngine.playbackPhase` is the single observable for what playback is doing right now, across all three pipelines. It is *derived*, not a parallel state machine: a pure fold of `state`, `isBuffering`, `isSeeking`, and a typed source-reconnect axis, recomputed on every input change so it can never desync from them. Each input's `didSet` triggers an idempotent recompute that re-emits only on an actual change.
