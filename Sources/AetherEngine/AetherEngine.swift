@@ -342,6 +342,15 @@ public final class AetherEngine: ObservableObject {
     /// Eligibility is display-configuration aware on all platforms (its change notification fires
     /// on display connection/disconnection), so per-load reads pick up monitor changes; the value
     /// is device-wide, not per-window, so mixed HDR/SDR multi-display Macs read eligible (#98).
+    ///
+    /// `availableHDRModes` is deprecated in the 26 SDKs ("use eligibleForHDRPlayback instead"),
+    /// but that Bool cannot express the per-mode split this engine routes on: a tvOS panel can be
+    /// HDR10-capable yet not Dolby Vision, and a single-variant DV P5 master fails there with
+    /// -11868. The 26 SDKs ship no public per-mode replacement (full header sweep, 2026-07), and
+    /// deprecated is not obsoleted, so the read stays; no warning is emitted while the deployment
+    /// targets sit below 26. If the symbol is ever removed: derive iOS modes from eligibility
+    /// (built-in HDR panels present every flavor) and pessimistically route DV P5 media-direct on
+    /// tvOS, accepting the DV-to-HDR10 downgrade for P8 on DV panels.
     public static var displayCapabilities: DisplayCapabilities {
         #if os(tvOS) || os(iOS)
         let hdrEligible = AVPlayer.eligibleForHDRPlayback
