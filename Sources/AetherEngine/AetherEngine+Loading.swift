@@ -217,6 +217,9 @@ extension AetherEngine {
         // #65 pause false-positive: let the producer read AVPlayer's play intent off-main so its backpressure
         // wedge detector suspends while the consumer is paused. Set before start() so makeProducer captures it.
         session.playIntentProvider = { [playIntentMirror] in playIntentMirror.get() }
+        // #93 retest: let the wedge re-anchor aim the producer at a pending unlanded user seek target
+        // instead of the frozen clock (same decision the nudge and stage-2 reload apply).
+        session.recoverySeekTargetProvider = { [recoverySeekTargetMirror] in recoverySeekTargetMirror.get() }
         // #93 residual: after a wedge re-anchor with a consumer that stopped requesting entirely,
         // nudge AVPlayer: a zero-tolerance seek to its own position rebuilds AVFoundation's loading
         // pipeline (the effect a manual back-out had). Opens the spurious-pause window too, since
@@ -473,7 +476,7 @@ extension AetherEngine {
                 // AVPlayer abandoned the seek and playback runs elsewhere).
                 if let pending = self.pendingRecoverySeekClockTarget {
                     if Self.pendingSeekLanded(rendered: value, target: pending) {
-                        self.pendingRecoverySeekClockTarget = nil
+                        self.setPendingRecoverySeekTarget(nil)
                     } else {
                         let prev = self.lastRenderedForPendingSeek
                         if value > prev, value - prev < 1.0 {
@@ -485,7 +488,7 @@ extension AetherEngine {
                                     + "s dropped (playback resumed elsewhere)",
                                     category: .engine
                                 )
-                                self.pendingRecoverySeekClockTarget = nil
+                                self.setPendingRecoverySeekTarget(nil)
                             }
                         }
                         self.lastRenderedForPendingSeek = value

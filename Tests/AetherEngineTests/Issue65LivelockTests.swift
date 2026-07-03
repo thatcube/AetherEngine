@@ -90,6 +90,105 @@ struct Issue65LivelockTests {
         #expect(d.observe(currentTarget: 53, wantsToPlay: true) == true)   // 3s -> wedge
     }
 
+    // MARK: - BackpressureWedgeDetector fast path (#93 retest: park + flat clock)
+
+    @Test("Frozen target plus flat rendered clock trips at the fast threshold, well before the slow one")
+    func fastTripOnFrozenTargetAndFlatClock() {
+        // rrgomes' trace: consumer fetch target frozen AND FreezeDiag clock flat within ~3s of the park,
+        // while the slow counter would need 24s. Both signals frozen -> fast trip.
+        var d = BackpressureWedgeDetector(
+            breakThresholdSeconds: 24, fastBreakThresholdSeconds: 3,
+            initialTarget: 84, initialRenderedPosition: 391.9)
+        #expect(d.observe(currentTarget: 84, renderedPosition: 391.9) == false) // 1s flat
+        #expect(d.observe(currentTarget: 84, renderedPosition: 391.9) == false) // 2s flat
+        #expect(d.observe(currentTarget: 84, renderedPosition: 391.9) == true)  // 3s flat -> fast wedge
+        #expect(d.lastTripFast == true)
+    }
+
+    @Test("An advancing rendered clock never fast-trips, however long the target freezes")
+    func advancingClockNeverFastTrips() {
+        // Healthy steady-state playback: the consumer fetches a new segment only every ~segment duration,
+        // so the target freezes for stretches, but the clock advances every poll. Must never fast-trip.
+        var d = BackpressureWedgeDetector(
+            breakThresholdSeconds: 60, fastBreakThresholdSeconds: 3,
+            initialTarget: 84, initialRenderedPosition: 100.0)
+        for i in 1...20 {
+            #expect(d.observe(currentTarget: 84, renderedPosition: 100.0 + Double(i)) == false)
+        }
+    }
+
+    @Test("An advancing fetch target suppresses the fast path even while the clock is flat")
+    func advancingTargetSuppressesFastTrip() {
+        // Decode ramp after a landed seek: AVPlayer holds the old frame (clock flat) but keeps
+        // prefetching forward segments. A fetching consumer is alive, not wedged.
+        var d = BackpressureWedgeDetector(
+            breakThresholdSeconds: 60, fastBreakThresholdSeconds: 3,
+            initialTarget: 84, initialRenderedPosition: 341.9)
+        for t in 85...105 {
+            #expect(d.observe(currentTarget: t, renderedPosition: 341.9) == false)
+        }
+    }
+
+    @Test("Without a rendered position the fast path stays inert and the slow threshold governs")
+    func nilRenderedPositionKeepsSlowPath() {
+        var d = BackpressureWedgeDetector(
+            breakThresholdSeconds: 3, fastBreakThresholdSeconds: 2, initialTarget: 53)
+        #expect(d.observe(currentTarget: 53) == false) // 1s
+        #expect(d.observe(currentTarget: 53) == false) // 2s (fast would fire here if it wrongly counted)
+        #expect(d.observe(currentTarget: 53) == true)  // 3s -> slow wedge
+        #expect(d.lastTripFast == false)
+    }
+
+    @Test("Fast path disabled by default: a flat clock alone never accelerates the slow trip")
+    func fastPathDisabledByDefault() {
+        var d = BackpressureWedgeDetector(
+            breakThresholdSeconds: 4, initialTarget: 53, initialRenderedPosition: 10.0)
+        #expect(d.observe(currentTarget: 53, renderedPosition: 10.0) == false) // 1s
+        #expect(d.observe(currentTarget: 53, renderedPosition: 10.0) == false) // 2s
+        #expect(d.observe(currentTarget: 53, renderedPosition: 10.0) == false) // 3s
+        #expect(d.observe(currentTarget: 53, renderedPosition: 10.0) == true)  // 4s -> slow wedge
+        #expect(d.lastTripFast == false)
+    }
+
+    @Test("A pause suspends the fast window and resume restarts it from zero")
+    func pauseSuspendsFastPath() {
+        var d = BackpressureWedgeDetector(
+            breakThresholdSeconds: 60, fastBreakThresholdSeconds: 3,
+            initialTarget: 84, initialRenderedPosition: 200.0)
+        #expect(d.observe(currentTarget: 84, renderedPosition: 200.0) == false) // 1s flat
+        #expect(d.observe(currentTarget: 84, renderedPosition: 200.0) == false) // 2s flat
+        #expect(d.observe(currentTarget: 84, wantsToPlay: false, renderedPosition: 200.0) == false) // pause
+        #expect(d.observe(currentTarget: 84, renderedPosition: 200.0) == false) // resume, 1s
+        #expect(d.observe(currentTarget: 84, renderedPosition: 200.0) == false) // 2s
+        #expect(d.observe(currentTarget: 84, renderedPosition: 200.0) == true)  // 3s -> fast wedge
+    }
+
+    @Test("A rendered clock jump in either direction resets the flat window")
+    func clockJumpResetsFlatWindow() {
+        // A backward jump is a new seek landing mid-park; the window must restart, not trip on stale flatness.
+        var d = BackpressureWedgeDetector(
+            breakThresholdSeconds: 60, fastBreakThresholdSeconds: 3,
+            initialTarget: 84, initialRenderedPosition: 391.9)
+        #expect(d.observe(currentTarget: 84, renderedPosition: 391.9) == false) // 1s flat
+        #expect(d.observe(currentTarget: 84, renderedPosition: 391.9) == false) // 2s flat
+        #expect(d.observe(currentTarget: 84, renderedPosition: 341.9) == false) // jump -> reset
+        #expect(d.observe(currentTarget: 84, renderedPosition: 341.9) == false) // 1s
+        #expect(d.observe(currentTarget: 84, renderedPosition: 341.9) == false) // 2s
+        #expect(d.observe(currentTarget: 84, renderedPosition: 341.9) == true)  // 3s -> fast wedge
+    }
+
+    @Test("Sub-epsilon clock jitter still counts as flat")
+    func microJitterCountsAsFlat() {
+        // The mirror is fed by a periodic observer; representation-level wiggle far below a real
+        // frame step must not defeat the fast path.
+        var d = BackpressureWedgeDetector(
+            breakThresholdSeconds: 60, fastBreakThresholdSeconds: 3,
+            initialTarget: 84, initialRenderedPosition: 391.900)
+        #expect(d.observe(currentTarget: 84, renderedPosition: 391.905) == false) // 1s
+        #expect(d.observe(currentTarget: 84, renderedPosition: 391.898) == false) // 2s
+        #expect(d.observe(currentTarget: 84, renderedPosition: 391.902) == true)  // 3s -> fast wedge
+    }
+
     // MARK: - seekIsWedged (Piece B)
 
     @Test("Empty forward buffer at the rendered position is a wedge")

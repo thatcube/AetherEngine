@@ -104,15 +104,23 @@ extension HLSVideoEngine {
             return
         }
 
-        let idx = segmentIndexForPlaylistTime(pos)
+        // #93 retest: a pending user seek that never landed owns the recovery aim. AVPlayer only
+        // requests media at the seek TARGET after a hard zero-tolerance seek, so a producer
+        // re-anchored on the frozen clock fills a window nobody fetches (and can evict the target's
+        // segments from retention). Same decision the nudge and stage-2 reload already apply.
+        let anchor = AetherEngine.recoveryAnchorPosition(
+            frozenPosition: pos, pendingSeekTarget: recoverySeekTargetProvider?())
+        let idx = segmentIndexForPlaylistTime(anchor)
         EngineLog.emit(
-            "[HLSVideoEngine] #65 backpressure wedge: re-anchoring producer to AVPlayer position "
-            + "\(String(format: "%.2f", pos))s -> seg\(idx) (attempt \(attempts)/\(Self.maxConsecutiveWedgeReanchors))",
+            "[HLSVideoEngine] #65 backpressure wedge: re-anchoring producer to "
+            + "\(String(format: "%.2f", anchor))s -> seg\(idx)"
+            + (anchor != pos ? " (requested seek target; frozen clock \(String(format: "%.2f", pos))s)" : " (AVPlayer position)")
+            + " (attempt \(attempts)/\(Self.maxConsecutiveWedgeReanchors))",
             category: .session
         )
-        // #79: re-anchor authoritatively. It is computed from AVPlayer's REAL position, so it must win the
-        // coalescer's pending slot over any stale in-flight scrub target (else the producer settles at the
-        // scrub target, not where the clock was reconciled to, and AVPlayer stays starved).
+        // #79: re-anchor authoritatively. The anchor is where recovery must aim (pending seek target,
+        // else AVPlayer's real position), so it must win the coalescer's pending slot over any stale
+        // in-flight scrub target (else the producer settles at the scrub target and AVPlayer stays starved).
         requestRestart(at: idx, authoritative: true)
 
         // #93 residual: the producer is re-anchored and can serve, but a stalled AVPlayer sometimes

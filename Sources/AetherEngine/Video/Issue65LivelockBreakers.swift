@@ -14,15 +14,34 @@ import Foundation
 /// timer whenever the target advances, so only a target that is frozen for the whole window trips.
 struct BackpressureWedgeDetector {
     let breakThresholdSeconds: Int
+    /// #93 retest fast path: trip after this many consecutive polls where the fetch target AND the
+    /// rendered clock are both frozen while the consumer wants to play. nil = fast path disabled.
+    /// The dual freeze is what makes the short window safe: healthy steady-state playback freezes the
+    /// target between segment fetches but advances the clock every poll; a post-seek decode ramp holds
+    /// the clock but keeps prefetching (target advances). Only a consumer that neither renders nor
+    /// fetches for the whole window is wedged.
+    let fastBreakThresholdSeconds: Int?
     private var maxTargetSeen: Int
     private var stuckSeconds: Int = 0
+    private var lastRenderedPosition: Double?
+    private var flatSeconds: Int = 0
+    /// Diagnostic: whether the last `true` from `observe` came from the fast path.
+    private(set) var lastTripFast = false
 
-    init(breakThresholdSeconds: Int, initialTarget: Int) {
+    /// Rendered-clock deltas below this are aliasing/representation jitter, not playback progress
+    /// (one poll second of real playback advances the clock by ~1 s).
+    static let renderedClockFlatEpsilon: Double = 0.1
+
+    init(breakThresholdSeconds: Int, fastBreakThresholdSeconds: Int? = nil,
+         initialTarget: Int, initialRenderedPosition: Double? = nil) {
         self.breakThresholdSeconds = breakThresholdSeconds
+        self.fastBreakThresholdSeconds = fastBreakThresholdSeconds
         self.maxTargetSeen = initialTarget
+        self.lastRenderedPosition = initialRenderedPosition
     }
 
-    /// Returns `true` once the consumer fetch target has been frozen for `breakThresholdSeconds`.
+    /// Returns `true` once the consumer fetch target has been frozen for `breakThresholdSeconds`, or
+    /// (fast path) once target and rendered clock have both been frozen for `fastBreakThresholdSeconds`.
     ///
     /// `wantsToPlay` is the play-intent guard (issue #65 pause false-positive). A paused or backgrounded
     /// consumer issues no forward segment request by design, so its frozen fetch target is NOT a wedge: when
@@ -30,19 +49,46 @@ struct BackpressureWedgeDetector {
     /// zero, so a pause of any length never trips and the window after resume starts fresh. The legit wedge
     /// (AVPlayer wants to play but is starved, `timeControlStatus == .waitingToPlay`) keeps `wantsToPlay`
     /// true and still trips. Defaults to true so existing callers and live keep their prior behaviour.
-    mutating func observe(currentTarget: Int, wantsToPlay: Bool = true) -> Bool {
+    ///
+    /// `renderedPosition` feeds the fast path; nil (not wired: tests, live) keeps it inert. Any move
+    /// beyond the flat epsilon, forward or backward (a new seek landing), restarts the flat window.
+    mutating func observe(currentTarget: Int, wantsToPlay: Bool = true,
+                          renderedPosition: Double? = nil) -> Bool {
         guard wantsToPlay else {
             if currentTarget > maxTargetSeen { maxTargetSeen = currentTarget }
             stuckSeconds = 0
+            flatSeconds = 0
+            if let rendered = renderedPosition { lastRenderedPosition = rendered }
             return false
         }
-        if currentTarget > maxTargetSeen {
+        let targetAdvanced = currentTarget > maxTargetSeen
+        if targetAdvanced {
             maxTargetSeen = currentTarget
             stuckSeconds = 0
         } else {
             stuckSeconds += 1
         }
-        return stuckSeconds >= breakThresholdSeconds
+        var clockFlat = false
+        if let rendered = renderedPosition {
+            if let last = lastRenderedPosition {
+                clockFlat = abs(rendered - last) < Self.renderedClockFlatEpsilon
+            }
+            lastRenderedPosition = rendered
+        }
+        if targetAdvanced || !clockFlat {
+            flatSeconds = 0
+        } else {
+            flatSeconds += 1
+        }
+        if let fast = fastBreakThresholdSeconds, flatSeconds >= fast {
+            lastTripFast = true
+            return true
+        }
+        if stuckSeconds >= breakThresholdSeconds {
+            lastTripFast = false
+            return true
+        }
+        return false
     }
 }
 
@@ -80,6 +126,17 @@ final class AtomicDouble: @unchecked Sendable {
     init(_ initial: Double) { value = initial }
     func get() -> Double { lock.lock(); defer { lock.unlock() }; return value }
     func set(_ newValue: Double) { lock.lock(); value = newValue; lock.unlock() }
+}
+
+/// Thread-safe Double? mirror so the off-main wedge re-anchor can read the engine's pending recovery
+/// seek target (#93 retest), which the engine sets/retires on the main actor. nil = no unlanded user
+/// seek pending; the wedge re-anchor then falls back to AVPlayer's frozen position.
+final class AtomicOptionalDouble: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Double?
+    init(_ initial: Double? = nil) { value = initial }
+    func get() -> Double? { lock.lock(); defer { lock.unlock() }; return value }
+    func set(_ newValue: Double?) { lock.lock(); value = newValue; lock.unlock() }
 }
 
 /// Thread-safe Bool mirror so the off-main producer pump can read whether AVPlayer currently wants to play

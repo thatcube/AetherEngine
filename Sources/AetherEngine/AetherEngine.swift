@@ -679,8 +679,18 @@ public final class AetherEngine: ObservableObject {
     /// the target's neighbourhood, on organic playback progress elsewhere (stale: AVPlayer
     /// abandoned the seek), and on load reset / stop.
     var pendingRecoverySeekClockTarget: Double? = nil
+    /// Off-main mirror of `pendingRecoverySeekClockTarget` so the session's wedge re-anchor can aim
+    /// the producer at the pending target (#93 retest). Kept in sync via `setPendingRecoverySeekTarget`.
+    let recoverySeekTargetMirror = AtomicOptionalDouble()
     var pendingSeekProgressAccum: Double = 0
     var lastRenderedForPendingSeek: Double = 0
+
+    /// Single write path for the recovery seek intent: the MainActor field and its off-main mirror
+    /// must never diverge (a stale mirror would teleport a wedge re-anchor to a retired target).
+    func setPendingRecoverySeekTarget(_ target: Double?) {
+        pendingRecoverySeekClockTarget = target
+        recoverySeekTargetMirror.set(target)
+    }
     nonisolated static let pendingSeekLandedEpsilon: Double = 5.0
     nonisolated static let pendingSeekStaleProgressSeconds: Double = 3.0
 
@@ -1072,7 +1082,7 @@ public final class AetherEngine: ObservableObject {
         stallReengageTask = nil
         nativeSubtitleReanchorTask?.cancel()
         nativeSubtitleReanchorTask = nil
-        pendingRecoverySeekClockTarget = nil
+        setPendingRecoverySeekTarget(nil)
         nativeSubtitleTrackTable = []
         nativeSubtitleReapplyOrdinal = nil
         nativeSubtitleTracks = []
@@ -1677,7 +1687,7 @@ public final class AetherEngine: ObservableObject {
         } else {
             // #93 retest: remember the target as recovery intent BEFORE awaiting; a wedged seek
             // never lands and the recovery chain must aim here, not at the frozen clock.
-            pendingRecoverySeekClockTarget = clockTarget
+            setPendingRecoverySeekTarget(clockTarget)
             pendingSeekProgressAccum = 0
             lastRenderedForPendingSeek = nativeHost?.renderedTime ?? 0
             // Await real AVPlayer landing so isSeeking spans it (#37/#38), but bound the wait (#65): a seek
@@ -1693,7 +1703,11 @@ public final class AetherEngine: ObservableObject {
                    host.isEffectivelyPlaying, // #65: a paused seek lands while paused and is not a wedge; only reconcile a starved seek the player actually wants to play
                    seekIsWedged(renderedTime: host.renderedTime, bufferedEnd: host.bufferedEnd) {
                     // Genuine wedge: snap the clock back to AVPlayer's REAL rendered position (not the
-                    // unreachable optimistic target) and re-anchor the producer there.
+                    // unreachable optimistic target). The producer, unlike the clock, keeps aiming at
+                    // the TARGET (#93 retest): after a hard zero-tolerance seek AVPlayer only requests
+                    // media at the target, so a re-anchor on the frozen position would pull the producer
+                    // away from the window the seek's own restart just anchored (and its refill can
+                    // evict the target's segments from retention).
                     let avpReal = host.renderedTime
                     nativeClockSeconds = avpReal
                     clock.currentTime = avpReal + playlistShiftSeconds
@@ -1705,15 +1719,16 @@ public final class AetherEngine: ObservableObject {
                     // forever even after the producer re-anchor recovers playback.
                     state = (host.timeControlStatus == .paused) ? .paused : .playing
                     isBuffering = host.timeControlStatus == .waitingToPlayAtSpecifiedRate
-                    reanchorProducerToPlaylistTime(avpReal)
+                    reanchorProducerToPlaylistTime(Self.recoveryAnchorPosition(
+                        frozenPosition: avpReal, pendingSeekTarget: pendingRecoverySeekClockTarget))
                     // pendingRecoverySeekClockTarget deliberately survives this reconcile: the UI
                     // clock gives up the phantom target, the recovery intent does not.
                     EngineLog.emit(
                         "[AetherEngine] #65 seek did not land within \(Self.nativeSeekReconcileBudgetSeconds)s "
                         + "and AVPlayer is starved (rendered=\(String(format: "%.2f", avpReal))s "
                         + "buffered=\(String(format: "%.2f", host.bufferedEnd))s); reconciled clock to rendered "
-                        + "position and re-anchored producer (recovery still aims at "
-                        + "\(String(format: "%.2f", clockTarget))s)",
+                        + "position, producer + recovery keep aiming at "
+                        + "\(String(format: "%.2f", clockTarget))s",
                         category: .engine
                     )
                     return
@@ -1725,7 +1740,7 @@ public final class AetherEngine: ObservableObject {
         // Guard: stop/load during the await tore the session down; writing clock state would publish a phantom.
         // A superseding seek owns the final state.
         guard loadGeneration == gen, seekGeneration == seekGen else { return }
-        pendingRecoverySeekClockTarget = nil
+        setPendingRecoverySeekTarget(nil)
         nativeClockSeconds = clockTarget
         clock.currentTime = target
         clock.sourceTime = target
@@ -2125,7 +2140,7 @@ public final class AetherEngine: ObservableObject {
         nativeVideoSession?.stop()
         nativeVideoSession = nil
         extractorYieldState.deactivate()
-        pendingRecoverySeekClockTarget = nil
+        setPendingRecoverySeekTarget(nil)
 
         // Shut down live scrub-thumbnail FrameExtractors with the session.
         let liveThumbs = liveThumbnailExtractors

@@ -329,6 +329,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// frozen fetch target is not a wedge — issue #65 pause false-positive).
     var playIntentProvider: (@Sendable () -> Bool)?
 
+    /// The requested-but-unlanded user seek target (AVPlayer/item clock axis), readable off the main
+    /// actor; nil = none pending. Wired by AetherEngine to a thread-safe mirror of its recovery seek
+    /// intent (#93 retest). A wedge re-anchor must aim the producer here, not at the frozen clock:
+    /// after a hard zero-tolerance seek AVPlayer only requests media at the TARGET, so re-producing
+    /// the frozen position serves segments nobody will ever fetch (and its window refill can evict
+    /// the target's segments from retention).
+    var recoverySeekTargetProvider: (@Sendable () -> Double?)?
+
     /// Deep copy of AVCodecParameters decoupled from the demuxer's lifetime. Raw pointers into
     /// AVStreams become use-after-free on live reopen (avformat_close_input frees them while the
     /// continuation producer still reads via saved configs). Freed after pump unwinds.
@@ -1493,6 +1501,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // consumer issues no forward fetch; its frozen fetch target is not a wedge). Threaded onto every
         // producer (initial + restart) so the guard survives scrub/audio-switch rebuilds.
         prod.wantsToPlayProvider = playIntentProvider
+        // #93 retest: the rendered clock feeds the wedge detector's fast path (park + both signals
+        // frozen -> single-digit detection). Threaded onto every producer like the play-intent guard.
+        prod.playbackPositionProvider = currentPlaybackPositionProvider
         // Thread native subtitle state onto every producer (initial + restart) so the init moov is
         // consistent and per-segment cue drain survives seek/audio-switch (#55). Set unconditionally:
         // empty set keeps byte-identical output and clears stale stores after clearSubtitle.

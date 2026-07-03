@@ -355,6 +355,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// AVPlayer's real position; a slow-but-advancing consumer never trips the detector (see BackpressureWedgeDetector).
     private static let backpressureWedgeBreakThresholdSeconds = 24
 
+    /// #93 retest fast path: break the park once the consumer fetch target AND the rendered clock have
+    /// both been frozen this long while the consumer wants to play (rrgomes: the clock is provably flat
+    /// within ~3 s of the park; the 24 s counter alone put recovery latency at 30-70 s). Only effective
+    /// when `playbackPositionProvider` is wired; the dual-freeze guard is what keeps the short window
+    /// safe (see BackpressureWedgeDetector.fastBreakThresholdSeconds).
+    private static let backpressureWedgeFastBreakThresholdSeconds = 5
+
     private let pumpQueue = DispatchQueue(
         label: "AetherEngine.HLSSegmentProducer.pump",
         qos: .userInitiated
@@ -461,6 +468,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// consumer issues no forward fetch, so the VOD backpressure wedge detector must suspend while this is
     /// false instead of misreading the frozen fetch target as a wedge (issue #65 pause false-positive).
     var wantsToPlayProvider: (@Sendable () -> Bool)?
+
+    /// #93 retest: reads AVPlayer's rendered (playlist-axis) position off the main actor. Feeds the
+    /// backpressure wedge detector's fast path (park + flat clock + frozen fetch target -> single-digit
+    /// detection instead of the 24 s counter). nil (tests, live) keeps the fast path inert.
+    var playbackPositionProvider: (@Sendable () -> Double?)?
 
     /// Ordinal-indexed cue stores for native mov_text subtitle tracks (#55). Empty = disabled.
     var subtitleCueStores: [NativeSubtitleCueStore] = []
@@ -768,9 +780,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // #65 Piece A: a genuine VOD wedge is the consumer fetch target frozen past the break threshold.
         // The detector resets whenever the target advances, so healthy backpressure (slow CDN, cold cache)
         // keeps the target climbing and never trips. Live keeps its own pump watchdogs.
+        // #93 retest: the fast path additionally watches the rendered clock; target AND clock both frozen
+        // for the short window while the consumer wants to play breaks in single-digit seconds.
         var wedgeDetector = BackpressureWedgeDetector(
             breakThresholdSeconds: Self.backpressureWedgeBreakThresholdSeconds,
-            initialTarget: cache.targetIndex
+            fastBreakThresholdSeconds: Self.backpressureWedgeFastBreakThresholdSeconds,
+            initialTarget: cache.targetIndex,
+            initialRenderedPosition: playbackPositionProvider?()
         )
         while !checkShouldStop() {
             if cache.awaitFetchHighWater(reaching: target, timeout: 1.0) {
@@ -800,12 +816,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     category: .session
                 )
             }
-            if !isLive, wedgeDetector.observe(currentTarget: cacheTarget, wantsToPlay: wantsToPlay) {
+            if !isLive, wedgeDetector.observe(currentTarget: cacheTarget, wantsToPlay: wantsToPlay,
+                                              renderedPosition: playbackPositionProvider?()) {
                 markBackpressureWedgeBroken()
                 EngineLog.emit(
                     "[HLSSegmentProducer] #65 backpressure WEDGE BROKEN (\(context)) head=\(head) "
-                    + "target=\(target) cacheTarget=\(cacheTarget) parked=\(parked)s; "
-                    + "exiting pump for host re-anchor on AVPlayer position",
+                    + "target=\(target) cacheTarget=\(cacheTarget) parked=\(parked)s"
+                    + (wedgeDetector.lastTripFast ? " (fast path: fetch target + rendered clock both frozen)" : "")
+                    + "; exiting pump for host re-anchor on AVPlayer position",
                     category: .session
                 )
                 return false
