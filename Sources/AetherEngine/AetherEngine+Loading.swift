@@ -286,13 +286,14 @@ extension AetherEngine {
                 self.liveSourceReset.send()
             }
         }
-        // prepareNativeSubtitles + non-bitmap text tracks: flag gates allocateMuxer SubtitleConfig; must be set before start() (#55).
-        // Each text track becomes one mov_text track in the init moov (#55, all-tracks). Load-declared external
-        // tracks are already merged into subtitleTracks and join the table (#88); VOD only, a live program's
-        // renditions cannot cover an unbounded timeline. Runtime sidecar selections stay table-less.
+        // prepareNativeSubtitles + non-bitmap text tracks: builds the native subtitle table; must be set before start().
+        // Each text track becomes one WebVTT rendition served by HLSLocalServer (#15 / Sodalite#32, all-tracks; NOT
+        // muxed into the A/V segments). Load-declared external tracks are already merged into subtitleTracks and join
+        // the table (#88); VOD only, a live program's renditions cannot cover an unbounded timeline. Runtime sidecar
+        // selections stay table-less.
         // Bitmap codecs excluded via the shared decoder-name classifier (a prior exact-match Set used descriptor
-        // names that never matched TrackInfo.codec's decoder names, so PGS/DVB/DVD leaked in as mov_text).
-        // Exclude in-band CEA-608/708 (#77): no demuxable packets to mux into mov_text; served by the CC tap.
+        // names that never matched TrackInfo.codec's decoder names, so PGS/DVB/DVD leaked in).
+        // Exclude in-band CEA-608/708 (#77): no demuxable packets for a text rendition; served by the CC tap.
         var textTracks = subtitleTracks.filter {
             !Self.isBitmapSubtitleCodec($0.codec) && !Self.isEmbeddedClosedCaptionCodec($0.codec)
                 && (!$0.isExternal || !loadedOptions.isLive)

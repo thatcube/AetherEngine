@@ -77,23 +77,6 @@ final class MP4SegmentMuxer {
         let timeBase: AVRational
     }
 
-    /// Config for a single mov_text (tx3g) subtitle output stream; muxer synthesises it entirely.
-    struct SubtitleConfig {
-        /// 1/1000 default = millisecond precision, sufficient for SRT/WebVTT cues.
-        let timeBase: AVRational
-        /// BCP-47 tag converted to ISO 639-2/T via iso639_2(fromBCP47:) for the QuickTime
-        /// language metadata key. Nil = no language box.
-        let language: String?
-
-        init(
-            timeBase: AVRational = AVRational(num: 1, den: 1000),
-            language: String? = nil
-        ) {
-            self.timeBase = timeBase
-            self.language = language
-        }
-    }
-
     enum MuxerError: Error, CustomStringConvertible {
         case allocFailed(code: Int32)
         case streamCreationFailed
@@ -147,7 +130,6 @@ final class MP4SegmentMuxer {
     /// (typically 1/16000 for 24 fps video, 1/<sample rate> for audio).
     private(set) var muxerVideoTimeBase: AVRational = AVRational(num: 1, den: 1)
     private(set) var muxerAudioTimeBase: AVRational = AVRational(num: 1, den: 1)
-    private(set) var muxerSubtitleTimeBase: AVRational = AVRational(num: 1, den: 1000)
     private let haveAudio: Bool
 
     /// Mid-segment fragment-flush bound (#64). With movflags +frag_custom a moof+mdat is emitted only at
@@ -166,10 +148,6 @@ final class MP4SegmentMuxer {
     let videoOutputStreamIndex: Int32 = 0
     let audioOutputStreamIndex: Int32 = 1
 
-    /// Ordinal -> libavformat stream index map for declared mov_text tracks.
-    /// Dynamic: 1 without audio, 2 with audio, then +1 per additional subtitle track.
-    private(set) var subtitleOutputStreamIndices: [Int32] = []
-
     private let splitter: FragmentSplitter
 
     // MARK: - Init
@@ -182,7 +160,6 @@ final class MP4SegmentMuxer {
         sessionDir: URL,
         video: VideoConfig,
         audio: AudioConfig?,
-        subtitles: [SubtitleConfig] = [],
         maxBufferedFragmentSeconds: Double = 8.0,
         onInitCaptured: @escaping (Data) -> Void
     ) throws {
@@ -211,17 +188,9 @@ final class MP4SegmentMuxer {
         counter.fd = firstFd
         self.byteCounter = counter
 
-        // movenc 62.x forces enabled=1 on the first subtitle tkhd regardless of disposition=0;
-        // post-process the init segment to clear the bit before handing it to the caller.
-        let subtitleCount = subtitles.count
         self.splitter = FragmentSplitter(
             onHeaderComplete: { initBytes in
-                if subtitleCount > 0 {
-                    let patched = Self.clearSubtitleTkhdEnabled(initBytes)
-                    onInitCaptured(patched)
-                } else {
-                    onInitCaptured(initBytes)
-                }
+                onInitCaptured(initBytes)
             },
             onFragmentBytes: { ptr, count in
                 guard !counter.writeFailed, counter.fd >= 0 else { return }
@@ -265,14 +234,11 @@ final class MP4SegmentMuxer {
         self.pb = pb
         ctx.pointee.pb = pb
 
-        var capturedSubtitleIndices: [Int32] = []
         do {
             try Self.configureStreamsAndWriteHeader(
                 ctx: ctx,
                 video: video,
-                audio: audio,
-                subtitles: subtitles,
-                capturedSubtitleIndices: &capturedSubtitleIndices
+                audio: audio
             )
         } catch {
             cleanup()
@@ -291,10 +257,6 @@ final class MP4SegmentMuxer {
             seconds: maxBufferedFragmentSeconds,
             timeBase: muxerVideoTimeBase
         )
-        if let firstSubIdx = capturedSubtitleIndices.first {
-            muxerSubtitleTimeBase = ctx.pointee.streams.advanced(by: Int(firstSubIdx)).pointee!.pointee.time_base
-        }
-        subtitleOutputStreamIndices = capturedSubtitleIndices
     }
 
     private let byteCounter: ByteCounter
@@ -331,8 +293,7 @@ final class MP4SegmentMuxer {
     /// never falls back to FLAC bridge. Bytes go to a discarded in-memory AVIO sink.
     static func probeWriteHeader(
         video: VideoConfig,
-        audio: AudioConfig?,
-        subtitles: [SubtitleConfig] = []
+        audio: AudioConfig?
     ) -> Int32 {
         var ctxOut: UnsafeMutablePointer<AVFormatContext>?
         let allocRet = avformat_alloc_output_context2(&ctxOut, nil, "mp4", "probe.m4s")
@@ -355,14 +316,11 @@ final class MP4SegmentMuxer {
             }
         }
 
-        var unused: [Int32] = []
         do {
             try Self.configureStreamsAndWriteHeader(
                 ctx: ctx,
                 video: video,
-                audio: audio,
-                subtitles: subtitles,
-                capturedSubtitleIndices: &unused
+                audio: audio
             )
             return 0
         } catch MuxerError.copyParametersFailed(let code) {
@@ -379,9 +337,7 @@ final class MP4SegmentMuxer {
     private static func configureStreamsAndWriteHeader(
         ctx: UnsafeMutablePointer<AVFormatContext>,
         video: VideoConfig,
-        audio: AudioConfig?,
-        subtitles: [SubtitleConfig],
-        capturedSubtitleIndices: inout [Int32]
+        audio: AudioConfig?
     ) throws {
         // strict=-2 lets the mp4 muxer write Dolby Vision atoms (dvcC,
         // dvvC) and other non-strict-ISOBMFF extensions when the source
@@ -427,25 +383,6 @@ final class MP4SegmentMuxer {
             audioStream.pointee.time_base = audio.timeBase
         }
 
-        // Subtitle streams declared after audio; indices dynamic (1 without audio, 2 with audio, +1 per track).
-        // disposition=0 keeps tkhd enabled CLEAR so AVFoundation derives defaultOption=nil and does not
-        // auto-display; movenc 62.x still forces enabled=1 on the first track, handled by clearSubtitleTkhdEnabled.
-        for cfg in subtitles {
-            guard let subStream = avformat_new_stream(ctx, nil) else {
-                throw MuxerError.streamCreationFailed
-            }
-            subStream.pointee.codecpar.pointee.codec_type = AVMEDIA_TYPE_SUBTITLE
-            subStream.pointee.codecpar.pointee.codec_id = AV_CODEC_ID_MOV_TEXT
-            subStream.pointee.time_base = cfg.timeBase
-            subStream.pointee.disposition = 0
-            if let iso = iso639_2(fromBCP47: cfg.language) {
-                iso.withCString { cStr in
-                    _ = av_dict_set(&subStream.pointee.metadata, "language", cStr, 0)
-                }
-            }
-            capturedSubtitleIndices.append(subStream.pointee.index)
-        }
-
         var opts: OpaquePointer? = nil
         defer { av_dict_free(&opts) }
         // +frag_discont with avoid_negative_ts=disabled makes tfdt carry the ABSOLUTE input dts:
@@ -463,11 +400,6 @@ final class MP4SegmentMuxer {
         // lipsync drift. Position belongs in each fragment's tfdt; moov stays restart-invariant.
         av_dict_set(&opts, "use_editlist", "0", 0)
         av_dict_set(&opts, "avoid_negative_ts", "disabled", 0)
-        // infer_no_subs: skip default-track inference for subtitle traks only; movenc 62.x still
-        // forces enabled=1 on the first subtitle tkhd regardless, handled by clearSubtitleTkhdEnabled.
-        if !subtitles.isEmpty {
-            av_dict_set(&opts, "default_mode", "infer_no_subs", 0)
-        }
 
         let ret = avformat_write_header(ctx, &opts)
         guard ret >= 0 else {
@@ -476,63 +408,6 @@ final class MP4SegmentMuxer {
     }
 
     // MARK: - Pump-side API
-
-    static func subtitleTicks(forSeconds s: Double, timescale: Int32) -> Int64 {
-        Int64((s * Double(timescale)).rounded())
-    }
-
-    private static let bcp47ToISO639_2: [String: String] = [
-        "en": "eng", "de": "deu", "ja": "jpn", "fr": "fra",
-        "es": "spa", "it": "ita", "pt": "por", "ru": "rus",
-        "zh": "zho", "ko": "kor", "nl": "nld", "pl": "pol",
-        "sv": "swe", "da": "dan", "no": "nor", "fi": "fin",
-        "tr": "tur", "ar": "ara", "cs": "ces", "el": "ell",
-        "he": "heb", "hi": "hin", "th": "tha", "uk": "ukr",
-    ]
-
-    /// BCP-47 -> ISO 639-2/T for QuickTime language key. Strips region subtag (en-US -> en);
-    /// passes through already-3-letter codes; returns nil for unknown tags.
-    static func iso639_2(fromBCP47 tag: String?) -> String? {
-        guard let tag else { return nil }
-        let base = tag.split(separator: "-", maxSplits: 1).first.map(String.init) ?? tag
-        let lower = base.lowercased()
-        if lower.count == 3 && lower.allSatisfy(\.isLetter) {
-            return lower
-        }
-        return bcp47ToISO639_2[lower]
-    }
-
-    /// Write one mov_text sample. `payload` is the [uint16 BE len][UTF-8] body from MovTextSampleBuilder.
-    /// av_interleaved_write_frame takes ownership of the packet buffer (calls av_packet_unref internally);
-    /// trackedPacketFree in the defer frees the now-empty struct.
-    func writeSubtitleSample(
-        _ payload: Data,
-        trackOrdinal: Int,
-        ptsSeconds: Double,
-        durationSeconds: Double
-    ) {
-        guard trackOrdinal < subtitleOutputStreamIndices.count else { return }
-        let idx = subtitleOutputStreamIndices[trackOrdinal]
-        let timescale = muxerSubtitleTimeBase.den
-        let ptsTicks = Self.subtitleTicks(forSeconds: ptsSeconds, timescale: timescale)
-        let durTicks = Self.subtitleTicks(forSeconds: durationSeconds, timescale: timescale)
-
-        guard let p = trackedPacketAlloc() else { return }
-        var pkt: UnsafeMutablePointer<AVPacket>? = p
-        defer { trackedPacketFree(&pkt) }
-
-        guard av_new_packet(p, Int32(payload.count)) >= 0 else { return }
-        payload.withUnsafeBytes { raw in
-            if let src = raw.baseAddress, let dst = p.pointee.data {
-                memcpy(dst, src, payload.count)
-            }
-        }
-        p.pointee.pts = ptsTicks
-        p.pointee.dts = ptsTicks
-        p.pointee.duration = durTicks
-        p.pointee.stream_index = idx
-        _ = writePacket(p)
-    }
 
     /// Write one packet via av_interleaved_write_frame (caller must rescale pts/dts to muxerVideoTimeBase / muxerAudioTimeBase).
     @discardableResult
@@ -795,116 +670,6 @@ final class MP4SegmentMuxer {
     }
 
     // MARK: - Helpers
-
-    /// Walk moov to find subtitle trak entries (handler sbtl or text) and clear tkhd enabled bit (bit 0 of 3-byte flags).
-    /// movenc 62.x forces enabled=1 regardless of disposition=0; AVFoundation treats enabled=1 as defaultOption
-    /// on AVMediaSelectionGroup and auto-displays the track. No-op when moov cannot be located.
-    static func clearSubtitleTkhdEnabled(_ initData: Data) -> Data {
-        var bytes = initData
-        let count = bytes.count
-
-        // Inline big-endian UInt32 reader. Uses byte-by-byte assembly to
-        // avoid alignment faults on Data buffers that are not 4-byte aligned.
-        func readU32(_ offset: Int) -> UInt32? {
-            guard offset + 4 <= count else { return nil }
-            return bytes.withUnsafeBytes { (ptr: UnsafeRawBufferPointer) -> UInt32 in
-                let b0 = UInt32(ptr[offset])
-                let b1 = UInt32(ptr[offset + 1])
-                let b2 = UInt32(ptr[offset + 2])
-                let b3 = UInt32(ptr[offset + 3])
-                return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
-            }
-        }
-
-        var pos = 0
-        var moovStart = -1
-        var moovEnd = -1
-        while pos + 8 <= count {
-            guard let size32 = readU32(pos) else { break }
-            let boxSize: Int
-            if size32 == 1 {
-                // Extended 64-bit size.
-                guard pos + 16 <= count,
-                      let hi = readU32(pos + 8), let lo = readU32(pos + 12)
-                else { break }
-                boxSize = Int((UInt64(hi) << 32) | UInt64(lo))
-            } else if size32 == 0 {
-                boxSize = count - pos  // box extends to EOF
-            } else {
-                boxSize = Int(size32)
-            }
-            guard boxSize >= 8, pos + boxSize <= count else { break }
-            let name = bytes[pos + 4 ..< pos + 8]
-            if name == Data([0x6d, 0x6f, 0x6f, 0x76]) { // "moov"
-                moovStart = pos + 8  // skip size+name
-                moovEnd   = pos + boxSize
-                break
-            }
-            pos += boxSize
-        }
-        guard moovStart >= 0 else { return bytes }  // no moov found
-
-        pos = moovStart
-        while pos + 8 <= moovEnd {
-            guard let size32 = readU32(pos) else { break }
-            let boxSize = size32 == 0 ? (moovEnd - pos) : Int(size32)
-            guard boxSize >= 8, pos + boxSize <= moovEnd else { break }
-            let name = bytes[pos + 4 ..< pos + 8]
-            if name == Data([0x74, 0x72, 0x61, 0x6b]) { // "trak"
-                let trakStart = pos + 8
-                let trakEnd   = pos + boxSize
-
-                var tkhdFlagsOffset = -1   // byte offset of the 3-byte flags field inside tkhd
-                var handlerType: Data? = nil
-
-                var trakPos = trakStart
-                while trakPos + 8 <= trakEnd {
-                    guard let sz32 = readU32(trakPos) else { break }
-                    let sz = sz32 == 0 ? (trakEnd - trakPos) : Int(sz32)
-                    guard sz >= 8, trakPos + sz <= trakEnd else { break }
-                    let boxName = bytes[trakPos + 4 ..< trakPos + 8]
-
-                    if boxName == Data([0x74, 0x6b, 0x68, 0x64]) { // "tkhd"
-                        // tkhd: [size 4B][name 4B][version 1B][flags 3B] -> flags at trakPos+9
-                        let fOffset = trakPos + 9
-                        if fOffset + 3 <= trakEnd {
-                            tkhdFlagsOffset = fOffset
-                        }
-                    } else if boxName == Data([0x6d, 0x64, 0x69, 0x61]) { // "mdia"
-                        let mdiaStart = trakPos + 8
-                        let mdiaEnd   = trakPos + sz
-                        var mPos = mdiaStart
-                        while mPos + 8 <= mdiaEnd {
-                            guard let msz32 = readU32(mPos) else { break }
-                            let msz = msz32 == 0 ? (mdiaEnd - mPos) : Int(msz32)
-                            guard msz >= 8, mPos + msz <= mdiaEnd else { break }
-                            let mn = bytes[mPos + 4 ..< mPos + 8]
-                            if mn == Data([0x68, 0x64, 0x6c, 0x72]) { // "hdlr"
-                                // hdlr layout: sz+name(8) + ver(1) + flags(3) + pre_defined(4) + handler_type(4)
-                                let htOffset = mPos + 8 + 1 + 3 + 4
-                                if htOffset + 4 <= mdiaEnd {
-                                    handlerType = bytes[htOffset ..< htOffset + 4]
-                                }
-                                break
-                            }
-                            mPos += msz
-                        }
-                    }
-                    trakPos += sz
-                }
-
-                // Subtitle handler types: 'sbtl' (tx3g/mov_text) or 'text'.
-                let isSbtl = handlerType == Data([0x73, 0x62, 0x74, 0x6c]) // "sbtl"
-                let isText = handlerType == Data([0x74, 0x65, 0x78, 0x74]) // "text"
-                if (isSbtl || isText), tkhdFlagsOffset >= 0 {
-                    // enabled is bit 0 of the 3-byte BE flags; lives at byte [+2].
-                    bytes[tkhdFlagsOffset + 2] &= 0xFE
-                }
-            }
-            pos += boxSize
-        }
-        return bytes
-    }
 
     private static func mkTag(fromFourCC fourCC: String) -> UInt32? {
         let chars = Array(fourCC)

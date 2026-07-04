@@ -880,8 +880,6 @@ extension AetherEngine {
             nativeVideoSession?.nativeSubtitleCueStoresForSession.forEach { $0.clear() }
             nativeVideoSession?.nativeSubtitleCueStoresForSession = []
             nativeVideoSession?.nativeSubtitleLanguagesForSession = []
-            nativeVideoSession?.producer?.subtitleCueStores = []
-            nativeVideoSession?.producer?.nativeSubtitleLanguages = []
             nativeSubtitleRenditionAvailable = false
         }
     }

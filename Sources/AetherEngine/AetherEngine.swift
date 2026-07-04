@@ -880,12 +880,9 @@ public final class AetherEngine: ObservableObject {
     /// to EOF, downloading the entire source a second time and accumulating all future bitmap cues (each a RGBA
     /// CGImage); on 50-80 GB UHD remuxes this causes jetsam on Apple TV 4K (AetherEngine#31). 90 s covers the
     /// main pump's ~60-80 s lead plus network jitter; while parked, TCP backpressure throttles the subtitle
-    /// connection to playback rate.
-    ///
-    /// CRITICAL INVARIANT (#55): must exceed bufferAheadSegments * targetSegmentDurationSeconds (currently
-    /// 10 * 4 = 40 s). The producer drains NativeSubtitleCueStore when cutting each segment; if the store's
-    /// park horizon is inside the buffer window, segments beyond it get no cues and the native tx3g track gaps.
-    /// Verify this constraint when raising bufferAheadSegments or targetSegmentDurationSeconds.
+    /// connection to playback rate. Independent of the forward-buffer window: overlay cues are paced to the
+    /// playhead and the native subtitle rendition is a separate WebVTT stream (not muxed into the A/V
+    /// segments), so a large `forwardBufferSegments` does not gap subtitles.
     nonisolated static let embeddedSubtitleReadAheadSeconds: Double = 90
     /// #15: native WebVTT readers must stay ahead of AVPlayer's subtitle prefetch (~240s burst at PiP start),
     /// otherwise far segments are fetched empty and cached empty for the VOD rendition. Larger than the inline

@@ -92,8 +92,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     var savedVideoConfig: HLSSegmentProducer.StreamConfig?
     var savedAudioConfig: HLSSegmentProducer.AudioConfig?
 
-    /// When true, `makeProducer` sets `enableNativeSubtitleTrack` on every producer so the
-    /// init moov always declares the mov_text track (#55). Set before `start()`.
+    /// When true, the session exposes the native subtitle WebVTT rendition (separate from the A/V
+    /// variant, served by HLSLocalServer) and arms its cue readers on track selection (#15 / Sodalite#32).
+    /// Set before `start()`.
     var enableNativeSubtitleTrackForSession: Bool = false
 
     /// Native subtitle rendition marked DEFAULT=YES in the master (Sodalite#32). Set before `start()`; the
@@ -191,8 +192,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let prod = producer
         restartLock.unlock()
         rebuildSubtitleTapRoutes()
-        prod?.subtitleCueStores = stores
-        prod?.nativeSubtitleLanguages = langs
         armSubtitleTap(on: prod)
     }
 
@@ -1528,12 +1527,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // #93 retest: the rendered clock feeds the wedge detector's fast path (park + both signals
         // frozen -> single-digit detection). Threaded onto every producer like the play-intent guard.
         prod.playbackPositionProvider = currentPlaybackPositionProvider
-        // Thread native subtitle state onto every producer (initial + restart) so the init moov is
-        // consistent and per-segment cue drain survives seek/audio-switch (#55). Set unconditionally:
-        // empty set keeps byte-identical output and clears stale stores after clearSubtitle.
-        prod.enableNativeSubtitleTrack = enableNativeSubtitleTrackForSession
-        prod.subtitleCueStores = nativeSubtitleCueStoresForSession
-        prod.nativeSubtitleLanguages = nativeSubtitleLanguagesForSession
         prod.closedCaptionObserver = closedCaptionObserverForSession   // #77
         // Sodalite#32: build the tap routes lazily on the first producer that has stores + stream
         // indices (the host sets both before start()), then wire the tap onto every producer.
