@@ -136,6 +136,7 @@ extension AetherEngine {
 
         isSubtitleActive = true
         subtitleCues = []
+        pgsStaleArrivalGates[.primary]?.reset()   // #100
         isLoadingSubtitles = true
         activeEmbeddedSubtitleStreamIndex = Int32(index)
         activeSubtitleTrackIndex = index
@@ -197,6 +198,7 @@ extension AetherEngine {
 
         isSecondarySubtitleActive = true
         secondarySubtitleCues = []
+        pgsStaleArrivalGates[.secondary]?.reset()   // #100
         isLoadingSecondarySubtitles = true
         activeSecondaryEmbeddedSubtitleStreamIndex = Int32(index)
 
@@ -595,16 +597,33 @@ extension AetherEngine {
                     )
                 }
             }
-        }
-        for cue in event.cues {
-            var lo = 0, hi = cues.count
-            while lo < hi {
-                let mid = (lo + hi) / 2
-                if cues[mid].startTime < cue.startTime { lo = mid + 1 } else { hi = mid }
+            // #100: this event is the held stale arrival's successor; its start closes the held
+            // cue's true window. Publish it only if that window covers the playhead (it is the
+            // genuinely active cue), drop replayed history silently.
+            for cue in pgsStaleArrivalGates[channel, default: PGSStaleArrivalGate()]
+                .resolveHeld(trimAt: trimAt, playhead: sourceTime) {
+                insertSorted(cue, into: &cues)
             }
-            cues.insert(cue, at: lo)
+        }
+        // #100: a PGS event whose cues start well behind the playhead is a catch-up replay; its
+        // open-ended placeholder window would cover the playhead the instant it inserts and flash
+        // stale history through the overlay until the successor trims it. Hold it instead.
+        let admitted = pgsStaleArrivalGates[channel, default: PGSStaleArrivalGate()]
+            .admit(cues: event.cues, isPGS: event.isPGS, playhead: sourceTime)
+        for cue in admitted {
+            insertSorted(cue, into: &cues)
         }
         pruneOldSubtitleCues(&cues)
+    }
+
+    @MainActor
+    private func insertSorted(_ cue: SubtitleCue, into cues: inout [SubtitleCue]) {
+        var lo = 0, hi = cues.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if cues[mid].startTime < cue.startTime { lo = mid + 1 } else { hi = mid }
+        }
+        cues.insert(cue, at: lo)
     }
 
     /// Prune cues whose `endTime` is older than the retention window. Uses `sourceTime` because cue.startTime/endTime are absolute source PTS seconds (see EmbeddedSubtitleDecoder.decode).
@@ -761,6 +780,7 @@ extension AetherEngine {
         loadedSidecarURL = url
         isSubtitleActive = true
         subtitleCues = []
+        pgsStaleArrivalGates[.primary]?.reset()   // #100
         sidecarASSHeader = nil
         isLoadingSubtitles = true
 
@@ -812,6 +832,7 @@ extension AetherEngine {
         loadedSecondarySidecarURL = url
         isSecondarySubtitleActive = true
         secondarySubtitleCues = []
+        pgsStaleArrivalGates[.secondary]?.reset()   // #100
         isLoadingSecondarySubtitles = true
 
         let effectiveHeaders = httpHeaders ?? loadedOptions.httpHeaders
@@ -847,6 +868,7 @@ extension AetherEngine {
         loadedSidecarURL = nil
         isSubtitleActive = false
         subtitleCues = []
+        pgsStaleArrivalGates[.primary]?.reset()   // #100
         sidecarASSHeader = nil
         isLoadingSubtitles = false
         subtitleTapOverlayStreamIndex = nil
@@ -886,6 +908,7 @@ extension AetherEngine {
         loadedSecondarySidecarURL = nil
         isSecondarySubtitleActive = false
         secondarySubtitleCues = []
+        pgsStaleArrivalGates[.secondary]?.reset()   // #100
         isLoadingSecondarySubtitles = false
     }
 
