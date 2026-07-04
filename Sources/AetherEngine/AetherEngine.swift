@@ -247,6 +247,10 @@ public final class AetherEngine: ObservableObject {
     /// Decoded cues for the active subtitle source (sidecar or embedded side-demuxer). When
     /// `LoadOptions.prepareNativeSubtitles` is set, cues also flow into NativeSubtitleCueStore for mov_text injection (#55).
     @Published public internal(set) var subtitleCues: [SubtitleCue] = []
+    /// #100: per-channel holdback for PGS cues arriving behind the playhead (catch-up bursts after
+    /// side-reader starvation). Reset wherever the cue arrays reset (track switch, seek re-anchor,
+    /// clear, load/stop) so a hold can never leak across subtitle sessions.
+    var pgsStaleArrivalGates: [SubtitleChannel: PGSStaleArrivalGate] = [:]
     @Published public internal(set) var isLoadingSubtitles: Bool = false
     @Published public internal(set) var isSubtitleActive: Bool = false
     /// Active primary embedded subtitle stream index (matches TrackInfo.id), or nil when subtitles are off or
@@ -1769,6 +1773,9 @@ public final class AetherEngine: ObservableObject {
         clock.currentTime = target
         clock.sourceTime = target
 
+        // #100: the playhead jumped; a held stale PGS arrival belongs to the old position.
+        pgsStaleArrivalGates = [:]
+
         // Re-arm the embedded subtitle side demuxer at the new playhead.
         if activeEmbeddedSubtitleStreamIndex >= 0, let url = loadedURL {
             let streamIdx = activeEmbeddedSubtitleStreamIndex
@@ -2228,6 +2235,7 @@ public final class AetherEngine: ObservableObject {
         loadedSidecarURL = nil
         isSubtitleActive = false
         subtitleCues = []
+        pgsStaleArrivalGates = [:]   // #100: both channels; a hold never survives the session
         sidecarASSHeader = nil
         isLoadingSubtitles = false
         nativeSubtitleTrackTable = []
