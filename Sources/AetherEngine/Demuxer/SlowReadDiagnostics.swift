@@ -22,9 +22,16 @@ struct SlowReadDiagnostics {
     private(set) var reconnects = 0
     private(set) var backoffMs: Double = 0
     private(set) var staleGenDroppedBytes: Int64 = 0
+    private(set) var iterations = 0
 
     init(thresholdMs: Double = 2000) {
         self.thresholdMs = thresholdMs
+    }
+
+    /// One pass of the read loop. Separates a single blocked call (few iterations, large
+    /// unaccounted time) from a spin (many iterations) when the recorded counters are near zero.
+    mutating func recordIteration() {
+        iterations += 1
     }
 
     mutating func recordDetourServe(ms: Double, fetched: Bool) {
@@ -54,11 +61,16 @@ struct SlowReadDiagnostics {
     /// The summary line for a completed read, or nil while under the threshold.
     func line(elapsedMs: Double, offset: Int64, generationSpan: (Int, Int)) -> String? {
         guard elapsedMs >= thresholdMs else { return nil }
+        // Time not attributable to any recorded branch: the read was blocked upstream of the loop
+        // (fresh-connection first byte, a starved detour fetch not yet timed out, scheduling). This
+        // is the #93/#96 residual's signature, so surfacing it turns "empty counters" into a number.
+        let unaccounted = max(0, elapsedMs - stallWaitMs - detourMs - backoffMs)
         return "[AVIOReader] slow read: \(Int(elapsedMs))ms at offset=\(offset) "
             + "detour=\(detourServes)(\(Int(detourMs))ms,\(detourFetches)fetch) "
             + "stallWaits=\(stallWaits)(\(Int(stallWaitMs))ms,\(stallWaitsSignaled)signaled) "
             + "reconnects=\(reconnects) backoff=\(Int(backoffMs))ms "
             + "staleGenDropped=\(staleGenDroppedBytes)b "
+            + "iters=\(iterations) unaccounted=\(Int(unaccounted))ms "
             + "gen=\(generationSpan.0)->\(generationSpan.1)"
     }
 }

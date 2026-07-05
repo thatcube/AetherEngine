@@ -38,6 +38,33 @@ struct Issue93SlowReadDiagnosticsTests {
         #expect(rendered.contains("gen=7->9"))
     }
 
+    @Test("a slow read reports loop iterations and the time unaccounted by any counter")
+    func slowReadReportsIterationsAndUnaccounted() {
+        // #93/#96 residual: the pathological reads show near-zero recorded counters but a
+        // multi-second total, i.e. the wait is upstream of every instrumented branch. The
+        // unaccounted figure (elapsed minus stall/detour/backoff) makes that gap quantitative,
+        // and the iteration count separates a single blocked call from a spin.
+        var diag = SlowReadDiagnostics()
+        diag.recordIteration()
+        diag.recordIteration()
+        diag.recordStallWait(ms: 70, signaled: true)
+        diag.recordReconnect()
+        let line = diag.line(elapsedMs: 18_938, offset: 2_661_629_352, generationSpan: (24, 25))
+        let rendered = try! #require(line)
+        #expect(rendered.contains("iters=2"))
+        // 18938 - 70 stall - 0 detour - 0 backoff = 18868 upstream of the loop.
+        #expect(rendered.contains("unaccounted=18868ms"))
+    }
+
+    @Test("unaccounted equals the whole elapsed when nothing was counted")
+    func unaccountedIsWholeElapsedWithoutCounters() {
+        let diag = SlowReadDiagnostics()
+        let line = diag.line(elapsedMs: 15_795, offset: 1_217_464_230, generationSpan: (10, 11))
+        let rendered = try! #require(line)
+        #expect(rendered.contains("iters=0"))
+        #expect(rendered.contains("unaccounted=15795ms"))
+    }
+
     @Test("threshold is configurable and inclusive above, exclusive below")
     func thresholdBoundary() {
         var diag = SlowReadDiagnostics(thresholdMs: 1000)

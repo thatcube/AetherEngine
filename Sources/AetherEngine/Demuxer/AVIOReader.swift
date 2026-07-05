@@ -476,7 +476,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     // Suspend/resume calls are balanced under streamLock.
     private var streamingTaskSuspended = false
 
-    /// Unblock a suspended av_read_frame without freeing resources.
+    /// Unblock a suspended av_read_frame and release the live network connection.
     /// Must be called BEFORE acquiring the demuxer's access lock.
     func markClosed() {
         isClosed = true
@@ -492,8 +492,22 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         sTask?.cancel()
         winCond.lock()
         connGeneration &+= 1
+        // #93/#96 residual: cancel the persistent Range GET here, not only in close(). markClosed is
+        // the abort used by the #79 reopen path (dem.markClosed() to unblock a wedged read); leaving
+        // its long-lived open-ended connection alive lets it keep draining the origin for the whole
+        // reopen + first-read window, and that connection fair-shares the origin's bandwidth with the
+        // fresh reader's cold read, which is exactly the per-connection starvation behind the residual
+        // 15-30s cold reads. The AVIO context is untouched (close() still frees it); only the socket
+        // is released. Grab under winCond, invalidate outside it (mirrors close()).
+        let session = activeSession
+        let task = activeTask
+        activeSession = nil
+        activeTask = nil
+        connEnded = true
         winCond.broadcast()
         winCond.unlock()
+        task?.cancel()
+        session?.invalidateAndCancel()
     }
 
     /// Free all resources. Separate from `markClosed` (step 1: unblock reads)
@@ -763,6 +777,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
 
         while totalRead < requestSize {
+            diag.recordIteration()
             if isClosed { return totalRead > 0 ? Int32(totalRead) : -1 }
             if isPastReadDeadline { readDeadlineFired = true; return totalRead > 0 ? Int32(totalRead) : -1 }
 
@@ -1234,12 +1249,21 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             _ = winCond.wait(until: Date(timeIntervalSinceNow: 0.2))
         }
         winCond.unlock()
-        #if DEBUG
         if let firstDataMs {
-            EngineLog.emit("[AVIOReader] gen=\(generation) first data after \(Int(firstDataMs))ms",
-                           category: .demux)
+            // #93/#96 residual: a slow first-data gap is release-visible so a device trace can pair it
+            // with the response-header timing above. Small header gap + large first-data gap = the body
+            // stalled after headers; large header gap = server-side connection queuing. Fast reads stay
+            // on the DEBUG-only path to keep the release log quiet.
+            if firstDataMs > 2000 {
+                EngineLog.emit("[AVIOReader] gen=\(generation) first data after \(Int(firstDataMs))ms",
+                               category: .demux)
+            } else {
+                #if DEBUG
+                EngineLog.emit("[AVIOReader] gen=\(generation) first data after \(Int(firstDataMs))ms",
+                               category: .demux)
+                #endif
+            }
         }
-        #endif
     }
 
     fileprivate func persistentReceivedResponse(
@@ -1253,10 +1277,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         if status == 429 || status == 503 {
             retryAfter = Self.parseRetryAfter(http)
         }
+        var headerMs: Double? = nil
         winCond.lock()
         if generation == connGeneration {
             connStatus = status
             connRetryAfter = retryAfter
+            // #93/#96 residual: time-to-first-response-header for this generation. A large value here
+            // with a small subsequent first-data gap points at server-side connection queuing (the
+            // origin accepted the socket but withheld the response while it served another connection
+            // of the same file at full rate), the prime suspect for the ~15s cold reads.
+            headerMs = Double(DispatchTime.now().uptimeNanoseconds - connStartedAt.uptimeNanoseconds) / 1_000_000
         }
         // VOD: 200 at offset > 0 means server ignored Range and sent the full body
         // from byte 0 (silent corruption). Reject it. Live is exempt: transcode
@@ -1276,6 +1306,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             #endif
         }
         winCond.unlock()
+        if let headerMs, headerMs > 2000 {
+            EngineLog.emit(
+                "[AVIOReader] gen=\(generation) response headers after \(Int(headerMs))ms status=\(status)",
+                category: .demux
+            )
+        }
         if status == 200 && requestedOffset > 0 && !isLive {
             EngineLog.emit(
                 "[AVIOReader] server ignored Range (200 for offset \(requestedOffset)); rejecting body",
