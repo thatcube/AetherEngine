@@ -167,6 +167,10 @@ public final class AetherEngine: ObservableObject {
     /// Late HDR10+ T.35 SEI upgrades flip this independently of `videoFormat`'s panel guard.
     @Published public internal(set) var sourceVideoFormat: VideoFormat = .sdr
 
+    /// Dolby Vision profile number (5, 7, 8, 10) of the source, or nil when not DV. Companion to
+    /// `sourceVideoFormat` for Stats-for-Nerds labels ("Dolby Vision P5"); read from the dvcC record.
+    @Published public internal(set) var sourceDVProfile: Int? = nil
+
     // MARK: - Disc titles / chapters (#67)
 
     /// Selectable titles on the loaded disc image (Blu-ray playlists / DVD titles), longest first so
@@ -1165,6 +1169,7 @@ public final class AetherEngine: ObservableObject {
         // don't keep publishing the predecessor's values (e.g. Live TV after an HDR10 film kept reporting .hdr10).
         videoFormat = .sdr
         sourceVideoFormat = .sdr
+        sourceDVProfile = nil
         sourceVideoWidth = 0
         sourceVideoHeight = 0
 
@@ -1188,6 +1193,7 @@ public final class AetherEngine: ObservableObject {
         //    HLSVideoEngine re-opens internally; the double-open keeps the failure-mode matrix small.
         var detectedFormat: VideoFormat = .sdr
         var effectiveFormat: VideoFormat = .sdr
+        var detectedDVProfileNum: Int? = nil
         var detectedRate: Double? = nil
         var detectedDVProfile: Bool = false
         var detectedCodecID: AVCodecID = AV_CODEC_ID_NONE
@@ -1233,6 +1239,7 @@ public final class AetherEngine: ObservableObject {
                 // DV->HDR10 when the panel can't host it; we don't pre-strip engine-side. Pairs with
                 // always-emit-SUPPLEMENTAL + no-strip in HLSVideoEngine's profile81/profile84 emission.
                 detectedDVProfile = (detectedFormat == .dolbyVision)
+                detectedDVProfileNum = Self.dvProfile(stream: stream)
                 detectedCodecID = stream.pointee.codecpar.pointee.codec_id
                 sourceVideoWidth = stream.pointee.codecpar.pointee.width
                 sourceVideoHeight = stream.pointee.codecpar.pointee.height
@@ -1275,6 +1282,7 @@ public final class AetherEngine: ObservableObject {
         // sourceVideoFormat = what's in the file; videoFormat = what the panel shows (published after
         // the criteria handshake; see panelHDRAfterHandshake below).
         sourceVideoFormat = detectedFormat
+        sourceDVProfile = detectedDVProfileNum
         audioTracks = probedAudioTracks
         subtitleTracks = probedSubtitleTracks
         // #88: load-declared external tracks join the list now, BEFORE preferred-language selection
@@ -1907,6 +1915,7 @@ public final class AetherEngine: ObservableObject {
         fontAttachments = []
         videoFormat = .sdr
         sourceVideoFormat = .sdr
+        sourceDVProfile = nil
         sourceVideoWidth = 0
         sourceVideoHeight = 0
         pendingExternalMetadata = []
