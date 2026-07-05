@@ -31,6 +31,16 @@ struct DemuxerOpenProfile: Sendable {
     /// on demand only if its target subtitle stream's codec is genuinely unresolved at open.
     var skipStreamInfo: Bool
 
+    /// Bound the open-time data connection to a finite byte range (`bytes=0-N`) instead of the
+    /// open-ended `bytes=0-` streaming request (#93 residual). Only the wedge-restart reopen sets
+    /// it: that open reads the container header plus the bounded find_stream_info probe and nothing
+    /// more (the producer seeks to the target and streams from there on its own connection), so an
+    /// open-ended full-file GET is both wasteful and, on origins that serve `bytes=0-` as a slow
+    /// dribble while answering finite ranges instantly, the whole 22 s reopen cost (device trace:
+    /// one offset=0 read, stallWaits=14/20.5 s, next to a bounded sibling range that answered in
+    /// ~300 ms). nil keeps the open-ended behaviour for every other path (playback streams from 0).
+    var boundedInitialFetch: Int64? = nil
+
     static let playback = DemuxerOpenProfile(
         probesize: 50 * 1024 * 1024,
         maxAnalyzeDuration: 60 * 1_000_000,
@@ -77,9 +87,15 @@ struct DemuxerOpenProfile: Sendable {
     /// The bounded budget resolves video_delay from the first few packets (HEVC/H.264 parser
     /// reads it from SPS) at a small bounded read cost. Keeps the playback AVIO tuning for the
     /// sustained pump reads that follow.
-    static let restartReopen: DemuxerOpenProfile =
-        playback.withProbeBudget(probesize: 4 * 1024 * 1024,
-                                 maxAnalyzeDuration: 5 * 1_000_000)
+    static let restartReopen: DemuxerOpenProfile = {
+        var profile = playback.withProbeBudget(probesize: 4 * 1024 * 1024,
+                                               maxAnalyzeDuration: 5 * 1_000_000)
+        // Bound the open connection to comfortably above the 4 MB probe budget (header + probe +
+        // margin for the AVIO buffer straddling the 4 MB boundary). The producer reconnects
+        // open-ended at the seek target immediately after, so sustained reads are untouched.
+        profile.boundedInitialFetch = 8 * 1024 * 1024
+        return profile
+    }()
 
     /// Open profile for the embedded subtitle side-demuxer (#76, #87). `EmbeddedSubtitleDecoder`
     /// needs only `codec_id` / `codec_type` (carried in the container header / MPEG-TS PMT,
@@ -260,7 +276,8 @@ public final class Demuxer: @unchecked Sendable {
             prefetchEnabled: openProfile.avioPrefetch,
             isLive: isLive,
             chunkRequestTimeout: openProfile.avioRequestTimeout,
-            chunkMaxRetries: openProfile.avioMaxRetries
+            chunkMaxRetries: openProfile.avioMaxRetries,
+            boundedInitialFetch: openProfile.boundedInitialFetch
         )
         reader.onNetworkPhaseChanged = onNetworkPhaseChanged
         try openWithProvider(reader, isLive: isLive)

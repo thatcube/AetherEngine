@@ -141,6 +141,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// When false, no speculative next-chunk prefetch (random-access: next read
     /// almost always seeks elsewhere, so prefetch would be wasted bandwidth).
     private let prefetchEnabled: Bool
+    /// When set, the open-time data connection requests a finite `bytes=0-N` range instead of the
+    /// open-ended `bytes=0-` stream (#93 residual). Scopes to the open connection only; read-loop
+    /// reconnects and seek reconnects stay open-ended. nil = open-ended everywhere (playback).
+    private let boundedInitialFetch: Int64?
     private static let avioBufferSize: Int32 = 256 * 1024  // 256 KB
     private static let streamTrimThreshold = 1024 * 1024  // 1 MB, keep for small backward seeks
     // Backpressure: suspend the streaming task above highWater, resume below lowWater.
@@ -274,7 +278,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var throttleVClockNs: UInt64 = 0
     private let throttleLock = NSLock()
 
-    init(url: URL, extraHeaders: [String: String] = [:], chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3) {
+    init(url: URL, extraHeaders: [String: String] = [:], chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil) {
         self.url = url
         self.extraHeaders = extraHeaders
         self.chunkSize = chunkSize
@@ -282,6 +286,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         self.isLive = isLive
         self.chunkRequestTimeout = chunkRequestTimeout
         self.chunkMaxRetries = max(1, chunkMaxRetries)
+        self.boundedInitialFetch = boundedInitialFetch.map { max(1, $0) }
         self.throttleKbps = AetherEngine.sourceThrottleKbpsForTesting
     }
 
@@ -335,7 +340,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // the size probe: its 206 Content-Range is folded into fileSize by
             // persistentReceivedResponse (issue #70), so the common case skips the dedicated
             // probeFileSize() round-trip (and its HEAD fallback, the request some origins 429).
-            startPersistentConnection(at: 0)
+            startPersistentConnection(at: 0, boundedTo: boundedInitialFetch)
             let gotData = awaitFirstPersistentData()
             var tookFallback = false
             if !isLive {
@@ -1130,7 +1135,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     /// Open a fresh Range: bytes=<offset>- connection. Bumps generation so
     /// late callbacks from the old connection are ignored.
-    private func startPersistentConnection(at offset: Int64) {
+    private func startPersistentConnection(at offset: Int64, boundedTo: Int64? = nil) {
         winCond.lock()
         connGeneration &+= 1
         let generation = connGeneration
@@ -1153,7 +1158,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         if isClosed { return }
 
         var request = URLRequest(url: requestURL())
-        request.setValue("bytes=\(offset)-", forHTTPHeaderField: "Range")
+        // #93 residual: a bounded open connection asks for a finite range so an origin that dribbles
+        // the open-ended `bytes=0-` stream serves it as a fast finite GET. The 206 Content-Range still
+        // carries the total size, so fileSize resolution (issue #70) is unaffected.
+        if let boundedTo {
+            request.setValue("bytes=\(offset)-\(offset + boundedTo - 1)", forHTTPHeaderField: "Range")
+        } else {
+            request.setValue("bytes=\(offset)-", forHTTPHeaderField: "Range")
+        }
         request.timeoutInterval = 0  // long-lived; stalls handled by the reader
         applyExtraHeaders(&request)
 

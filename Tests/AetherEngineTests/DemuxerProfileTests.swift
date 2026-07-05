@@ -169,4 +169,32 @@ extension DemuxerProfileTests {
         #expect(p.avioRequestTimeout == DemuxerOpenProfile.playback.avioRequestTimeout)
         #expect(p.avioMaxRetries == DemuxerOpenProfile.playback.avioMaxRetries)
     }
+
+    /// #93 residual latency: the reopen open reads only the header + the bounded find_stream_info
+    /// probe, then the producer seeks to the target and streams from there on its own connection, so
+    /// the open-ended `bytes=0-` GET (which an origin can serve as a slow dribble: device trace, one
+    /// offset=0 read spending stallWaits=14/20.5 s while a bounded sibling range answered ~300 ms) is
+    /// pure cost. The reopen therefore bounds the open connection to comfortably above the probe
+    /// budget so the header + probe still fit inside one fast finite range.
+    @Test("restartReopen bounds the open connection above its probe budget")
+    func restartReopenBoundsOpenConnection() {
+        let p = DemuxerOpenProfile.restartReopen
+        #expect(p.boundedInitialFetch != nil)
+        // Must cover the header + the full find_stream_info probe (plus AVIO-buffer straddle margin).
+        #expect((p.boundedInitialFetch ?? 0) > p.probesize)
+    }
+
+    /// The bound is scoped to the reopen alone. Playback must keep streaming from byte 0 open-ended
+    /// (it plays forward from the start), and neither the still-extraction nor the subtitle side
+    /// demuxer opens should acquire a finite open range.
+    @Test("every non-reopen profile keeps the open-ended `bytes=0-` open")
+    func nonReopenProfilesStayOpenEnded() {
+        #expect(DemuxerOpenProfile.playback.boundedInitialFetch == nil)
+        #expect(DemuxerOpenProfile.stillExtraction.boundedInitialFetch == nil)
+        #expect(DemuxerOpenProfile.subtitleSideDemuxer(
+            callerProbesize: nil, callerMaxAnalyzeDuration: nil).boundedInitialFetch == nil)
+        // withProbeBudget must not fabricate a bound when the receiver had none.
+        #expect(DemuxerOpenProfile.playback.withProbeBudget(
+            probesize: 1, maxAnalyzeDuration: nil).boundedInitialFetch == nil)
+    }
 }
