@@ -42,11 +42,16 @@ struct Issue93SlowSegmentServeTests {
         // The server reads its header-sent flag right after the provider
         // returns; a callback still executing past complete() would race it.
         let fired = Counter()
+        // Block until the callback has actually begun, so the barrier assertion never depends on
+        // wall-clock scheduling (a fixed sleep flaked in CI when the timer thread was starved and
+        // the callback had not started when complete() was called).
+        let started = DispatchSemaphore(value: 0)
         let signal = SlowServeSignal(thresholdSeconds: 0.05) {
+            started.signal()                     // callback is now in flight
             Thread.sleep(forTimeInterval: 0.2)   // slow callback body
             fired.bump()
         }
-        Thread.sleep(forTimeInterval: 0.1)        // let the timer fire
+        started.wait()                            // wait for the timer to fire the callback
         signal.complete()
         // complete() must have waited for the in-flight callback.
         #expect(fired.value == 1)
