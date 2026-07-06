@@ -49,9 +49,13 @@ public actor FrameExtractor {
         self.decodeQueue = DispatchQueue(label: "com.aetherengine.frameextractor", qos: .utility)
     }
 
+    /// `selectTitleID` picks the disc title for a Blu-ray / DVD ISO URL (nil = main title); it lets a
+    /// still follow the currently-selected title instead of always the default one (AE#105). Inert for
+    /// non-disc URLs.
     public init(url: URL, httpHeaders: [String: String] = [:],
+                selectTitleID: Int? = nil,
                 yieldWhile: (@Sendable () -> Bool)? = nil) {
-        self.init(context: FrameDecodeContext(url: url, httpHeaders: httpHeaders),
+        self.init(context: FrameDecodeContext(url: url, httpHeaders: httpHeaders, selectTitleID: selectTitleID),
                   yieldWhile: yieldWhile)
     }
 
