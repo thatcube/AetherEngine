@@ -263,15 +263,26 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 
     // MARK: - Thumbnail lookup (engine-internal)
 
-    /// Pure lookup for live scrub thumbnail: no side effects, no restarts; nil outside resident window.
-    func liveThumbnailSegment(atSeconds seconds: Double) -> (index: Int, startSeconds: Double, fileURL: URL)? {
-        guard isLive else { return nil }
+    /// Pure lookup for the segment whose [startSeconds, startSeconds+duration) window
+    /// contains `seconds`. No clamp past the end (unlike segmentIndex(forPlaylistTime:)):
+    /// a scrub past the produced range must miss, not pin to the last segment. Exposed
+    /// static for unit tests. lastIndex mirrors the live lookup (picks the most recent
+    /// match across a discontinuity; identical to firstIndex for contiguous VOD segments).
+    static func thumbnailSegmentIndex(atSeconds seconds: Double,
+                                      segments: [HLSVideoEngine.Segment]) -> Int? {
+        segments.lastIndex(where: {
+            $0.startSeconds <= seconds && seconds < $0.startSeconds + $0.durationSeconds
+        })
+    }
+
+    /// Pure lookup for a scrub thumbnail: no side effects, no restarts; nil outside the
+    /// resident window or on a cache miss. Works for live and VOD (VOD `segments` carry
+    /// `startSeconds` from init); callers gate on session type one layer up.
+    func thumbnailSegment(atSeconds seconds: Double) -> (index: Int, startSeconds: Double, fileURL: URL)? {
         stateLock.lock()
         let segs = segments
         stateLock.unlock()
-        guard let idx = segs.lastIndex(where: {
-            $0.startSeconds <= seconds && seconds < $0.startSeconds + $0.durationSeconds
-        }) else { return nil }
+        guard let idx = Self.thumbnailSegmentIndex(atSeconds: seconds, segments: segs) else { return nil }
         guard let url = cache.peekURL(index: idx) else { return nil }
         return (idx, segs[idx].startSeconds, url)
     }

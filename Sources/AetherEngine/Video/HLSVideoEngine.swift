@@ -1378,7 +1378,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let prov = provider
         restartLock.unlock()
         guard isLiveSession, let prov else { return nil }
-        guard let seg = prov.liveThumbnailSegment(atSeconds: seconds) else { return nil }
+        guard let seg = prov.thumbnailSegment(atSeconds: seconds) else { return nil }
         guard let initData = prov.peekInitSegment(),
               let segData = try? Data(contentsOf: seg.fileURL) else { return nil }
         return (initData + segData, seg.index)
