@@ -75,7 +75,7 @@ func printUsage() {
       aetherctl dovitest <file>
       aetherctl extract [--at <sec>] [--snapshot] [--width <px>] [--loops <n>] <url>
       aetherctl audio [--seconds N] <url>
-      aetherctl audiotap [--duration S] [--out PATH.wav] <url>
+      aetherctl audiotap [--duration S] [--out PATH.wav] [--remote] <url>
                          (#95: decode the loopback audio track to mono 48k WAV, print continuity stats)
       aetherctl customio [--memory] [--forward-only] [--audio-only] [--reload] [--switch-audio] [--select-subs] [--extract] <file>
       aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--serve-only] [--measure-rss] [--report-cache-bytes] [--rewind-test] [--reload-test] [--sw] [--drop-after N] [--discontinuity-at N] [--realtime] [--gen-highbitrate-seed]
@@ -373,14 +373,16 @@ if first == "audiotap" {
     var rest = Array(args.dropFirst(2))
     let duration = takeDoubleFlag("--duration", from: &rest) ?? 30
     let outPath = takeStringFlag("--out", from: &rest) ?? "/tmp/audiotap.wav"
+    let remote = rest.contains("--remote")
+    rest.removeAll { $0 == "--remote" }
     guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
         print("ERROR: audiotap requires a <url> argument")
-        print("Usage: aetherctl audiotap [--duration S] [--out PATH.wav] <url>")
+        print("Usage: aetherctl audiotap [--duration S] [--out PATH.wav] [--remote] <url>")
         exit(64)
     }
     rest.removeAll { $0 == urlArg }
     rejectStrayFlags(rest, subcommand: "audiotap")
-    exit(runAudioTap(url: parseSourceURL(urlArg), duration: duration, outPath: outPath))
+    exit(runAudioTap(url: parseSourceURL(urlArg), duration: duration, outPath: outPath, remote: remote))
 }
 
 if first == "hlsfixture" {

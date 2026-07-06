@@ -97,6 +97,93 @@ public enum AudioTapProbe {
             + "wrote=\(outPath)"
     }
 
+    /// #95 remote-HLS variant: drives AudioTapHLSReader against a remote HLS URL through the real
+    /// AudioTapHLSFetcher (no loopback producer, no AVPlayer). A synthetic playhead trails the
+    /// decode position so the reader decodes as-fast-as-available, the same trick as `run`.
+    public static func runRemote(url: URL, durationSeconds: Double, outPath: String) throws -> String {
+        final class Sink: @unchecked Sendable {
+            let lock = NSLock()
+            var samples: [Float] = []
+            var buffers = 0
+            var discontinuities = 0
+            var firstSource: Double?
+            var lastSource: Double = 0
+            var lastEmittedEndPTS: Double = 0
+        }
+        let sink = Sink()
+        let fetcher = AudioTapHLSFetcher()
+        let decoder = AudioTapSegmentDecoder()
+        let base = AudioTapBaseBox(url)
+
+        let deps = AudioTapHLSReader.Dependencies(
+            playhead: { [sink] in
+                sink.lock.lock(); defer { sink.lock.unlock() }
+                return max(0, sink.lastEmittedEndPTS - (AudioTapDefaults.leadSeconds - 1))
+            },
+            mediaURL: url,
+            fetchPlaylist: { u in
+                let (playlist, finalURL) = try await fetcher.fetchPlaylist(u)
+                if let audioURI = AudioTapHLSVariantResolver.pickAudioURI(from: playlist),
+                   let audioURL = HLSPlaylistParser.resolve(uri: audioURI, against: finalURL) {
+                    let (mediaPlaylist, mediaFinal) = try await fetcher.fetchPlaylist(audioURL)
+                    base.set(mediaFinal)
+                    guard case .media(let media) = mediaPlaylist else {
+                        throw AudioTapHLSFetcher.FetchError.invalidPlaylist("expected media playlist")
+                    }
+                    return media
+                }
+                base.set(finalURL)
+                guard case .media(let media) = playlist else {
+                    throw AudioTapHLSFetcher.FetchError.invalidPlaylist("expected media playlist")
+                }
+                return media
+            },
+            fetchSegment: { uri, crypt in
+                guard let segURL = HLSPlaylistParser.resolve(uri: uri, against: base.get()) else {
+                    throw AudioTapHLSFetcher.FetchError.unresolvable
+                }
+                return try await fetcher.fetchSegment(segURL, crypt: crypt, base: base.get())
+            },
+            decodeSegment: { decoder.decode(selfContainedSegment: $0) },
+            emit: { [sink] buf in
+                sink.lock.lock(); defer { sink.lock.unlock() }
+                sink.buffers += 1
+                if buf.discontinuity { sink.discontinuities += 1 }
+                if sink.firstSource == nil { sink.firstSource = buf.sourceTime }
+                sink.lastSource = buf.sourceTime
+                sink.lastEmittedEndPTS = buf.sourceTime
+                    + Double(buf.buffer.frameLength) / AudioTapDefaults.sampleRate
+                let n = Int(buf.buffer.frameLength)
+                sink.samples.append(contentsOf: UnsafeBufferPointer(
+                    start: buf.buffer.floatChannelData![0], count: n))
+            })
+        let reader = AudioTapHLSReader(deps: deps)
+        reader.start()
+
+        let deadline = Date().addingTimeInterval(durationSeconds * 3)
+        while Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.5)
+            sink.lock.lock()
+            let seconds = Double(sink.samples.count) / AudioTapDefaults.sampleRate
+            sink.lock.unlock()
+            if seconds >= durationSeconds { break }
+        }
+        reader.stop()
+
+        sink.lock.lock()
+        defer { sink.lock.unlock() }
+        let seconds = Double(sink.samples.count) / AudioTapDefaults.sampleRate
+        guard writeFloat32WAV(samples: sink.samples,
+                              sampleRate: Int(AudioTapDefaults.sampleRate), to: outPath) else {
+            throw ProbeError.wavWriteFailed(outPath)
+        }
+        return "audiotap(remote): buffers=\(sink.buffers) "
+            + "pcmSeconds=\(String(format: "%.2f", seconds)) "
+            + "discontinuities=\(sink.discontinuities) "
+            + "sourceTime=[\(sink.firstSource ?? -1) ... \(sink.lastSource)] "
+            + "wrote=\(outPath)"
+    }
+
     /// Minimal IEEE-float WAV writer (format tag 3).
     static func writeFloat32WAV(samples: [Float], sampleRate: Int, to path: String) -> Bool {
         var d = Data()
