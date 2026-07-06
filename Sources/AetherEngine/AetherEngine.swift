@@ -1795,8 +1795,17 @@ public final class AetherEngine: ObservableObject {
                     // forever even after the producer re-anchor recovers playback.
                     state = (host.timeControlStatus == .paused) ? .paused : .playing
                     isBuffering = host.timeControlStatus == .waitingToPlayAtSpecifiedRate
-                    reanchorProducerToPlaylistTime(Self.recoveryAnchorPosition(
-                        frozenPosition: avpReal, pendingSeekTarget: pendingRecoverySeekClockTarget))
+                    let recoveryAnchor = Self.recoveryAnchorPosition(
+                        frozenPosition: avpReal, pendingSeekTarget: pendingRecoverySeekClockTarget)
+                    reanchorProducerToPlaylistTime(recoveryAnchor)
+                    // #96: re-anchor the overlay subtitle readers at the SAME recovery target the producer
+                    // now aims at. This reconcile just snapped sourceTime to the frozen (stale-ahead) position,
+                    // and the normal-landing re-arm below is never reached (we return here), so without this the
+                    // reader stays pinned to the pre-wedge clock and never re-seeks, opening a (frozen - target)
+                    // -length cue hole (device: ~25 s / ~44 s / one ~178 s blackout). recoveryAnchor is
+                    // playlist-axis; the reader anchors in source-PTS (source = playlist + playlistShiftSeconds).
+                    // The reader's own effectiveSubtitleStart honours this anchor over the still-stale clock.
+                    rearmEmbeddedSubtitleReaders(atSourceTime: recoveryAnchor + playlistShiftSeconds)
                     // pendingRecoverySeekClockTarget deliberately survives this reconcile: the UI
                     // clock gives up the phantom target, the recovery intent does not.
                     EngineLog.emit(
@@ -1821,10 +1830,25 @@ public final class AetherEngine: ObservableObject {
         clock.currentTime = target
         clock.sourceTime = target
 
+        // #100 + #96: the playhead jumped; re-anchor the overlay subtitle readers at the landed source-PTS.
+        rearmEmbeddedSubtitleReaders(atSourceTime: target)
+
+        // Seek has physically landed.
+        state = .playing
+        setProgrammaticSeek(inFlight: false, target: nil)
+    }
+
+    /// Re-arm the embedded (primary + secondary) overlay subtitle side readers at `anchorSourceTime`
+    /// (source-PTS). Shared by the normal seek landing and the #96 wedge-reconcile recovery, so the wedge
+    /// path re-anchors the reader to the producer's true recovery target instead of orphaning it at the
+    /// stale pre-wedge clock (device: up to a ~178 s cue hole). In-band CC and tap-fed overlay tracks ride
+    /// the producer across the seek and only clear/backfill their on-screen cues; only the side-demuxer
+    /// path actually re-seeks (reusing the open container per #76 part 2).
+    private func rearmEmbeddedSubtitleReaders(atSourceTime anchorSourceTime: Double) {
         // #100: the playhead jumped; a held stale PGS arrival belongs to the old position.
         pgsStaleArrivalGates = [:]
 
-        // Re-arm the embedded subtitle side demuxer at the new playhead.
+        // Primary embedded subtitle side demuxer.
         if activeEmbeddedSubtitleStreamIndex >= 0, let url = loadedURL {
             let streamIdx = activeEmbeddedSubtitleStreamIndex
             // #77: in-band CC is fed by the producer CC tap, which rides the producer across the seek.
@@ -1846,30 +1870,26 @@ public final class AetherEngine: ObservableObject {
                 // Custom sources: clone the reader; skip re-arm if the reader can't produce a clone (forward-only).
                 if isCustomSource {
                     if let clone = customReader?.makeIndependentReader() {
-                        startEmbeddedSubtitleTask(url: url, reader: clone, formatHint: customFormatHint, streamIndex: streamIdx, startAt: target)
+                        startEmbeddedSubtitleTask(url: url, reader: clone, formatHint: customFormatHint, streamIndex: streamIdx, startAt: anchorSourceTime)
                     }
                 } else {
-                    startEmbeddedSubtitleTask(url: url, reader: nil, formatHint: nil, streamIndex: streamIdx, startAt: target)
+                    startEmbeddedSubtitleTask(url: url, reader: nil, formatHint: nil, streamIndex: streamIdx, startAt: anchorSourceTime)
                 }
             }
         }
 
-        // Re-arm the secondary embedded subtitle track (#47).
+        // Secondary embedded subtitle track (#47).
         if activeSecondaryEmbeddedSubtitleStreamIndex >= 0, let url = loadedURL {
             let streamIdx = activeSecondaryEmbeddedSubtitleStreamIndex
             secondarySubtitleCues = []
             if isCustomSource {
                 if let clone = customReader?.makeIndependentReader() {
-                    startEmbeddedSubtitleTask(url: url, reader: clone, formatHint: customFormatHint, streamIndex: streamIdx, startAt: target, channel: .secondary)
+                    startEmbeddedSubtitleTask(url: url, reader: clone, formatHint: customFormatHint, streamIndex: streamIdx, startAt: anchorSourceTime, channel: .secondary)
                 }
             } else {
-                startEmbeddedSubtitleTask(url: url, reader: nil, formatHint: nil, streamIndex: streamIdx, startAt: target, channel: .secondary)
+                startEmbeddedSubtitleTask(url: url, reader: nil, formatHint: nil, streamIndex: streamIdx, startAt: anchorSourceTime, channel: .secondary)
             }
         }
-
-        // Seek has physically landed.
-        state = .playing
-        setProgrammaticSeek(inFlight: false, target: nil)
     }
 
     /// #65: re-base the loopback producer onto AVPlayer's real (playlist-axis) position after a seek-deadline

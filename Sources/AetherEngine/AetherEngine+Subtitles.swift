@@ -245,6 +245,18 @@ extension AetherEngine {
         }
     }
 
+    /// #96: choose the overlay reader's effective start anchor. The #52 forward catch-up (advance to the
+    /// live playhead when unpaused playback moved on during the slow open) must NOT apply when the AVPlayer
+    /// clock is a frozen wedge phantom: after a wedged backward seek `playhead` is stale-AHEAD of the real
+    /// target (#37 semantics), so `max(startAt, playhead)` would anchor the reader ahead of the producer's
+    /// true landing and open a `(playhead - target)`-length cue hole (device: up to ~178 s of playback with
+    /// no subtitles). While a recovery seek is pending the clock is not trustworthy, so honour the passed
+    /// anchor; otherwise apply the forward catch-up as before.
+    nonisolated static func effectiveSubtitleStart(startAt: Double, playhead: Double?, recoveryPending: Bool) -> Double {
+        guard let playhead, !recoveryPending else { return startAt }
+        return max(startAt, playhead)
+    }
+
     /// Side-demuxer read loop: opens a fresh Demuxer, prewarms MKV cue index by seeking mid-file, seeks to just before the start time, then streams packets through EmbeddedSubtitleDecoder. Paces against the playhead via `embeddedSubtitleReadAheadSeconds` instead of racing to EOF.
     nonisolated private func runEmbeddedSubtitleReader(
         url: URL, reader: IOReader?, formatHint: String?,
@@ -347,9 +359,13 @@ extension AetherEngine {
             }
         }
 
-        // Re-sample the live playhead after the slow open + prewarm: startAt was captured pre-open, and unpaused playback may have advanced several seconds, causing the first cues to arrive behind the playhead (tens-of-seconds delay in issue #52). `max` only seeks forward to catch up, never behind the anchor.
-        let freshPlayhead = await MainActor.run { [weak self] in self?.sourceTime }
-        let effectiveStart = max(startAt, freshPlayhead ?? startAt)
+        // Re-sample the live playhead after the slow open + prewarm: startAt was captured pre-open, and unpaused playback may have advanced several seconds, causing the first cues to arrive behind the playhead (tens-of-seconds delay in issue #52). The forward catch-up only seeks forward, never behind the anchor, and is suppressed while a recovery seek is pending: during a wedge the clock is frozen stale-AHEAD of the real backward target and would otherwise anchor the reader past the producer's landing (#96, see effectiveSubtitleStart).
+        let (freshPlayhead, recoveryPending): (Double?, Bool) = await MainActor.run { [weak self] in
+            guard let self else { return (nil, false) }
+            return (self.sourceTime, self.pendingRecoverySeekClockTarget != nil)
+        }
+        let effectiveStart = Self.effectiveSubtitleStart(
+            startAt: startAt, playhead: freshPlayhead, recoveryPending: recoveryPending)
 
         // -2 s lead-in: PGS/DVB/HDMV need their SETUP segments before the first END/EVENT (#52). On reuse this
         // re-seeks the already-open container to the new playhead, which is the whole point (no re-open).
