@@ -231,6 +231,10 @@ extension AetherEngine {
             prior?.cancel()
             await prior?.value
             if Task.isCancelled { reader?.close(); return }
+            // #93 residual: don't open/seek a competing origin connection while a producer restart's
+            // reopen is queuing at the origin; defer until it settles (the pump tap covers the gap).
+            await self?.awaitRestartSettledForSubtitleReader()
+            if Task.isCancelled { reader?.close(); return }
             await self?.runEmbeddedSubtitleReader(
                 url: url, reader: reader, formatHint: formatHint,
                 headers: headers, streamIndex: streamIndex, startAt: startAt,
@@ -979,6 +983,33 @@ extension AetherEngine {
                 callerProbesize: probesize, callerMaxAnalyzeDuration: maxAnalyzeDuration,
                 selectTitleID: titleID, readToEOF: readToEOF
             )
+        }
+    }
+
+    /// Bound for `awaitRestartSettledForSubtitleReader` (mirrors the native reader deferral's 30s cap).
+    nonisolated static let subtitleReaderRestartDeferralSeconds: Double = 30.0
+
+    /// #93 residual: block up to `subtitleReaderRestartDeferralSeconds` while a producer restart is in
+    /// flight, so a subtitle side reader does not open/seek a fresh origin connection that competes for
+    /// the origin's limited connection slots and queues the restart's reopen behind it (rrgomes device
+    /// trace on 8aed0db: reopen `response headers after 13121ms`, server-side connection queuing, with
+    /// subtitles on). The old wedged producer connection is kept alive through the reopen on purpose
+    /// (open-before-abort, #79), so the reader is the one elective slot we can free. The pump tap covers
+    /// the produced region meanwhile. Bounded so a stuck restart never pins the reader forever; returns
+    /// immediately when no restart is in flight. Honours the restart-in-flight test hook.
+    func awaitRestartSettledForSubtitleReader() async {
+        func restartBusy() -> Bool {
+            var busy = nativeVideoSession?.restartInFlight == true
+            #if DEBUG
+            if let override = testHookRestartInFlightOverride { busy = override }
+            #endif
+            return busy
+        }
+        guard restartBusy() else { return }
+        EngineLog.emit("[AetherEngine] subtitle reader deferring origin I/O while a producer restart is in flight", category: .engine)
+        let deadline = DispatchTime.now() + Self.subtitleReaderRestartDeferralSeconds
+        while restartBusy(), !Task.isCancelled, DispatchTime.now() < deadline {
+            try? await Task.sleep(nanoseconds: 200_000_000)
         }
     }
 
