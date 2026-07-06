@@ -182,6 +182,24 @@ public final class Demuxer: @unchecked Sendable {
         discTitles.indices.contains(selectedDiscTitleIndex) ? discTitles[selectedDiscTitleIndex].id : nil
     }
 
+    /// Authoritative playlist/IFO duration of the selected disc title, or nil when there is no disc
+    /// title or its duration is unparsed (ticks 0). This is trusted over FFmpeg's container estimate
+    /// (see `duration`).
+    var selectedDiscTitleDurationSeconds: Double? {
+        guard discTitles.indices.contains(selectedDiscTitleIndex) else { return nil }
+        let ticks = discTitles[selectedDiscTitleIndex].durationTicks
+        return ticks > 0 ? Double(ticks) / discTickRate : nil
+    }
+
+    /// Pick the trustworthy duration for a disc-backed source. FFmpeg's mpegts estimate over
+    /// concatenated multi-clip Blu-ray m2ts with discontinuous PTS is unreliable (AE#105: a 42s title
+    /// probed as 25.5h, a 35s title as 5s), so the MPLS/IFO playlist duration wins whenever it is
+    /// present (> 0). Non-disc sources (`discTitle == nil`) keep the container estimate verbatim.
+    static func effectiveDurationSeconds(discTitle: Double?, container: Double) -> Double {
+        if let discTitle, discTitle > 0 { return discTitle }
+        return container
+    }
+
     /// Open a media URL and probe its streams.
     /// - Parameters:
     ///   - extraHeaders: Attached to every HTTP request (ignored for file:// URLs).
@@ -432,9 +450,13 @@ public final class Demuxer: @unchecked Sendable {
     }
 
     var duration: Double {
-        guard let ctx = formatContext else { return 0 }
-        let dur = ctx.pointee.duration
-        return dur > 0 ? Double(dur) / Double(AV_TIME_BASE) : 0
+        let container: Double = {
+            guard let ctx = formatContext else { return 0 }
+            let dur = ctx.pointee.duration
+            return dur > 0 ? Double(dur) / Double(AV_TIME_BASE) : 0
+        }()
+        // A disc title's MPLS/IFO duration overrides FFmpeg's unreliable mpegts estimate (AE#105).
+        return Self.effectiveDurationSeconds(discTitle: selectedDiscTitleDurationSeconds, container: container)
     }
 
     /// AVFormatContext.bit_rate in bps, or 0 if unknown. Used by

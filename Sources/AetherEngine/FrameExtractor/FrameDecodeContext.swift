@@ -18,6 +18,10 @@ final class FrameDecodeContext: @unchecked Sendable {
     /// idle-reopen path can rebuild over the still-alive reader).
     private let reader: IOReader?
     private let formatHint: String?
+    /// For a disc image (Blu-ray / DVD ISO) URL, the title to extract stills from. nil = the default
+    /// (main) title. Threaded into `Demuxer.open` so a still follows the currently-selected disc title
+    /// instead of always decoding the default one (AE#105).
+    private let selectTitleID: Int?
 
     private var demuxer: Demuxer?
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
@@ -92,11 +96,12 @@ final class FrameDecodeContext: @unchecked Sendable {
         return max(0, duration - clampBackoffSeconds)
     }
 
-    init(url: URL, httpHeaders: [String: String]) {
+    init(url: URL, httpHeaders: [String: String], selectTitleID: Int? = nil) {
         self.url = url
         self.httpHeaders = httpHeaders
         self.reader = nil
         self.formatHint = nil
+        self.selectTitleID = selectTitleID
     }
 
     init(reader: IOReader, formatHint: String?) {
@@ -105,6 +110,7 @@ final class FrameDecodeContext: @unchecked Sendable {
         self.httpHeaders = [:]
         self.reader = reader
         self.formatHint = formatHint
+        self.selectTitleID = nil
     }
 
     deinit {
@@ -147,7 +153,7 @@ final class FrameDecodeContext: @unchecked Sendable {
         if let reader = reader {
             try demuxer.open(reader: reader, formatHint: formatHint, profile: .stillExtraction)
         } else {
-            try demuxer.open(url: url, extraHeaders: httpHeaders, profile: .stillExtraction)
+            try demuxer.open(url: url, extraHeaders: httpHeaders, profile: .stillExtraction, selectTitleID: selectTitleID)
         }
         self.demuxer = demuxer
 

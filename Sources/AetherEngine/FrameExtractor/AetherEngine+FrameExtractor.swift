@@ -62,7 +62,11 @@ extension AetherEngine {
                                   yieldWhile: sessionYieldSignal())
         }
         guard let url = loadedURL else { return nil }
+        // For a disc image, pin the extractor to the currently-selected title so stills follow the
+        // title switch instead of always decoding the default one (AE#105). The host rebuilds the
+        // extractor when the disc title changes.
         return FrameExtractor(url: url, httpHeaders: loadedOptions.httpHeaders,
+                              selectTitleID: activeDiscTitleID,
                               yieldWhile: sessionYieldSignal())
     }
 
