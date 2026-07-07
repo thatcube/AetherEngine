@@ -55,7 +55,13 @@ final class EmbeddedSubtitleDecoder {
             if ctx.pointee.height == 0 { ctx.pointee.height = sourceVideoHeight }
         }
 
-        if avcodec_open2(ctx, codec, nil) < 0 {
+        var opts: OpaquePointer?
+        for (key, value) in Self.decoderOptions(for: id) {
+            av_dict_set(&opts, key, value, 0)
+        }
+        let openResult = avcodec_open2(ctx, codec, &opts)
+        av_dict_free(&opts)
+        if openResult < 0 {
             var local: UnsafeMutablePointer<AVCodecContext>? = ctx
             avcodec_free_context(&local)
             return nil
@@ -229,6 +235,14 @@ final class EmbeddedSubtitleDecoder {
             || id == AV_CODEC_ID_DVB_SUBTITLE
             || id == AV_CODEC_ID_DVD_SUBTITLE
             || id == AV_CODEC_ID_XSUB
+    }
+
+    /// Decoder options for a subtitle codec. DVB teletext (libzvbi_teletextdec) must be told to emit
+    /// text and to follow subtitle pages so it flows through the text pipeline as WebVTT/overlay
+    /// rather than as a teletext bitmap. Every other codec opens with no options. #107.
+    static func decoderOptions(for id: AVCodecID) -> [String: String] {
+        guard id == AV_CODEC_ID_DVB_TELETEXT else { return [:] }
+        return ["txt_format": "text", "txt_page": "subtitle"]
     }
 
     /// Issue #112: decide whether a PGS payload that decoded with gotSub==0 warrants the synthetic
