@@ -25,7 +25,10 @@ extension AetherEngine {
             playlistShiftSeconds = active.shift
         }
         if pendingRecoverySeekClockTarget == nil {
-            clock.currentTime = value + playlistShiftSeconds
+            // AE#105: fold the disc's clip-0 STC base back out so the published playhead sits on the same
+            // 0-based axis as the MPLS duration (origin 0 for normal/live -> no-op).
+            clock.currentTime = PresentationAxis.display(sourcePTS: value + playlistShiftSeconds,
+                                                         origin: sourcePresentationOrigin)
         }
         // Live edge must fold with the same playlistShiftSeconds as the playhead; opposite sign would make behindLiveSeconds meaningless.
         if isLive {
@@ -211,10 +214,16 @@ extension AetherEngine {
                 let prevShift = self.playlistShiftSeconds
                 let delta = seconds - prevShift
                 self.playlistShiftSeconds = seconds
+                // AE#105: a disc title's raw source PTS starts at clip 0's STC base (= this constant VOD shift)
+                // while its duration is the 0-based MPLS/IFO playlist length. Anchor the display origin to that
+                // base so the published playhead is 0-based like the total. Normal/live sources keep origin 0
+                // (their public axis already equals source PTS), so this whole change is a no-op off disc.
+                self.sourcePresentationOrigin = (!self.discTitles.isEmpty && !self.isLive) ? seconds : 0
                 // Seed seam history: activateAt=-.infinity covers the full output timeline from the start.
                 self.liveShiftSeams = [(activateAt: -.infinity, shift: seconds)]
-                // Re-fold immediately so currentTime (source PTS) doesn't lag the next periodic tick.
-                self.clock.currentTime = self.nativeClockSeconds + seconds
+                // Re-fold immediately so currentTime doesn't lag the next periodic tick (origin-corrected).
+                self.clock.currentTime = PresentationAxis.display(sourcePTS: self.nativeClockSeconds + seconds,
+                                                                  origin: self.sourcePresentationOrigin)
                 // sourceTime re-folds on next $renderedTime tick; keeping it there tracks the rendered picture, not the optimistic clock (#49).
                 // #65 diag: every VOD producer (re)start collapses the seam history to one entry here. If `delta`
                 // is non-zero while AVPlayer still holds old-epoch buffer (avBufAhead > 0), the buffered bytes
@@ -225,6 +234,7 @@ extension AetherEngine {
                     "[AetherEngine] #65 VOD shift published: \(String(format: "%.3f", seconds))s "
                     + "(prev \(String(format: "%.3f", prevShift))s, delta \(String(format: "%.3f", delta))s, "
                     + "changed=\(abs(delta) > 0.001 ? "YES" : "no")) seams->1 "
+                    + "presentationOrigin=\(String(format: "%.3f", self.sourcePresentationOrigin))s "
                     + "rawClock=\(String(format: "%.2f", self.nativeClockSeconds))s "
                     + "avBufAhead=\(String(format: "%.2f", self.avPlayerBufferAheadSeconds()))s",
                     category: .session
@@ -234,8 +244,11 @@ extension AetherEngine {
         session.onSeekStateChanged = { [weak self] inFlight, playlistTime in
             Task { @MainActor in
                 guard let self = self else { return }
-                // Fold playlist-axis segment time onto source-PTS axis for seekTarget/currentTime (#38). nil clears without disturbing the last value.
-                let target = playlistTime.map { $0 + self.playlistShiftSeconds }
+                // Fold playlist-axis segment time onto the published display axis (#38); the origin keeps a disc
+                // scrub target 0-based like currentTime (0 off disc). nil clears without disturbing the last value.
+                let target = playlistTime.map {
+                    PresentationAxis.display(sourcePTS: $0 + self.playlistShiftSeconds, origin: self.sourcePresentationOrigin)
+                }
                 self.setNativeScrubSeek(inFlight: inFlight, target: target)
             }
         }
@@ -540,8 +553,11 @@ extension AetherEngine {
                 let shift = self.liveShiftSeams.last(where: { value >= $0.activateAt })?.shift
                     ?? self.playlistShiftSeconds
                 self.clock.sourceTime = value + shift
-                // bufferedPosition = end of AVPlayer's contiguous loadedTimeRanges, folded the same way. Clamp so it never trails the rendered frame (#54).
-                self.clock.bufferedPosition = max(value + shift, host.bufferedEnd + shift)
+                // bufferedPosition = end of AVPlayer's contiguous loadedTimeRanges, folded the same way. Clamp so
+                // it never trails the rendered frame (#54). Drawn against the 0-based duration, so map onto the
+                // display axis to keep the buffer bar aligned with currentTime (0 off disc). AE#105.
+                self.clock.bufferedPosition = PresentationAxis.display(
+                    sourcePTS: max(value + shift, host.bufferedEnd + shift), origin: self.sourcePresentationOrigin)
             }
             .store(in: &nativeCancellables)
         startLiveWindowTimer(host: host)

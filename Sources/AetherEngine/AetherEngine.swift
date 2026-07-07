@@ -508,6 +508,16 @@ public final class AetherEngine: ObservableObject {
     /// onPlaylistShiftChanged can re-derive currentTime immediately on shift change. Unused on SW/audio (shift 0).
     var nativeClockSeconds: Double = 0
 
+    /// Source PTS that maps to display-time 0 for the SELECTED source. 0 for normal files and live (their
+    /// public seconds axis already coincides with source PTS). For a disc title it equals the (constant) VOD
+    /// `playlistShiftSeconds` = clip 0's STC base, because a disc title publishes its `duration` from the
+    /// MPLS/IFO playlist on a 0-based axis while the raw source PTS starts at that base (599s / 4199s on the
+    /// TRON multi-clip titles, AE#105). Subtracted from the published `currentTime`/`seekTarget` and added back
+    /// to the `seek` input so the scrubber position, total, seek and resume all live on the same 0-based axis
+    /// the producer already anchors `startPosition` on (`segmentIndexForPlaylistTime`), while `sourceTime`
+    /// stays true source PTS for subtitle-cue alignment. Reset to 0 on load/stop; set in onPlaylistShiftChanged.
+    var sourcePresentationOrigin: Double = 0
+
     /// Diagnostics only. Reads HLSVideoEngine's videoShiftPts synchronously, bypassing the async
     /// onPlaylistShiftChanged relay. A persistent gap vs `playlistShiftSeconds` means the clock is folding
     /// with a stale shift (AetherEngine#49 divergence). Poll alongside `frameAhead` when tracing divergence.
@@ -1851,9 +1861,11 @@ public final class AetherEngine: ObservableObject {
             setProgrammaticSeek(inFlight: false, target: nil)
             return
         }
-        // Convert source-PTS target to AVPlayer's HLS clock (source - playlistShiftSeconds).
-        // SW/audio hosts run on source time (shift 0), so the conversion is a no-op there.
-        let clockTarget = target - playlistShiftSeconds
+        // Convert the (display-axis) target to AVPlayer's HLS clock. The origin re-adds a disc title's clip-0
+        // STC base so `target` (0-based, matching duration) lands on the source-PTS shift the producer subtracts,
+        // i.e. clockTarget == the 0-based playlist time (AE#105). Origin 0 off disc, so this stays
+        // `target - playlistShiftSeconds` for normal VOD; SW/audio hosts run on source time (shift 0), no-op.
+        let clockTarget = PresentationAxis.source(displayTime: target, origin: sourcePresentationOrigin) - playlistShiftSeconds
         let gen = loadGeneration
         // Publish the native-path seek target up front so the scrub clock snaps immediately (#37); the host
         // suppresses periodic-observer reads until landing. SW/audio hosts resolve synchronously and write
@@ -1896,7 +1908,9 @@ public final class AetherEngine: ObservableObject {
                     // evict the target's segments from retention).
                     let avpReal = host.renderedTime
                     nativeClockSeconds = avpReal
-                    clock.currentTime = avpReal + playlistShiftSeconds
+                    // currentTime on the 0-based display axis (AE#105 origin); sourceTime stays source PTS for subs.
+                    clock.currentTime = PresentationAxis.display(sourcePTS: avpReal + playlistShiftSeconds,
+                                                                 origin: sourcePresentationOrigin)
                     clock.sourceTime = avpReal + playlistShiftSeconds
                     setProgrammaticSeek(inFlight: false, target: nil)
                     // Hand state to AVPlayer's ACTUAL transport status, not the phantom .playing the normal
@@ -1938,10 +1952,12 @@ public final class AetherEngine: ObservableObject {
         setPendingRecoverySeekTarget(nil)
         nativeClockSeconds = clockTarget
         clock.currentTime = target
-        clock.sourceTime = target
+        // sourceTime + subtitle re-arm need true source PTS; map the display target back (0 off disc). AE#105.
+        let landedSourcePTS = PresentationAxis.source(displayTime: target, origin: sourcePresentationOrigin)
+        clock.sourceTime = landedSourcePTS
 
         // #100 + #96: the playhead jumped; re-anchor the overlay subtitle readers at the landed source-PTS.
-        rearmEmbeddedSubtitleReaders(atSourceTime: target)
+        rearmEmbeddedSubtitleReaders(atSourceTime: landedSourcePTS)
 
         // Seek has physically landed.
         state = .playing
@@ -2028,6 +2044,7 @@ public final class AetherEngine: ObservableObject {
         clock.currentTime = 0
         clock.bufferedPosition = 0
         clock.progress = 0
+        sourcePresentationOrigin = 0  // AE#105: clear disc display-origin so the next source starts on a clean axis.
         // Clear session state; without this, metadata/track lists/format/pendingExternalMetadata from the
         // previous session survive until the next load and bleed into unrelated sessions.
         duration = 0
