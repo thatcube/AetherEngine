@@ -477,6 +477,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// detection instead of the 24 s counter). nil (tests, live) keeps the fast path inert.
     var playbackPositionProvider: (@Sendable () -> Double?)?
 
+    /// #35/#93 startup guard: reads whether AVPlayer has ever presented a frame this item (its
+    /// `timeControlStatus` reached `.playing` at least once), off the main actor. nil = assume started
+    /// (preserves prior behaviour for tests + live). While false, the VOD backpressure wedge detector
+    /// suspends: a flat rendered clock during cold pre-roll is not a wedge, and re-anchoring there flushes
+    /// AVPlayer's forward buffer and livelocks a slow high-bitrate DV-master start ("loads forever").
+    var hasStartedRenderingProvider: (@Sendable () -> Bool)?
+
     /// #77: in-band CC tap. When `closedCaptionStreamIndex >= 0` that source stream is kept (not
     /// discarded) and each of its packets is handed to `closedCaptionObserver` (read-only) then dropped,
     /// never muxed (output byte-identical). Set via init so it's in the keep-set; observer attached after.
@@ -780,18 +787,24 @@ final class HLSSegmentProducer: @unchecked Sendable {
             // frozen fetch target is not a wedge. Gate the detector on play intent (nil provider = assume
             // playing, unchanged for live + tests); the legit starved-but-wants-to-play wedge keeps tripping.
             let wantsToPlay = wantsToPlayProvider?() ?? true
+            // #35/#93 cold-startup: before the first frame lands a flat clock is pre-roll, not a wedge.
+            let hasStarted = hasStartedRenderingProvider?() ?? true
             if !isLive, parked >= nextLogAt {
                 nextLogAt += 10
+                let suspendReason = !wantsToPlay ? "(consumer paused; wedge detection suspended)"
+                    : !hasStarted ? "(pre-first-frame; wedge detection suspended)"
+                    : "(no playback progress)"
                 EngineLog.emit(
                     "[HLSSegmentProducer] #65 backpressure PARK (\(context)) head=\(head) "
                     + "target=\(target) cacheTarget=\(cacheTarget) "
                     + "highStored=\(cache.highestStoredIndex) cached=\(cache.count) parked=\(parked)s "
-                    + (wantsToPlay ? "(no playback progress)" : "(consumer paused; wedge detection suspended)"),
+                    + suspendReason,
                     category: .session
                 )
             }
             if !isLive, wedgeDetector.observe(currentTarget: cacheTarget, wantsToPlay: wantsToPlay,
-                                              renderedPosition: playbackPositionProvider?()) {
+                                              renderedPosition: playbackPositionProvider?(),
+                                              hasStartedRendering: hasStarted) {
                 markBackpressureWedgeBroken()
                 EngineLog.emit(
                     "[HLSSegmentProducer] #65 backpressure WEDGE BROKEN (\(context)) head=\(head) "

@@ -163,6 +163,26 @@ struct Issue65LivelockTests {
         #expect(d.observe(currentTarget: 84, renderedPosition: 200.0) == true)  // 3s -> fast wedge
     }
 
+    @Test("Cold pre-roll (no first frame yet) never trips, even fully frozen")
+    func preFirstFrameSuspendsDetector() {
+        // The DV-master "loads forever" repro: producer parked, consumer wants to play
+        // (waitingToMinimizeStalls), fetch target frozen and rendered clock pinned at the resume
+        // position because no frame has decoded yet. Before the first frame this is pre-roll, not a
+        // wedge; tripping here would re-anchor and nudge-flush AVPlayer's forward buffer forever.
+        var d = BackpressureWedgeDetector(
+            breakThresholdSeconds: 60, fastBreakThresholdSeconds: 3,
+            initialTarget: 840, initialRenderedPosition: 3355.35)
+        for _ in 0..<10 {
+            #expect(d.observe(currentTarget: 840, renderedPosition: 3355.35,
+                              hasStartedRendering: false) == false)
+        }
+        // First frame lands: the detector arms and the fast window trips on the next 3 frozen polls.
+        #expect(d.observe(currentTarget: 840, renderedPosition: 3355.35, hasStartedRendering: true) == false)
+        #expect(d.observe(currentTarget: 840, renderedPosition: 3355.35, hasStartedRendering: true) == false)
+        #expect(d.observe(currentTarget: 840, renderedPosition: 3355.35, hasStartedRendering: true) == true)
+        #expect(d.lastTripFast == true)
+    }
+
     @Test("A rendered clock jump in either direction resets the flat window")
     func clockJumpResetsFlatWindow() {
         // A backward jump is a new seek landing mid-park; the window must restart, not trip on stale flatness.

@@ -260,6 +260,9 @@ extension AetherEngine {
         // #65 pause false-positive: let the producer read AVPlayer's play intent off-main so its backpressure
         // wedge detector suspends while the consumer is paused. Set before start() so makeProducer captures it.
         session.playIntentProvider = { [playIntentMirror] in playIntentMirror.get() }
+        // #35/#93 cold-startup: let the producer read whether the first frame has landed, so its wedge
+        // detector stays suspended through a slow DV-master pre-roll instead of re-anchoring and livelocking.
+        session.hasStartedRenderingProvider = { [hasRenderedFirstFrameMirror] in hasRenderedFirstFrameMirror.get() }
         // #93 retest: let the wedge re-anchor aim the producer at a pending unlanded user seek target
         // instead of the frozen clock (same decision the nudge and stage-2 reload apply).
         session.recoverySeekTargetProvider = { [recoverySeekTargetMirror] in recoverySeekTargetMirror.get() }
@@ -593,6 +596,11 @@ extension AetherEngine {
                 // != .paused covers both .playing and .waitingToPlay, so a deep rebuffer (wants to play, starved)
                 // still reads as play-intent and can legitimately trip the breaker; only a real pause suspends it.
                 self.playIntentMirror.set(status != .paused)
+                // #35/#93 startup latch: the first true .playing (rate running, not .waitingToPlay) means
+                // pre-roll is over and a frame is presenting. Arms the backpressure wedge detector, which
+                // stays suspended before this so a slow DV-master pre-roll is never re-anchored. Latched
+                // for the item (reset only by load()), so a later backward-seek wedge (#93) still trips.
+                if status == .playing { self.hasRenderedFirstFrameMirror.set(true) }
                 // Reconcile state with external transport commands (AVKit bar, Control Center, hardware button); without this togglePlayPause() is a no-op (swallowed press). .waitingToPlayAtSpecifiedRate maps to .playing so the icon doesn't flicker on rebuffer.
                 // isBuffering only once playback has started (not during initial load spin-up).
                 let startedPlaying = self.state == .playing || self.state == .paused

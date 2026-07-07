@@ -52,9 +52,18 @@ struct BackpressureWedgeDetector {
     ///
     /// `renderedPosition` feeds the fast path; nil (not wired: tests, live) keeps it inert. Any move
     /// beyond the flat epsilon, forward or backward (a new seek landing), restarts the flat window.
+    ///
+    /// `hasStartedRendering` is the cold-startup guard: before AVPlayer has ever presented a frame
+    /// (`timeControlStatus` never reached `.playing`), a flat rendered clock is normal pre-roll, NOT a
+    /// wedge, and the producer parks the instant it fills its forward window ahead of a consumer still
+    /// evaluating buffering rate. A high-bitrate DV master over a slow link pre-rolls past the fast
+    /// window, so tripping here re-anchors and nudge-flushes AVPlayer's forward buffer, restarting the
+    /// pre-roll from zero forever ("loads forever"). Cold startup belongs to the #35 StartupReadinessGate;
+    /// this detector is a mid-stream recovery tool (#93 backward-seek), so it suspends (re-baselines,
+    /// like the paused case) until the first frame lands. Defaults true for existing callers, live, tests.
     mutating func observe(currentTarget: Int, wantsToPlay: Bool = true,
-                          renderedPosition: Double? = nil) -> Bool {
-        guard wantsToPlay else {
+                          renderedPosition: Double? = nil, hasStartedRendering: Bool = true) -> Bool {
+        guard wantsToPlay, hasStartedRendering else {
             if currentTarget > maxTargetSeen { maxTargetSeen = currentTarget }
             stuckSeconds = 0
             flatSeconds = 0

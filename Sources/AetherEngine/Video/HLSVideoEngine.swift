@@ -329,6 +329,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// frozen fetch target is not a wedge, issue #65 pause false-positive).
     var playIntentProvider: (@Sendable () -> Bool)?
 
+    /// Whether AVPlayer has ever presented a frame this item (its `timeControlStatus` reached `.playing`
+    /// at least once), readable off the main actor. Wired by AetherEngine to a thread-safe mirror and
+    /// threaded onto every producer so the VOD backpressure wedge detector stays suspended through cold
+    /// pre-roll (#35/#93 startup: a flat clock before the first frame is not a wedge).
+    var hasStartedRenderingProvider: (@Sendable () -> Bool)?
+
     /// The requested-but-unlanded user seek target (AVPlayer/item clock axis), readable off the main
     /// actor; nil = none pending. Wired by AetherEngine to a thread-safe mirror of its recovery seek
     /// intent (#93 retest). A wedge re-anchor must aim the producer here, not at the frozen clock:
@@ -1546,6 +1552,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // #93 retest: the rendered clock feeds the wedge detector's fast path (park + both signals
         // frozen -> single-digit detection). Threaded onto every producer like the play-intent guard.
         prod.playbackPositionProvider = currentPlaybackPositionProvider
+        // #35/#93 cold-startup: suspend the wedge detector until the first frame lands (pre-roll of a
+        // slow high-bitrate DV master must not be misread as a wedge). Threaded onto every producer.
+        prod.hasStartedRenderingProvider = hasStartedRenderingProvider
         prod.closedCaptionObserver = closedCaptionObserverForSession   // #77
         // Sodalite#32: build the tap routes lazily on the first producer that has stores + stream
         // indices (the host sets both before start()), then wire the tap onto every producer.

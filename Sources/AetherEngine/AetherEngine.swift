@@ -439,6 +439,13 @@ public final class AetherEngine: ObservableObject {
     /// target is not a wedge, pause false-positive). Starts true: VOD autostarts and the sink corrects it.
     let playIntentMirror = AtomicBool(true)
 
+    /// #35/#93 startup: thread-safe mirror of "AVPlayer has presented a frame this item" (its
+    /// `timeControlStatus` reached `.playing` at least once), set on the main actor by the
+    /// $timeControlStatus sink and reset per new load(). Read off-main by the producer to keep the VOD
+    /// backpressure wedge detector suspended through cold pre-roll: a flat rendered clock before the first
+    /// frame is not a wedge, and re-anchoring there livelocks a slow high-bitrate DV-master start.
+    let hasRenderedFirstFrameMirror = AtomicBool(false)
+
     /// #65: how long a native VOD seek may stay pending before the engine checks for a wedge. A normal
     /// loopback seek lands in ~1-2s and slow-but-buffering seeks refill within it; only a starved seek
     /// (no forward buffer after the budget) is reconciled.
@@ -1209,6 +1216,9 @@ public final class AetherEngine: ObservableObject {
         // the SW dispatch branch releases it if this source routes software.
         let priorBackendWasNative = (playbackBackend == .native)
         stopInternal(keepNativeHost: priorBackendWasNative)
+        // #35/#93: a genuinely new item has not rendered yet; re-arm the cold-startup wedge suspension.
+        // Scrub/seek/producer-restart never route through load(), so mid-stream #93 detection stays armed.
+        hasRenderedFirstFrameMirror.set(false)
         // Drop disc recognition memoized for the previous media. Track-switch reopens (audio / subtitle
         // side demuxer) deliberately keep it so a remote ISO is parsed once per session (#76); only a
         // genuinely new load clears it, which also keeps custom sources (shared placeholder URL) from
