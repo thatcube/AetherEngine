@@ -99,4 +99,75 @@ struct DolbyVisionColorTests {
         #expect(DolbyVisionStillConverter.q2d(AVRational(num: 3, den: 2)) == 1.5)
         #expect(DolbyVisionStillConverter.q2d(AVRational(num: 5, den: 0)) == 0)
     }
+
+    // MARK: - RPU reshaping (mapping) curves (#103 follow-up)
+
+    private typealias Curve = DolbyVisionStillConverter.ReshapeCurve
+
+    private func poly(_ pivots: [Double], _ coefs: [[Double]]) -> Curve {
+        Curve(pivots: pivots, isMMR: coefs.map { _ in false }, poly: coefs,
+              mmrOrder: [], mmrConst: [], mmrCoef: [])
+    }
+
+    @Test("Linear reshaping curve matches the clip's Cp/Ct gain+offset fit")
+    func reshapeLinear() {
+        // Cp curve from the real Profile 5 clip: out = 0.06739 + 1.05242*x.
+        let cp = poly([0, 1], [[0.06739, 1.05242, 0]])
+        #expect(abs(cp.map(0, (0, 0, 0)) - 0.06739) < 1e-9)
+        #expect(abs(cp.map(0.5, (0, 0.5, 0.5)) - (0.06739 + 1.05242 * 0.5)) < 1e-9)
+        #expect(!cp.isIdentity)
+    }
+
+    @Test("Identity curve is detected and is a no-op")
+    func reshapeIdentity() {
+        let id = poly([0, 1], [[0, 1, 0]])
+        #expect(id.isIdentity)
+        for i in 0...10 {
+            let x = Double(i) / 10.0
+            #expect(abs(id.map(x, (x, x, x)) - x) < 1e-12)
+        }
+    }
+
+    @Test("Quadratic term is applied (Horner)")
+    func reshapeQuadratic() {
+        let q = poly([0, 1], [[0, 0, 1]])   // y = x^2
+        #expect(abs(q.map(0.5, (0, 0, 0)) - 0.25) < 1e-12)
+        #expect(abs(q.map(0.7, (0, 0, 0)) - 0.49) < 1e-12)
+    }
+
+    @Test("Piecewise segment selection is continuous across the pivot")
+    func reshapePiecewise() {
+        // seg0 on [0,0.5]: y = x ; seg1 on [0.5,1]: y = -0.5 + 2x. Meet at (0.5, 0.5).
+        let c = poly([0, 0.5, 1], [[0, 1, 0], [-0.5, 2, 0]])
+        #expect(abs(c.map(0.25, (0, 0, 0)) - 0.25) < 1e-12)  // seg0
+        #expect(abs(c.map(0.5, (0, 0, 0)) - 0.5) < 1e-12)    // pivot: both segments agree
+        #expect(abs(c.map(0.75, (0, 0, 0)) - 1.0) < 1e-12)   // seg1
+    }
+
+    @Test("Input is clamped to the pivot range")
+    func reshapeClamp() {
+        let c = poly([0.2, 0.8], [[0, 1, 0]])   // y = x on [0.2,0.8]
+        #expect(abs(c.map(-1, (0, 0, 0)) - 0.2) < 1e-12)  // clamps to low pivot
+        #expect(abs(c.map(5, (0, 0, 0)) - 0.8) < 1e-12)   // clamps to high pivot
+    }
+
+    @Test("MMR reshaping evaluates cross terms and higher orders")
+    func reshapeMMR() {
+        // term layout per segment: [I, Ct, Cp, I*Ct, I*Cp, Ct*Cp, I*Ct*Cp]
+        func mmr(order: Int, const: Double, coef: [[Double]]) -> Curve {
+            Curve(pivots: [0, 1], isMMR: [true], poly: [[0, 0, 0]],
+                  mmrOrder: [order], mmrConst: [const], mmrCoef: [coef])
+        }
+        let zero = [Double](repeating: 0, count: 7)
+        // constant + linear I: 0.1 + 1*I
+        let linI = mmr(order: 1, const: 0.1, coef: [[1, 0, 0, 0, 0, 0, 0], zero, zero])
+        #expect(abs(linI.map(0.9, (0.3, 0.2, 0.1)) - 0.4) < 1e-12)
+        // cross term I*Ct (index 3)
+        let cross = mmr(order: 1, const: 0, coef: [[0, 0, 0, 1, 0, 0, 0], zero, zero])
+        #expect(abs(cross.map(0, (0.3, 0.2, 0.1)) - 0.06) < 1e-12)
+        // order 2: 1*I + 1*I^2 with I=0.3 -> 0.3 + 0.09 = 0.39
+        let ord2 = mmr(order: 2, const: 0,
+                       coef: [[1, 0, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0, 0], zero])
+        #expect(abs(ord2.map(0, (0.3, 0.2, 0.1)) - 0.39) < 1e-12)
+    }
 }

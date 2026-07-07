@@ -7,15 +7,139 @@ import Libavutil
 /// colour transform carried in the RPU. Without this the base-layer planes are read as
 /// BT.2020 YCbCr and produce the characteristic green + magenta cast (AetherEngine #103).
 ///
-/// The per-component reshaping curves are intentionally skipped (validated against a libplacebo
-/// render: reshaping does not drive the visible corruption, and skipping it keeps this a small
-/// CPU pass rather than a full Dolby Vision compositor). Highlights and shadows are brought to
-/// SDR with a hue-preserving BT.2390 EETF (`ToneCurve`) anchored on the RPU source PQ range, so
-/// the curve adapts to each clip's mastering envelope. This replaced a fixed-exposure per-channel
-/// Hable tone-map that mapped 100-nit diffuse white to mid-gray and crushed normally-lit content
-/// (validated too dark, 24-79% of a libplacebo reference luminance; #103 follow-up). If a frame
-/// carries no DV metadata the converter returns nil so the caller falls back to the standard path.
+/// The full DV reconstruction is applied: the per-component reshaping (mapping) curves from the
+/// RPU (`AVDOVIDataMapping`) are applied to the encoded base-layer signal FIRST, then the
+/// `ycc_to_rgb` / `rgb_to_lms` colour transform, then a hue-preserving BT.2390 EETF (`ToneCurve`)
+/// anchored on the RPU source PQ range. Reshaping is not optional per clip: masters carry
+/// non-identity luma (brightness) and chroma (~5% gain + offset) curves, and skipping them
+/// over-brightens highlights and leaves a cool/blue cast on neutral content (#103 follow-up,
+/// reproduced on a real Profile 5 clip whose RPU carried quadratic luma + gained chroma curves;
+/// an earlier clip happened to carry identity curves, which is why skipping looked correct once).
+/// The BT.2390 tone-map replaced a fixed-exposure per-channel Hable map that pushed 100-nit
+/// diffuse white to mid-gray. If a frame carries no DV metadata the converter returns nil so the
+/// caller falls back to the standard path.
 enum DolbyVisionStillConverter {
+
+    /// One RPU reshaping curve (per component). Reconstructs the mastered signal from the encoded
+    /// base-layer value via a piece-wise polynomial or MMR fit (`AVDOVIReshapingCurve`). Pivots are
+    /// normalised to [0,1] by the bit-depth max; coefficients by `2^coef_log2_denom`.
+    struct ReshapeCurve {
+        let pivots: [Double]        // normalised, ascending, count == num_pivots
+        let isMMR: [Bool]           // per segment (count == num_pivots-1)
+        let poly: [[Double]]        // [segment][3]  (x^0, x^1, x^2), zeroed above poly_order
+        let mmrOrder: [Int]         // [segment]
+        let mmrConst: [Double]      // [segment]
+        let mmrCoef: [[[Double]]]   // [segment][order 0..2][7 cross terms]
+
+        var isIdentity: Bool {
+            pivots.count == 2 && !isMMR[0] &&
+            abs(poly[0][0]) < 1e-9 && abs(poly[0][1] - 1) < 1e-9 && abs(poly[0][2]) < 1e-9
+        }
+
+        /// Reshape the encoded value `x` (this component). MMR segments use the full encoded
+        /// input vector `sig` = (I, Ct, Cp); polynomial segments use only `x`.
+        func map(_ x: Double, _ sig: (Double, Double, Double)) -> Double {
+            let n = pivots.count
+            if n < 2 { return x }
+            let clamped = min(max(x, pivots[0]), pivots[n - 1])
+            var seg = 0
+            while seg < n - 2 && clamped >= pivots[seg + 1] { seg += 1 }
+            if isMMR[seg] {
+                var s = mmrConst[seg]
+                var t: [Double] = [
+                    sig.0, sig.1, sig.2,
+                    sig.0 * sig.1, sig.0 * sig.2, sig.1 * sig.2,
+                    sig.0 * sig.1 * sig.2,
+                ]
+                let base = t
+                let order = max(1, mmrOrder[seg])
+                for o in 0..<min(order, 3) {
+                    let c = mmrCoef[seg][o]
+                    for k in 0..<7 { s += c[k] * t[k] }
+                    if o + 1 < order { for k in 0..<7 { t[k] *= base[k] } }
+                }
+                return s
+            }
+            let c = poly[seg]
+            return c[0] + clamped * (c[1] + clamped * c[2])
+        }
+    }
+
+    /// Parse the three per-component reshaping curves from `AVDOVIDataMapping`. Fixed C arrays
+    /// import as tuples, so each field is read by rebinding its bytes to the primitive element type
+    /// (the same technique the colour matrices use above).
+    static func parseReshapeCurves(
+        mapping: UnsafePointer<AVDOVIDataMapping>,
+        coefDenom: Double,
+        pivotScale: Double
+    ) -> [ReshapeCurve] {
+        var mapCopy = mapping.pointee
+        var curvesOut: [ReshapeCurve] = []
+        withUnsafePointer(to: &mapCopy.curves) { tuplePtr in
+            tuplePtr.withMemoryRebound(to: AVDOVIReshapingCurve.self, capacity: 3) { curves in
+                for i in 0..<3 {
+                    var c = curves[i]
+                    let np = Int(c.num_pivots)
+                    let segs = max(np - 1, 0)
+                    var pivots = [Double]()
+                    withUnsafeBytes(of: &c.pivots) { raw in
+                        let p = raw.bindMemory(to: UInt16.self)
+                        for j in 0..<np { pivots.append(Double(p[j]) / pivotScale) }
+                    }
+                    var method = [Int32]()
+                    withUnsafeBytes(of: &c.mapping_idc) { raw in
+                        let p = raw.bindMemory(to: Int32.self)
+                        for j in 0..<segs { method.append(p[j]) }
+                    }
+                    var order = [Int]()
+                    withUnsafeBytes(of: &c.poly_order) { raw in
+                        let p = raw.bindMemory(to: UInt8.self)
+                        for j in 0..<segs { order.append(Int(p[j])) }
+                    }
+                    var poly = [[Double]]()
+                    withUnsafeBytes(of: &c.poly_coef) { raw in
+                        let p = raw.bindMemory(to: Int64.self)
+                        for j in 0..<segs {
+                            let ord = j < order.count ? order[j] : 2
+                            var coef = [Double](repeating: 0, count: 3)
+                            for k in 0...2 where k <= ord {
+                                coef[k] = Double(p[j * 3 + k]) / coefDenom
+                            }
+                            poly.append(coef)
+                        }
+                    }
+                    var mmrOrder = [Int]()
+                    withUnsafeBytes(of: &c.mmr_order) { raw in
+                        let p = raw.bindMemory(to: UInt8.self)
+                        for j in 0..<segs { mmrOrder.append(Int(p[j])) }
+                    }
+                    var mmrConst = [Double]()
+                    withUnsafeBytes(of: &c.mmr_constant) { raw in
+                        let p = raw.bindMemory(to: Int64.self)
+                        for j in 0..<segs { mmrConst.append(Double(p[j]) / coefDenom) }
+                    }
+                    var mmrCoef = [[[Double]]]()
+                    withUnsafeBytes(of: &c.mmr_coef) { raw in
+                        let p = raw.bindMemory(to: Int64.self)   // [8][3][7], stride 21 per segment
+                        for j in 0..<segs {
+                            var seg = [[Double]]()
+                            for o in 0..<3 {
+                                var terms = [Double]()
+                                for k in 0..<7 { terms.append(Double(p[j * 21 + o * 7 + k]) / coefDenom) }
+                                seg.append(terms)
+                            }
+                            mmrCoef.append(seg)
+                        }
+                    }
+                    curvesOut.append(ReshapeCurve(
+                        pivots: pivots,
+                        isMMR: method.map { $0 == AV_DOVI_MAPPING_MMR.rawValue },
+                        poly: poly, mmrOrder: mmrOrder, mmrConst: mmrConst, mmrCoef: mmrCoef))
+                }
+            }
+        }
+        return curvesOut
+    }
 
     /// BT.2020 LMS -> RGB (Hunt-Pointer-Estevez, no crosstalk), applied after the RPU
     /// rgb_to_lms matrix. Constant from libplacebo's Dolby Vision path.
@@ -77,6 +201,23 @@ enum DolbyVisionStillConverter {
         // PQ-linearised LMS -> linear BT.2020 RGB in one matrix.
         let combined = matMul(lms2rgb, rgb2lms)
 
+        // Per-component reshaping (mapping) curves. Applied to the encoded base-layer signal before
+        // the colour transform; masters carry non-identity luma + chroma curves (#103 follow-up).
+        let mapping = base.advanced(by: Int(meta.pointee.mapping_offset))
+            .assumingMemoryBound(to: AVDOVIDataMapping.self)
+        let coefDenom = Double(UInt64(1) << UInt64(header.pointee.coef_log2_denom))
+        let curves = parseReshapeCurves(mapping: mapping, coefDenom: coefDenom, pivotScale: maxVal)
+        let needsReshape = curves.count == 3 && !curves.allSatisfy { $0.isIdentity }
+
+        if ProcessInfo.processInfo.environment["AETHER_DV_DUMP"] != nil {
+            EngineLog.emit("[DVStill] srcPQ min=\(colorMeta.source_min_pq) max=\(colorMeta.source_max_pq) coefDenom=\(coefDenom) reshape=\(needsReshape)", category: .swPlayback)
+            EngineLog.emit("[DVStill] offset=\(offset) ycc2rgb=\(nonlinear)", category: .swPlayback)
+            for (i, c) in curves.enumerated() {
+                let nm = i == 0 ? "I" : (i == 1 ? "Ct" : "Cp")
+                EngineLog.emit("[DVStill] curve[\(nm)] pivots=\(c.pivots.map { String(format: "%.4f", $0) }) mmr=\(c.isMMR) poly=\(c.poly.map { $0.map { String(format: "%.5f", $0) } }) identity=\(c.isIdentity)", category: .swPlayback)
+            }
+        }
+
         let srcW = Int(frame.pointee.width)
         let srcH = Int(frame.pointee.height)
         guard srcW > 0, srcH > 0,
@@ -109,10 +250,18 @@ enum DolbyVisionStillConverter {
                 for ox in 0..<dstW {
                     let sx = min(srcW - 1, ox * srcW / dstW)
                     let cx = sx / 2
-                    // Base-layer signal (I, Ct, Cp) normalised to [0,1]. Reshaping skipped.
-                    let sig0 = Double(yp[sy * yls + sx]) / maxVal - offset[0]
-                    let sig1 = Double(up[cy * uls + cx]) / maxVal - offset[1]
-                    let sig2 = Double(vp[cy * vls + cx]) / maxVal - offset[2]
+                    // Base-layer signal (I, Ct, Cp) normalised to [0,1].
+                    let e0 = Double(yp[sy * yls + sx]) / maxVal
+                    let e1 = Double(up[cy * uls + cx]) / maxVal
+                    let e2 = Double(vp[cy * vls + cx]) / maxVal
+                    // Reconstruct the mastered signal via the RPU reshaping curves (MMR uses the
+                    // full encoded vector), then remove the neutral offset.
+                    let m0 = needsReshape ? curves[0].map(e0, (e0, e1, e2)) : e0
+                    let m1 = needsReshape ? curves[1].map(e1, (e0, e1, e2)) : e1
+                    let m2 = needsReshape ? curves[2].map(e2, (e0, e1, e2)) : e2
+                    let sig0 = m0 - offset[0]
+                    let sig1 = m1 - offset[1]
+                    let sig2 = m2 - offset[2]
                     // ycc_to_rgb in the nonlinear (PQ) domain.
                     let r0 = nonlinear[0] * sig0 + nonlinear[1] * sig1 + nonlinear[2] * sig2
                     let g0 = nonlinear[3] * sig0 + nonlinear[4] * sig1 + nonlinear[5] * sig2
