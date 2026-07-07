@@ -3,6 +3,8 @@ import AetherEngine
 
 // MARK: - bgaudio
 
+#if DEBUG
+
 /// Drive a software-path source through the full engine, then toggle the SW-path background-audio-only flag
 /// (the macOS stand-in for the iOS background lifecycle) and verify audio keeps advancing while video is
 /// dropped, then resumes on foreground return. Exercises the real runDemuxLoop background branch headless.
@@ -109,3 +111,17 @@ private func backgroundAudioTest(url: URL, fgSeconds: Double, bgSeconds: Double)
     }
     return 1
 }
+
+#else
+
+// The bgaudio harness drives the DEBUG-only engine test hooks
+// (setSoftwareBackgroundAudioOnlyForTesting / softwareVideoFramesEnqueuedForTesting),
+// which are compiled out of Release, so the harness itself is DEBUG-only. Keep a
+// stub so `main.swift`'s unconditional dispatch still links in Release builds.
+func runBackgroundAudio(url: URL, fgSeconds: Double, bgSeconds: Double) -> Int32 {
+    print("aetherctl bgaudio is a DEBUG-only harness (it needs engine test hooks that are compiled out of Release).")
+    print("Rebuild in debug to use it: swift build --product aetherctl")
+    return 2
+}
+
+#endif
