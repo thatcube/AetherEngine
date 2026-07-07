@@ -1301,6 +1301,7 @@ public final class AetherEngine: ObservableObject {
         var detectedRate: Double? = nil
         var detectedDVProfile: Bool = false
         var detectedCodecID: AVCodecID = AV_CODEC_ID_NONE
+        var detectedFieldOrder: AVFieldOrder = AV_FIELD_UNKNOWN
         var probedAudioTracks: [TrackInfo] = []
         var probedSubtitleTracks: [TrackInfo] = []
         var probedDefaultAudioIndex: Int32 = -1
@@ -1345,6 +1346,7 @@ public final class AetherEngine: ObservableObject {
                 detectedDVProfile = (detectedFormat == .dolbyVision)
                 detectedDVProfileNum = Self.dvProfile(stream: stream)
                 detectedCodecID = stream.pointee.codecpar.pointee.codec_id
+                detectedFieldOrder = stream.pointee.codecpar.pointee.field_order
                 sourceVideoWidth = stream.pointee.codecpar.pointee.width
                 sourceVideoHeight = stream.pointee.codecpar.pointee.height
                 lastDetectedVideoCodec = detectedCodecID
@@ -1564,19 +1566,15 @@ public final class AetherEngine: ObservableObject {
         //    - VP9/VP8: AVPlayer's HLS manifest parser rejects vp09/vp8 CODECS attributes even when VT can
         //      HW-decode VP9 (verified via aetherctl: item.status never leaves .unknown).
         //    - MPEG-4 Part 2, MPEG-2, VC-1: not in the HLS Authoring Spec CODECS list; libavcodec handles all.
-        var useSoftwarePath: Bool
-        switch detectedCodecID {
-        case AV_CODEC_ID_AV1:
-            useSoftwarePath = !VTCapabilityProbe.av1Available
-        case AV_CODEC_ID_VP9,
-             AV_CODEC_ID_VP8,
-             AV_CODEC_ID_MPEG4,
-             AV_CODEC_ID_MPEG2VIDEO,
-             AV_CODEC_ID_VC1:
-            useSoftwarePath = true
-        default:
-            useSoftwarePath = false
-        }
+        // #107: interlaced H.264 joins MPEG-2/VC-1 on the software path so DeinterlaceFilter (bwdif)
+        // can deinterlace it; tvOS AVPlayer does not. Decision is pure and unit-tested in
+        // VideoRoutingPolicyTests. deint=interlaced passes progressive frames through untouched, so a
+        // mis-signalled progressive stream only pays an unnecessary SW decode, never a wrong deinterlace.
+        var useSoftwarePath = VideoRoutingPolicy.requiresSoftwarePath(
+            codecID: detectedCodecID,
+            fieldOrder: detectedFieldOrder,
+            av1Available: VTCapabilityProbe.av1Available
+        )
         // Forward-only custom sources can't serve the native path's seeks (cue prewarm, segment seeks).
         // Live custom sources are exempt: the live producer never seeks backward, scrub previews come from the
         // DVR segment cache, and audio-switch is already no-op for forward-only sources.
