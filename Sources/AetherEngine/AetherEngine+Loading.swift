@@ -459,6 +459,7 @@ extension AetherEngine {
             try checkLoadCurrent(generation)
         }
         self.nativeVideoSession = session
+        nativeSubtitleRenditionsServed = session.servingMasterPlaylist
         extractorYieldState.activate(session: session)
 
         // #15: the stores were created before start() (above) so the VideoSegmentProvider got the references at

@@ -288,6 +288,14 @@ public final class AetherEngine: ObservableObject {
     /// Use to gate the AVMediaSelection picker (PiP/AirPlay). Cleared by clearSubtitle and stopInternal.
     @Published public internal(set) var nativeSubtitleRenditionAvailable: Bool = false
 
+    /// True when the SERVED playlist is the master (so the master's SUBTITLES renditions reach an
+    /// external display), false when the media playlist is served (Sodalite#98 external-subtitle window).
+    /// Mirrors the inner session's `servingMasterPlaylist`; the "and renditions exist" refinement is
+    /// unnecessary because text subtitles on iOS always get renditions prepared, and bitmap subtitles on
+    /// an HDR external display stay a pre-existing limitation (unchanged). Goes false on a media fallback.
+    /// The host uses it to decide whether to draw its own subtitle window on a wired external display.
+    @Published public internal(set) var nativeSubtitleRenditionsServed: Bool = false
+
     /// Ordered native mov_text subtitle tracks for the session (#55). Populated from nativeSubtitleTrackTable
     /// when `LoadOptions.prepareNativeSubtitles` is set; empty otherwise. Cleared on stop/load.
     /// Hosts use this to populate a picker and call `setNativeSubtitleSelected(track:)`.
@@ -827,6 +835,7 @@ public final class AetherEngine: ObservableObject {
         }
         masterFallbackUsed = true
         session.markServingMediaAfterFallback()
+        nativeSubtitleRenditionsServed = false
         let position = lastNativeVideoStartPosition
         EngineLog.emit(
             "[AetherEngine] display rejected the master (code=\(rejection.code)); falling back to "
@@ -924,6 +933,7 @@ public final class AetherEngine: ObservableObject {
                 }
                 masterFallbackUsed = true
                 session.markServingMediaAfterFallback()
+                nativeSubtitleRenditionsServed = false
                 EngineLog.emit(
                     "[AetherEngine] #35 readiness gate: master never produced tracks after "
                     + "\(StartupReadinessGate.masterAttempts) attempts; falling back to the media "
@@ -2439,6 +2449,7 @@ public final class AetherEngine: ObservableObject {
         }
         nativeVideoSession?.stop()
         nativeVideoSession = nil
+        nativeSubtitleRenditionsServed = false
         extractorYieldState.deactivate()
         setPendingRecoverySeekTarget(nil)
 
