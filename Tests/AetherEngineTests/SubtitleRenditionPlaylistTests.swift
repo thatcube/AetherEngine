@@ -171,25 +171,16 @@ private final class ReducedMasterMockProvider: HLSSegmentProvider, @unchecked Se
 
 struct ReducedMasterPlaylistTests {
 
-    @Test("reducedSDR drops SUPPLEMENTAL, forces VIDEO-RANGE=SDR, keeps SUBTITLES + codecs")
-    func reducedSDR() {
-        let sdr = HLSLocalServer.buildMasterPlaylistText(provider: ReducedMasterMockProvider(), variant: .reducedSDR)
-        #expect(sdr.contains("VIDEO-RANGE=SDR"))
-        #expect(!sdr.contains("VIDEO-RANGE=PQ"))
-        #expect(!sdr.contains("SUPPLEMENTAL-CODECS"))
-        #expect(sdr.contains("CODECS=\"hvc1.2.4.L150,ec-3\""))
-        #expect(sdr.contains("#EXT-X-MEDIA:TYPE=SUBTITLES"))
-        #expect(sdr.contains("SUBTITLES=\"subs\""))
-        #expect(sdr.contains("media.m3u8"))
-    }
-
-    @Test("reducedHDR drops SUPPLEMENTAL, keeps the source range, keeps SUBTITLES")
+    @Test("reducedHDR drops SUPPLEMENTAL, keeps the source range + codecs, keeps SUBTITLES")
     func reducedHDR() {
         let hdr = HLSLocalServer.buildMasterPlaylistText(provider: ReducedMasterMockProvider(), variant: .reducedHDR)
         #expect(hdr.contains("VIDEO-RANGE=PQ"))
         #expect(!hdr.contains("VIDEO-RANGE=SDR"))
         #expect(!hdr.contains("SUPPLEMENTAL-CODECS"))
+        #expect(hdr.contains("CODECS=\"hvc1.2.4.L150,ec-3\""))
+        #expect(hdr.contains("#EXT-X-MEDIA:TYPE=SUBTITLES"))
         #expect(hdr.contains("SUBTITLES=\"subs\""))
+        #expect(hdr.contains("media.m3u8"))
     }
 
     @Test("primary keeps SUPPLEMENTAL and the source range")

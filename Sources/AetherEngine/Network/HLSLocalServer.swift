@@ -129,15 +129,13 @@ enum HLSVideoRange: String {
     case hlg = "HLG"
 }
 
-/// A served master's dynamic-range/DV form (#98 Stage 1.5). `.primary` is the DV/HDR master start()
-/// chose. The reduced forms drop SUPPLEMENTAL-CODECS (DV signaling) but keep the SUBTITLES renditions:
-/// `.reducedSDR` also forces VIDEO-RANGE=SDR (for an SDR external display that rejected the PQ/DV
-/// master), `.reducedHDR` keeps the source range (for the #35 cold-DV-start gate on an HDR TV, where
-/// forcing SDR would wash out HDR).
+/// A served master's DV form (#98). `.primary` is the DV/HDR master start() chose. `.reducedHDR` drops
+/// SUPPLEMENTAL-CODECS (DV signaling) but keeps the source range and the SUBTITLES renditions, for the
+/// #35 cold-DV-start gate on an HDR TV. (An SDR-forcing variant was tried and reverted: VIDEO-RANGE=SDR
+/// does not fool the external-display compatibility gate, so HDR/DV on an SDR display stays media-only.)
 enum MasterPlaylistVariant: Equatable {
     case primary
     case reducedHDR
-    case reducedSDR
 }
 
 // MARK: - Local HLS Server
@@ -173,16 +171,7 @@ final class HLSLocalServer: @unchecked Sendable {
         return URL(string: "http://127.0.0.1:\(port)/media.m3u8")
     }
 
-    /// SDR-signalled reduced master (#98 Stage 1.5): VIDEO-RANGE=SDR, no SUPPLEMENTAL-CODECS, subtitle
-    /// renditions kept, for the reactive fallback when an SDR external display rejects the PQ/DV master.
-    var sdrMasterPlaylistURL: URL? {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        guard port > 0, provider?.masterCodecs != nil else { return nil }
-        return URL(string: "http://127.0.0.1:\(port)/master_sdr.m3u8")
-    }
-
-    /// HDR-preserving reduced master (#98 Stage 1.5): source VIDEO-RANGE kept, no SUPPLEMENTAL-CODECS
+    /// HDR-preserving reduced master (#98): source VIDEO-RANGE kept, no SUPPLEMENTAL-CODECS
     /// (DV dropped), subtitle renditions kept, for the #35 cold-DV-start gate on an HDR TV.
     var reducedHDRMasterPlaylistURL: URL? {
         stateLock.lock()
@@ -601,12 +590,11 @@ final class HLSLocalServer: @unchecked Sendable {
             }
             return send404(fd: fd, path: normalizedPath, reason: "no masterCodecs")
 
-        case "/master_sdr.m3u8", "/master_hdr.m3u8":
-            // #98 Stage 1.5: reduced masters (DV signaling dropped, subtitle renditions kept) served as
-            // the reactive display-rejection fallback so subtitles survive on an SDR external display.
+        case "/master_hdr.m3u8":
+            // #98: HDR-preserving reduced master (DV signaling dropped, source range + subtitle
+            // renditions kept), served by the #35 cold-DV-start gate on an HDR TV.
             if provider?.masterCodecs != nil {
-                let variant: MasterPlaylistVariant = (normalizedPath == "/master_sdr.m3u8") ? .reducedSDR : .reducedHDR
-                let body = buildReducedMasterPlaylist(variant)
+                let body = buildReducedMasterPlaylist(.reducedHDR)
                 stateLock.lock()
                 let firstTime = !loggedReducedMasterPlaylist
                 if firstTime { loggedReducedMasterPlaylist = true }
@@ -1058,16 +1046,8 @@ final class HLSLocalServer: @unchecked Sendable {
         if let frameRate = provider.masterFrameRate {
             streamInfAttrs.append("FRAME-RATE=\(String(format: "%.3f", frameRate))")
         }
-        switch variant {
-        case .reducedSDR:
-            // An SDR external display rejects a PQ/DV master (-11868); advertising the same variant as
-            // SDR (segments still tone-map via their own colr atoms) lets it through while the SUBTITLES
-            // group below survives, unlike the bare media playlist.
-            streamInfAttrs.append("VIDEO-RANGE=SDR")
-        case .primary, .reducedHDR:
-            if let range = provider.masterVideoRange {
-                streamInfAttrs.append("VIDEO-RANGE=\(range.rawValue)")
-            }
+        if let range = provider.masterVideoRange {
+            streamInfAttrs.append("VIDEO-RANGE=\(range.rawValue)")
         }
         if let hdcp = provider.masterHDCPLevel {
             streamInfAttrs.append("HDCP-LEVEL=\(hdcp)")

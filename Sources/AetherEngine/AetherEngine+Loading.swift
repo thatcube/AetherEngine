@@ -703,13 +703,12 @@ extension AetherEngine {
             }
             .store(in: &nativeCancellables)
 
-        // #98: a display rejecting the served master fails the item at startup; reload the reduced
-        // master (subtitle renditions kept) then the media playlist, bounded single pass, in
-        // advanceDisplayRejectionFallback, instead of hard-failing.
+        // #98: a display rejecting the served master fails the item at startup; reload the media
+        // playlist in place instead of hard-failing. Gated + single-shot in fallBackToMediaPlaylist.
         host.$pendingDisplayRejection
             .compactMap { $0 }
             .sink { [weak self] rejection in
-                Task { @MainActor [weak self] in self?.advanceDisplayRejectionFallback(rejection) }
+                Task { @MainActor [weak self] in self?.fallBackToMediaPlaylist(rejection) }
             }
             .store(in: &nativeCancellables)
 
