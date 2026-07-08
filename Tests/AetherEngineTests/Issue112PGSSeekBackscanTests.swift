@@ -2,69 +2,50 @@ import Foundation
 import Testing
 @testable import AetherEngine
 
-/// #112 (ijuniorfu): after a fast-forward / audio-track switch into the middle of a PGS (Blu-ray) line,
-/// the overlay showed nothing for "ten or several tens of seconds". PGS is stateful and sparse: a line's
-/// composition (object def) can precede the seek target by tens of seconds, so the fixed -2 s lead-in
-/// landed after it and the active line never reconstructed. The reader now scans backward in growing
-/// steps until a probe decode confirms the line active at the target (`.covered`) or that the screen is
-/// genuinely empty there (`.empty`, a real dialogue gap that must NOT trigger further back-scanning);
-/// only when nothing is decoded at/before the target (`.notFound`) does it seek further back.
+/// #112 (ijuniorfu): after a fast-forward / audio-track switch into the middle of a PGS (Blu-ray) line, the
+/// overlay showed nothing for "ten or several tens of seconds". PGS is stateful and sparse: a line's composition
+/// (object def) can precede the seek target by tens of seconds, so the fixed -2 s lead-in landed after it and the
+/// active line never reconstructed.
 ///
-/// These cover the pure coverage decision: given the ordered decoded events (time + whether the event
-/// carries cues vs a PGS clear), what is the screen state at `target`.
+/// The first attempt scanned backward in geometric probe steps with a throwaway decoder. On a remote MPEG-TS
+/// Blu-ray that regressed into "no subtitles at all": a disc has no index and `discardAllStreamsExcept` drops
+/// packets only after they are read off the wire, so each backward probe re-downloaded its whole look-back span.
+/// Into a subtitle-sparse region every probe missed, the scan ran to the 60 s cap (~114 s of disc re-read,
+/// un-cancellable), and the reader was superseded before it served a cue. The reader now seeks back once by a
+/// source-aware lead-in and reconstructs in a single forward pass; the #100 stale-arrival gate publishes the
+/// composition whose window covers the playhead. Indexed containers (MP4/MKV) fast-walk their sample index
+/// between the sparse packets so they get the full window; disc sources are capped tight so a remote ISO is not
+/// re-downloaded.
 struct Issue112PGSSeekBackscanTests {
 
-    @Test("a line whose composition precedes the target is covered")
-    func activeLineIsCovered() {
-        // Composition at 580 s, still up at the 585 s seek target (PGS end is open until the next composition).
-        #expect(AetherEngine.evaluateBitmapSubtitleProbe(
-            eventTimes: [(time: 580.0, hasCues: true)], target: 585.0) == .covered)
+    @Test("an indexed container reconstructs across the full look-back window")
+    func indexedSourceUsesFullWindow() {
+        // MP4/MKV fast-walk their in-memory sample index between the sparse subtitle packets with almost no I/O,
+        // so the lead-in can span tens of seconds to recover a long-lived line.
+        #expect(AetherEngine.bitmapSubtitleReconstructLeadIn(isDiscSource: false) == 60.0)
     }
 
-    @Test("a clear event before the target is a genuine gap, not a miss")
-    func clearedBeforeTargetIsEmpty() {
-        // Line at 580, cleared at 583, target 585: the screen is empty at target. Must NOT scan further back.
-        #expect(AetherEngine.evaluateBitmapSubtitleProbe(
-            eventTimes: [(time: 580.0, hasCues: true), (time: 583.0, hasCues: false)],
-            target: 585.0) == .empty)
+    @Test("a disc source caps the look-back so a remote MPEG-TS is not re-downloaded")
+    func discSourceCapsLookBack() {
+        let disc = AetherEngine.bitmapSubtitleReconstructLeadIn(isDiscSource: true)
+        let indexed = AetherEngine.bitmapSubtitleReconstructLeadIn(isDiscSource: false)
+        // Still reconstructs a recently-composed line (a disc gets more than the bare -2 s text lead-in) ...
+        #expect(disc > 2.0)
+        // ... but far less than the indexed window: this is the #112 regression fix. A concat MPEG-TS has no
+        // index, so every second of look-back re-downloads a second of the muxed program.
+        #expect(disc < indexed)
+        // Bounded so a single forward reconstruct read on a remote ISO stays cheap.
+        #expect(disc <= 30.0)
     }
 
-    @Test("the last composition at or before the target wins")
-    func lastCompositionWins() {
-        // Two compositions both precede the target; the later one is the active line.
-        #expect(AetherEngine.evaluateBitmapSubtitleProbe(
-            eventTimes: [(time: 580.0, hasCues: true), (time: 584.0, hasCues: true)],
-            target: 585.0) == .covered)
-        // A composition cleared then re-shown before the target: covered by the re-show.
-        #expect(AetherEngine.evaluateBitmapSubtitleProbe(
-            eventTimes: [(time: 580.0, hasCues: true), (time: 582.0, hasCues: false),
-                         (time: 584.0, hasCues: true)],
-            target: 585.0) == .covered)
-    }
-
-    @Test("nothing decoded at or before the target means seek further back")
-    func nothingBeforeTargetIsNotFound() {
-        // The seek landed after the active line's composition: the only event decoded starts after target.
-        #expect(AetherEngine.evaluateBitmapSubtitleProbe(
-            eventTimes: [(time: 590.0, hasCues: true)], target: 585.0) == .notFound)
-        // No events at all in the probed window.
-        #expect(AetherEngine.evaluateBitmapSubtitleProbe(
-            eventTimes: [], target: 585.0) == .notFound)
-    }
-
-    @Test("events after the target never override an earlier covered/empty state")
-    func eventsAfterTargetIgnored() {
-        // A future composition at 588 does not change that the 580 line is active at 585.
-        #expect(AetherEngine.evaluateBitmapSubtitleProbe(
-            eventTimes: [(time: 580.0, hasCues: true), (time: 588.0, hasCues: true)],
-            target: 585.0) == .covered)
-    }
-
-    @Test("the back-scan step sequence grows geometrically and is capped")
-    func backscanDistanceSequenceIsCapped() {
-        // 2, 6, 18, 54, then the cap itself (60), then stop: five probes worst case.
-        #expect(AetherEngine.bitmapBackscanDistances(cap: 60.0) == [2.0, 6.0, 18.0, 54.0, 60.0])
-        // A smaller cap truncates and still ends exactly on the cap.
-        #expect(AetherEngine.bitmapBackscanDistances(cap: 20.0) == [2.0, 6.0, 18.0, 20.0])
+    @Test("the lead-in is a fixed, positive per-source constant")
+    func leadInIsStableAndPositive() {
+        // Deterministic (the seek target must not drift between reader restarts on the same source).
+        #expect(AetherEngine.bitmapSubtitleReconstructLeadIn(isDiscSource: true)
+                == AetherEngine.bitmapSubtitleReconstructLeadIn(isDiscSource: true))
+        #expect(AetherEngine.bitmapSubtitleReconstructLeadIn(isDiscSource: false)
+                == AetherEngine.bitmapSubtitleReconstructLeadIn(isDiscSource: false))
+        #expect(AetherEngine.bitmapSubtitleReconstructLeadIn(isDiscSource: true) > 0)
+        #expect(AetherEngine.bitmapSubtitleReconstructLeadIn(isDiscSource: false) > 0)
     }
 }
