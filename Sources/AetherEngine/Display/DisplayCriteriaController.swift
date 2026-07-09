@@ -97,7 +97,10 @@ final class DisplayCriteriaController {
         #endif
     }
 
-    /// Block until the panel finishes its HDR mode negotiation, or up to ~5s.
+    /// Block until the panel finishes its HDR mode negotiation, or up to a bounded cap
+    /// (~1000ms start phase + ~2000ms settle phase). Only called when an HDR/DV switch is
+    /// actually expected — the caller gates on apply()'s isHDR return so SDR/rate-only
+    /// loads and non-HDR panels never enter here.
     ///
     /// Two-stage poll: (1) start phase 1000ms/10ms ticks -- the HDMI handshake initiates asynchronously after the preferredDisplayCriteria write, so isDisplayModeSwitchInProgress can be false for a beat (old single-check guard let asset.load race on DV8.1 -> AVPlayer -11848). AVKit-sole-writer path also fires later, so 1000ms gives headroom. Early-return if EDR headroom is already > 1.001 (panel already in HDR). (2) settle phase 50 x 100ms; sanity-checks headroom after the switch clears.
     func waitForSwitch() async {
@@ -105,6 +108,12 @@ final class DisplayCriteriaController {
         guard let window = resolveWindow() else { return }
         let displayManager = window.avDisplayManager
         let screen = window.screen
+
+        // Panel HDR *capability* (potentialEDRHeadroom) vs current output (currentEDRHeadroom).
+        // On a genuinely non-HDR panel potentialEDR stays ~1.0; on an HDR/DV panel it reads
+        // > 1.0 even while currently displaying SDR. Logged so the non-DV path is verifiable
+        // on-device before we gate on capability.
+        EngineLog.emit("[DisplayCriteria] waitForSwitch entry: currentEDR=\(String(format: "%.2f", screen.currentEDRHeadroom)) potentialEDR=\(String(format: "%.2f", screen.potentialEDRHeadroom))", category: .engine)
 
         // Fast exit: panel already in HDR (headroom already raised, e.g. a prior HDR/DV session).
         if screen.currentEDRHeadroom > 1.001 {

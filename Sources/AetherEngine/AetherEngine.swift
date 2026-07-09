@@ -1282,6 +1282,16 @@ public final class AetherEngine: ObservableObject {
         }
 
         // 2. Display-criteria handshake. Use effective format so a non-DV panel isn't asked to switch to dvh1.
+        //
+        // `needsDisplaySettle` gates the pre-play waitForSwitch (below). Only HDR/DV
+        // content that will actually trigger a panel mode switch needs the settle wait.
+        // SDR content, rate-only switches, and Match-Content-off never raise EDR
+        // headroom, so blocking on them just burned the ~1000ms Stage-1 budget for
+        // nothing — e.g. every SDR load, or a non-DV panel asked to play HDR (the switch
+        // never starts, so Stage 1 polls the full 1000ms before giving up). apply()
+        // already folds in isDisplayCriteriaMatchingEnabled + window + tvOS17 and returns
+        // isHDR, so its return is the correct gate.
+        var needsDisplaySettle = false
         if !options.suppressDisplayCriteria {
             let codecTag: FourCharCode? = detectedDVProfile ? 0x64766831 : nil
             // Write the criteria to START the panel switch, but do NOT block here.
@@ -1291,12 +1301,17 @@ public final class AetherEngine: ObservableObject {
             // settle is unobservable (EDR headroom stays 1.0, isDisplayModeSwitchInProgress
             // can stick true), BOTH waits ran their full timeout (~10s to first frame).
             // One gated wait, before play(), is sufficient.
-            _ = displayCriteria.apply(
+            needsDisplaySettle = displayCriteria.apply(
                 format: effectiveFormat,
                 frameRate: snappedRate,
                 codecTag: codecTag,
                 omitColorExtensions: options.omitCriteriaColorExtensions
             )
+        } else {
+            // AVKit-sole-writer path: AVKit fires preferredDisplayCriteria from the live
+            // AVPlayerItem formatDescription instead of the engine. Still settle for HDR
+            // content when Match Content is on; SDR / Match-off never switches, so skip.
+            needsDisplaySettle = (effectiveFormat != .sdr) && options.matchContentEnabled
         }
         ttff("display1")
 
@@ -1453,7 +1468,14 @@ public final class AetherEngine: ObservableObject {
                 // via private CoreMedia hooks). waitForSwitch Stage 1 gives AVKit time to fire that write;
                 // Stage 2 waits for the panel to settle so the first frame doesn't hit a mid-transition panel.
                 // Critical for DV P5 (no HDR10 base, requires immediate DV mode).
-                await displayCriteria.waitForSwitch()
+                // Only wait when an HDR/DV mode switch is actually expected — SDR/rate-only
+                // loads and non-DV panels never raise EDR headroom, so gating here avoids the
+                // ~1000ms Stage-1 poll on content that will never switch.
+                if needsDisplaySettle {
+                    await displayCriteria.waitForSwitch()
+                } else {
+                    EngineLog.emit("[DisplayCriteria] settle skipped (SDR/rate-only or Match Content off — no HDR mode switch expected)", category: .engine)
+                }
                 try checkLoadCurrent(gen)
                 // automaticallyWaitsToMinimizeStalling=true (default) handles play-before-ready.
                 nativeHost?.play()
