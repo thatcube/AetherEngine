@@ -83,7 +83,11 @@ extension AetherEngine {
         }
     }
 
-    /// Activate an embedded subtitle stream via a side Demuxer. Side demuxer is used because the main HLS pump races ~60-80 s ahead mid-playback and discards the subtitle packets; seeking the side demuxer to the playhead is cheaper than re-reading the main pump. Re-seeks on `engine.seek`. Supports text codecs (SubRip / ASS / SSA / WebVTT / mov_text) and bitmap codecs (PGS / DVB / DVD / XSUB).
+    /// Activate an embedded subtitle stream. #112 rework: the producer pump keeps every embedded
+    /// subtitle stream and harvests its packets into the session's SubtitlePacketStore; a
+    /// playhead-paced drainer decodes the selected stream into the overlay. No side demuxer,
+    /// no second connection, selection is instant and rides seeks/restarts with the producer.
+    /// Supports text codecs (SubRip / ASS / SSA / WebVTT / mov_text) and bitmap codecs (PGS / DVB / DVD / XSUB).
     public func selectSubtitleTrack(index: Int) {
         hostExplicitSubtitleAction = true
         selectSubtitleTrack(index: index, startAt: sourceTime)
@@ -99,7 +103,7 @@ extension AetherEngine {
             return
         }
         guard index < Self.externalSubtitleTrackIDBase else { return }  // unknown external id: no-op
-        guard let url = loadedURL else { return }
+        guard loadedURL != nil else { return }
 
         // #77: in-band CEA-608/708 is fed by the always-on producer CC tap (set up at load), not a side
         // demuxer. Selecting it just makes it the active track and mirrors the tap's cue snapshot. Tear down
@@ -109,6 +113,7 @@ extension AetherEngine {
            Self.isEmbeddedClosedCaptionCodec(codec) {
             cancelSidecarTask()
             cancelEmbeddedSubtitleReader()
+            clearSubtitleDrainTarget(channel: .primary)   // #112 rework: CC is tap-fed, not drained
             isSubtitleActive = true
             activeEmbeddedSubtitleStreamIndex = Int32(index)
             activeSubtitleTrackIndex = index
@@ -117,47 +122,28 @@ extension AetherEngine {
             return
         }
 
-        // Sodalite#32 Phase 2: text track covered by the producer's pump tap: the overlay is fed from
-        // the tap (backfill the already-harvested produced region now, live events forwarded by
-        // onSubtitleTapEvent). No side demuxer, so enabling subtitles over a remote source is instant.
+        // #112 rework: every embedded track (text and bitmap, VOD and live) is served by the
+        // playhead-paced drainer from the session's packet store. The producer keeps all subtitle
+        // streams from init, so selection needs no side demuxer, no positioning, and no recovery:
+        // the immediate drainer tick backfills the window around the playhead synchronously.
         subtitleTapOverlayStreamIndex = nil
-        if !isLive, let session = nativeVideoSession, session.subtitleTapCoversStream(Int32(index)) {
-            cancelSidecarTask()
-            cancelEmbeddedSubtitleReader()
-            isSubtitleActive = true
-            activeEmbeddedSubtitleStreamIndex = Int32(index)
-            activeSubtitleTrackIndex = index
-            subtitleTapOverlayStreamIndex = Int32(index)
-            subtitleCues = tapOverlayBackfill(streamIndex: Int32(index))
-            isLoadingSubtitles = false
-            EngineLog.emit(
-                "[AetherEngine] overlay fed by pump tap for stream=\(index) "
-                + "(backfilled \(subtitleCues.count) cues)",
-                category: .engine
-            )
-            return
-        }
-
-        // Custom sources: side demuxer needs an independent cursor; no-op if reader cannot clone.
-        var customClone: IOReader? = nil
-        if isCustomSource {
-            guard let clone = customReader?.makeIndependentReader() else { return }
-            customClone = clone
-        }
         cancelSidecarTask()
-
+        cancelEmbeddedSubtitleReader()
         isSubtitleActive = true
         subtitleCues = []
         pgsStaleArrivalGates[.primary]?.reset()   // #100
-        isLoadingSubtitles = true
         activeEmbeddedSubtitleStreamIndex = Int32(index)
         activeSubtitleTrackIndex = index
-
-        // The prior embedded reader (if any) is cancelled and fully drained inside startEmbeddedSubtitleTask,
-        // which then reuses the already-open side demuxer for this switch instead of re-opening it (#76 part 2).
-        // Native mov_text rendition (#55, all-tracks) is fed by the dedicated multi-decode reader at load; this inline path only drives subtitleCues for the host overlay.
-        // startAt is the unified source-PTS playhead; pre-fold AVPlayer clock would land playlistShiftSeconds early ("subs 3-5 s late" repro on Cars with ~3.92 s shift).
-        startEmbeddedSubtitleTask(url: url, reader: customClone, formatHint: customFormatHint, streamIndex: Int32(index), startAt: startAt)
+        subtitleDrainTargets[.primary] = Int32(index)
+        subtitleDrainDecoders[.primary] = nil
+        subtitleDrainCursors[.primary] = nil
+        startSubtitleDrainer()
+        isLoadingSubtitles = false
+        EngineLog.emit(
+            "[AetherEngine] overlay fed by packet-store drainer for stream=\(index) "
+            + "(backfilled \(subtitleCues.count) cues)",
+            category: .engine
+        )
     }
 
     /// Apply `LoadOptions.preferredSubtitleLanguages` at the end of a successful load: activate the best-ranked
@@ -201,6 +187,7 @@ extension AetherEngine {
         if let external = externalSubtitleRegistry[index] {
             cancelSidecarTask(channel: .secondary)
             cancelEmbeddedSubtitleReader(channel: .secondary)
+            clearSubtitleDrainTarget(channel: .secondary)   // #112 rework
             activeSecondaryEmbeddedSubtitleStreamIndex = -1
             activeSecondaryExternalSubtitleTrackID = index
             startSecondarySidecarDecode(url: external.url, httpHeaders: external.httpHeaders)
@@ -208,23 +195,21 @@ extension AetherEngine {
         }
         guard index < Self.externalSubtitleTrackIDBase else { return }
         activeSecondaryExternalSubtitleTrackID = nil
-        guard let url = loadedURL else { return }
-        var customClone: IOReader? = nil
-        if isCustomSource {
-            guard let clone = customReader?.makeIndependentReader() else { return }
-            customClone = clone
-        }
+        guard loadedURL != nil else { return }
         cancelSidecarTask(channel: .secondary)
+        cancelEmbeddedSubtitleReader(channel: .secondary)
 
+        // #112 rework: secondary embedded tracks ride the same packet-store drainer on their
+        // own channel; the immediate tick backfills synchronously.
         isSecondarySubtitleActive = true
         secondarySubtitleCues = []
         pgsStaleArrivalGates[.secondary]?.reset()   // #100
-        isLoadingSecondarySubtitles = true
         activeSecondaryEmbeddedSubtitleStreamIndex = Int32(index)
-
-        // Prior secondary reader is cancelled + drained inside startEmbeddedSubtitleTask, then its side demuxer
-        // is reused for this switch (#76 part 2).
-        startEmbeddedSubtitleTask(url: url, reader: customClone, formatHint: customFormatHint, streamIndex: Int32(index), startAt: startAt, channel: .secondary)
+        subtitleDrainTargets[.secondary] = Int32(index)
+        subtitleDrainDecoders[.secondary] = nil
+        subtitleDrainCursors[.secondary] = nil
+        startSubtitleDrainer()
+        isLoadingSecondarySubtitles = false
     }
 
     /// Spawn the side-demuxer Task; cancellable at `cancel()`. Captures URL, stream index, start position, source video dims.
@@ -860,17 +845,6 @@ extension AetherEngine {
         return session.nativeSubtitleCueStoresForSession[ord].snapshotCues()
     }
 
-    /// Sodalite#32 Phase 2: forward the ACTIVE tap-overlay track's decoded events into the host overlay
-    /// (subtitleCues), replacing the side reader's publish path. Called at load, before start().
-    func armSubtitleTapOverlayForwarding(on session: HLSVideoEngine) {
-        session.onSubtitleTapEvent = { [weak self] streamIndex, event in
-            Task { @MainActor [weak self] in
-                guard let self, self.subtitleTapOverlayStreamIndex == streamIndex else { return }
-                self.applySubtitleEvent(event, channel: .primary)
-            }
-        }
-    }
-
     // MARK: - #112 rework: playhead-paced overlay drainer
 
     /// The active session's packet store (HLS producer tap today; the SW-host tap joins in
@@ -1161,6 +1135,7 @@ extension AetherEngine {
            store.isFinished, store.cueCount > 0 {
             cancelSidecarTask()
             cancelEmbeddedSubtitleReader()
+            clearSubtitleDrainTarget(channel: .primary)   // #112 rework
             activeEmbeddedSubtitleStreamIndex = -1
             subtitleTapOverlayStreamIndex = nil
             loadedSidecarURL = track.url
@@ -1237,6 +1212,7 @@ extension AetherEngine {
         cancelSidecarTask()
         // Sidecar replaces any active embedded stream.
         cancelEmbeddedSubtitleReader()
+        clearSubtitleDrainTarget(channel: .primary)   // #112 rework
         activeEmbeddedSubtitleStreamIndex = -1
         activeSubtitleTrackIndex = externalTrackID
         subtitleTapOverlayStreamIndex = nil
@@ -1286,6 +1262,7 @@ extension AetherEngine {
         hostExplicitSubtitleAction = true
         cancelSidecarTask(channel: .secondary)
         cancelEmbeddedSubtitleReader(channel: .secondary)
+        clearSubtitleDrainTarget(channel: .secondary)   // #112 rework
         activeSecondaryEmbeddedSubtitleStreamIndex = -1
         activeSecondaryExternalSubtitleTrackID = nil
         startSecondarySidecarDecode(url: url, httpHeaders: httpHeaders)
@@ -1327,6 +1304,7 @@ extension AetherEngine {
         hostExplicitSubtitleAction = true
         cancelSidecarTask()
         cancelEmbeddedSubtitleReader()
+        clearSubtitleDrainTarget(channel: .primary)   // #112 rework
         activeEmbeddedSubtitleStreamIndex = -1
         activeSubtitleTrackIndex = nil
         loadedSidecarURL = nil
@@ -1365,6 +1343,7 @@ extension AetherEngine {
         hostExplicitSubtitleAction = true
         cancelSidecarTask(channel: .secondary)
         cancelEmbeddedSubtitleReader(channel: .secondary)
+        clearSubtitleDrainTarget(channel: .secondary)   // #112 rework
         activeSecondaryEmbeddedSubtitleStreamIndex = -1
         activeSecondaryExternalSubtitleTrackID = nil
         loadedSecondarySidecarURL = nil

@@ -2612,6 +2612,8 @@ public final class AetherEngine: ObservableObject {
 
         cancelSidecarTask()
         cancelEmbeddedSubtitleReader()
+        stopSubtitleDrainer()                  // #112 rework: both channels
+        subtitleDrainTargets.removeAll()
         activeEmbeddedSubtitleStreamIndex = -1
         activeSubtitleTrackIndex = nil
         loadedSidecarURL = nil
