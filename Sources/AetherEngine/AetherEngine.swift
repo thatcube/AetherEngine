@@ -1284,23 +1284,19 @@ public final class AetherEngine: ObservableObject {
         // 2. Display-criteria handshake. Use effective format so a non-DV panel isn't asked to switch to dvh1.
         if !options.suppressDisplayCriteria {
             let codecTag: FourCharCode? = detectedDVProfile ? 0x64766831 : nil
-            let willSwitch = displayCriteria.apply(
+            // Write the criteria to START the panel switch, but do NOT block here.
+            // The remux (~130ms) overlaps the physical HDMI switch, and the pre-play
+            // waitForSwitch below gates the first frame on settle. Blocking here too
+            // double-counted the display handshake — for Dolby Vision, where the
+            // settle is unobservable (EDR headroom stays 1.0, isDisplayModeSwitchInProgress
+            // can stick true), BOTH waits ran their full timeout (~10s to first frame).
+            // One gated wait, before play(), is sufficient.
+            _ = displayCriteria.apply(
                 format: effectiveFormat,
                 frameRate: snappedRate,
                 codecTag: codecTag,
                 omitColorExtensions: options.omitCriteriaColorExtensions
             )
-            if willSwitch {
-                await displayCriteria.waitForSwitch()
-                // Superseded during panel handshake: close local probe and unwind.
-                if loadGeneration != gen {
-                    probe.markClosed()
-                    if probeOpened {
-                        Task.detached { [probe] in probe.close() }
-                    }
-                    try checkLoadCurrent(gen)
-                }
-            }
         }
         ttff("display1")
 
