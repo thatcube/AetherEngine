@@ -20,7 +20,6 @@ struct ExternalSubtitleSelectionTests {
         #expect(engine.isSubtitleActive)
         #expect(engine.activeSubtitleTrackIndex == info.id)
         #expect(engine.activeEmbeddedSubtitleStreamIndex == -1)
-        #expect(engine.subtitleTapOverlayStreamIndex == nil)
     }
 
     @Test("external selection works without a loaded URL (no loadedURL guard on the external path)")

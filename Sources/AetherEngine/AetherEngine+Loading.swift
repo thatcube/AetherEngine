@@ -255,9 +255,6 @@ extension AetherEngine {
                 // a debounced re-anchor once the restart run drains; it no-ops unless the retained store fails to
                 // cover the playhead. onSeekStateChanged is emitted only from the restart path, never for an ordinary
                 // in-budget seek, so this does not disturb the normal seek re-arm.
-                if !inFlight {
-                    self.scheduleEmbeddedSubtitleReanchor()
-                }
             }
         }
         session.onNetworkPhaseChanged = { [weak self] phase in

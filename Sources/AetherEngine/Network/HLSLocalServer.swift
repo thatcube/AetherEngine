@@ -1086,7 +1086,7 @@ final class HLSLocalServer: @unchecked Sendable {
     /// Windowed WebVTT subtitle media playlist (#15): MIRRORS the video media playlist one-for-one.
     ///
     /// The native subtitle path is embedded-only and its reader parks ~90s ahead of the playhead
-    /// (`embeddedSubtitleReadAheadSeconds`), filling the cue store incrementally; the store never holds the
+    /// (playhead-paced), filling the cue store incrementally; the store never holds the
     /// whole program at once. A single VOD .vtt fetched once would be truncated for embedded subs. Instead we
     /// emit ONE .vtt segment per video segment (same count, same per-segment EXTINF, same MEDIA-SEQUENCE,
     /// same PLAYLIST-TYPE/ENDLIST as the video) using the SAME `notePlaylistBuild()` snapshot so the two

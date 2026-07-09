@@ -178,10 +178,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Set before start() (AetherEngine+Loading).
     var preserveASSMarkupForSubtitleTap = false
 
-    /// Sodalite#32 Phase 2: decoded tap events, forwarded after the store append. AetherEngine routes
-    /// the ACTIVE track's events into the host overlay (subtitleCues), replacing the side reader.
-    var onSubtitleTapEvent: (@Sendable (Int32, EmbeddedSubtitleDecoder.SubtitleEvent) -> Void)?
-
     var subtitleTapActive: Bool {
         subtitleTapLock.lock(); defer { subtitleTapLock.unlock() }
         return !subtitleTapRoutes.isEmpty
@@ -293,7 +289,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
         if let event = route.decoder.decode(packet: packet, streamTimeBase: timeBase),
            !event.cues.isEmpty {
             route.store.appendCues(event.cues)
-            onSubtitleTapEvent?(streamIndex, event)
         }
     }
 
