@@ -871,6 +871,124 @@ extension AetherEngine {
         }
     }
 
+    // MARK: - #112 rework: playhead-paced overlay drainer
+
+    /// The active session's packet store (HLS producer tap today; the SW-host tap joins in
+    /// the same rework). nil when no session is loaded.
+    var activeSubtitlePacketStore: SubtitlePacketStore? {
+        nativeVideoSession?.subtitlePacketStore
+    }
+
+    /// Build a fresh overlay decoder for the stream on whichever host owns the session demuxer.
+    private func makeSubtitleDrainDecoder(streamIndex: Int32) -> EmbeddedSubtitleDecoder? {
+        nativeVideoSession?.makeOverlayDecoder(streamIndex: streamIndex)
+    }
+
+    /// Start (or keep) the 500ms drain loop. Performs an immediate tick so a fresh selection
+    /// backfills from the packet store synchronously, matching the #32 tap-overlay UX.
+    func startSubtitleDrainer() {
+        subtitleDrainTick()
+        guard subtitleDrainerTask == nil else { return }
+        subtitleDrainerTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: AetherEngine.subtitleDrainTickNanoseconds)
+                guard let self, !Task.isCancelled else { return }
+                self.subtitleDrainTick()
+            }
+        }
+    }
+
+    func stopSubtitleDrainer() {
+        subtitleDrainerTask?.cancel()
+        subtitleDrainerTask = nil
+        subtitleDrainDecoders.removeAll()
+        subtitleDrainCursors.removeAll()
+    }
+
+    /// Clear one channel's drain target; stops the loop when no channel remains active.
+    func clearSubtitleDrainTarget(channel: SubtitleChannel) {
+        subtitleDrainTargets[channel] = nil
+        subtitleDrainDecoders[channel] = nil
+        subtitleDrainCursors[channel] = nil
+        if subtitleDrainTargets.isEmpty { stopSubtitleDrainer() }
+    }
+
+    private func subtitleDrainTick() {
+        guard !subtitleDrainTargets.isEmpty, let store = activeSubtitlePacketStore else { return }
+        let playhead = sourceTime
+        for (channel, streamIndex) in subtitleDrainTargets {
+            let plan = SubtitleOverlayDrainer.drainPlan(
+                cursor: subtitleDrainCursors[channel],
+                playhead: playhead,
+                lead: Self.subtitleDrainLeadSeconds,
+                backscan: Self.subtitleDrainBackscanSeconds,
+                jumpThreshold: Self.subtitleDrainJumpThresholdSeconds)
+            let window: (from: Double, through: Double)
+            switch plan {
+            case .idle:
+                subtitleDrainCursors[channel]?.lastPlayhead = playhead
+                continue
+            case .decode(let from, let through):
+                window = (from, through)
+            case .resetAndDecode(let from, let through):
+                subtitleDrainDecoders[channel] = nil
+                window = (from, through)
+            }
+            if subtitleDrainDecoders[channel] == nil {
+                subtitleDrainDecoders[channel] = makeSubtitleDrainDecoder(streamIndex: streamIndex)
+            }
+            guard let decoder = subtitleDrainDecoders[channel] else { continue }
+            let entries = store.entries(streamIndex: streamIndex,
+                                        from: window.from, through: window.through)
+            // The cursor only advances to an actually-decoded packet's PTS: a window that is
+            // empty because the producer has not reached it yet must be rescanned next tick.
+            var lastDecoded = subtitleDrainCursors[channel]?.lastDecodedPts
+            for entry in entries {
+                if let event = Self.decodeStoredSubtitlePacket(entry, with: decoder),
+                   !event.cues.isEmpty {
+                    applySubtitleEvent(event, channel: channel)
+                }
+                lastDecoded = entry.ptsSeconds
+            }
+            if case .resetAndDecode = plan, entries.isEmpty {
+                // Fresh window with nothing stored yet: anchor just behind the window start so
+                // steady ticks rescan it without re-triggering the discontinuity path.
+                lastDecoded = window.from
+            }
+            subtitleDrainCursors[channel] = SubtitleDrainCursor(
+                lastDecodedPts: lastDecoded ?? window.from,
+                lastPlayhead: playhead)
+        }
+        store.prune(before: playhead - SubtitlePacketStore.retentionSeconds)
+    }
+
+    /// Rebuild an AVPacket from a stored entry and decode it. PTS/duration ride a 1/1000
+    /// time base carrying the harvested seconds; flags are restored for bitmap acquisition
+    /// points. Runs on the MainActor tick; subtitle decode is a parse plus, for bitmap, a
+    /// bounded blit, the same work the side reader did per packet.
+    nonisolated private static func decodeStoredSubtitlePacket(
+        _ entry: StoredSubtitlePacket,
+        with decoder: EmbeddedSubtitleDecoder
+    ) -> EmbeddedSubtitleDecoder.SubtitleEvent? {
+        let size = entry.payload.count
+        guard size > 0, let pkt = av_packet_alloc() else { return nil }
+        defer {
+            var p: UnsafeMutablePointer<AVPacket>? = pkt
+            av_packet_free(&p)
+        }
+        guard av_new_packet(pkt, Int32(size)) >= 0 else { return nil }
+        entry.payload.withUnsafeBytes { raw in
+            if let base = raw.baseAddress, let dst = pkt.pointee.data {
+                memcpy(dst, base, size)
+            }
+        }
+        pkt.pointee.pts = Int64((entry.ptsSeconds * 1000).rounded())
+        pkt.pointee.dts = pkt.pointee.pts
+        pkt.pointee.duration = Int64((entry.durationSeconds * 1000).rounded())
+        pkt.pointee.flags = entry.flags
+        return decoder.decode(packet: pkt, streamTimeBase: AVRational(num: 1, den: 1000))
+    }
+
     private func applySubtitleEvent(_ event: EmbeddedSubtitleDecoder.SubtitleEvent, channel: SubtitleChannel) {
         guard isSubtitleActive(for: channel) else { return }
 

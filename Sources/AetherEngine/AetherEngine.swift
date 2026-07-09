@@ -266,6 +266,19 @@ public final class AetherEngine: ObservableObject {
     /// side-reader starvation). Reset wherever the cue arrays reset (track switch, seek re-anchor,
     /// clear, load/stop) so a hold can never leak across subtitle sessions.
     var pgsStaleArrivalGates: [SubtitleChannel: PGSStaleArrivalGate] = [:]
+
+    /// #112 rework: per-channel embedded overlay targets served by the playhead-paced
+    /// drainer (SubtitleOverlayDrainer) from the session's SubtitlePacketStore. Replaces
+    /// the embedded side-demuxer reader for every host, VOD and live, text and bitmap.
+    var subtitleDrainTargets: [SubtitleChannel: Int32] = [:]
+    var subtitleDrainerTask: Task<Void, Never>?
+    var subtitleDrainDecoders: [SubtitleChannel: EmbeddedSubtitleDecoder] = [:]
+    var subtitleDrainCursors: [SubtitleChannel: SubtitleDrainCursor] = [:]
+    nonisolated static let subtitleDrainLeadSeconds: Double = 60
+    nonisolated static let subtitleDrainBackscanSeconds: Double = 15
+    nonisolated static let subtitleDrainJumpThresholdSeconds: Double = 2.5
+    nonisolated static let subtitleDrainTickNanoseconds: UInt64 = 500_000_000
+
     @Published public internal(set) var isLoadingSubtitles: Bool = false
     @Published public internal(set) var isSubtitleActive: Bool = false
     /// Active primary embedded subtitle stream index (matches TrackInfo.id), or nil when subtitles are off or
