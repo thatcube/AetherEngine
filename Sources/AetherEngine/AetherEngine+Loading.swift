@@ -368,9 +368,11 @@ extension AetherEngine {
         session.initialStartSeconds = startPosition
 
         // session.start() opens its own Demuxer + prewarm seek (~1-3 s on slow CDN); detach so @MainActor doesn't block.
+        ttff("preHLSstart")
         var playbackURL = try await Task.detached(priority: .userInitiated) { [session] in
             try session.start()
         }.value
+        ttff("HLSstarted")
         #if os(iOS)
         // AirPlay (#86): while external playback is active, serve the loopback over the device's LAN IP and
         // force the media playlist, so the receiver reaches the engine-processed stream (DV/Atmos/subtitles

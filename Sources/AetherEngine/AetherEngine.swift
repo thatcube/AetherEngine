@@ -397,6 +397,14 @@ public final class AetherEngine: ObservableObject {
     /// Programs AVDisplayManager.preferredDisplayCriteria from probed format + frame rate. No-op on iOS/macOS.
     let displayCriteria = DisplayCriteriaController()
 
+    /// Start of the current `load()` for [TTFF] phase instrumentation.
+    private var ttffStart: Date = .distantPast
+    /// Emit a time-to-first-frame phase boundary (ms since `load()` began) at
+    /// `.info`, so a host `EngineLog.handler` forwards it off-device.
+    func ttff(_ phase: String) {
+        EngineLog.emit("[TTFF] \(phase)=\(Int(Date().timeIntervalSince(ttffStart) * 1000))ms", category: .engine)
+    }
+
     /// Loopback HLS-fMP4 engine. Non-nil between load and stop.
     var nativeVideoSession: HLSVideoEngine?
     /// Thread-safe starvation inputs for session-coupled FrameExtractor yield closures
@@ -1068,10 +1076,7 @@ public final class AetherEngine: ObservableObject {
 
         // Time-to-first-frame phase instrumentation. Emitted at .info so a host
         // EngineLog.handler forwards each [TTFF] line off-device.
-        let ttffStart = Date()
-        func ttff(_ phase: String) {
-            EngineLog.emit("[TTFF] \(phase)=\(Int(Date().timeIntervalSince(ttffStart) * 1000))ms", category: .engine)
-        }
+        ttffStart = Date()
 
         // 1. Probe: detect format, frame rate, and track metadata.
         //    HLSVideoEngine re-opens internally; the double-open keeps the failure-mode matrix small.
