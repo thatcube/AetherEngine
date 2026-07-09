@@ -462,7 +462,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// #112 round 8: the resolved total byte size (Content-Length / Content-Range), nil until known.
     /// Read under winCond like every other fileSize access. Used by `Demuxer.seekByteEstimate` for the
     /// single-probe byte-position fallback when a timestamp seek on an index-less container times out.
-    var resolvedFileSize: Int64? {
+    var resolvedByteSize: Int64? {
         winCond.lock()
         defer { winCond.unlock() }
         return fileSize > 0 ? fileSize : nil

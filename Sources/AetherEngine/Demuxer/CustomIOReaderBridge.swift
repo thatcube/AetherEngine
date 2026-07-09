@@ -17,6 +17,30 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
 
     var cumulativeBytesFetched: Int64 { 0 }  // custom readers don't track network bytes
 
+    /// #112 round 9: same demux-thread-only contract as AVIOReader's deadline. Armed by
+    /// `Demuxer.seekBounded` around a positioning seek; `performRead` checks it between callbacks, so
+    /// an index-less remote disc's read_timestamp binary search aborts within one chunk fetch instead
+    /// of parking for minutes (ijuniorfu round 9, remote ISO: one seek sat wedged ~230 s).
+    private var readDeadline = Date.distantFuture
+    private var isPastReadDeadline: Bool { Date() >= readDeadline }
+    private(set) var readDeadlineFired = false
+
+    func beginReadDeadline(secondsFromNow seconds: TimeInterval) {
+        readDeadlineFired = false
+        readDeadline = Date(timeIntervalSinceNow: seconds)
+    }
+
+    func endReadDeadline() {
+        readDeadline = .distantFuture
+    }
+
+    /// #112 round 9: the byte axis libavformat sees through this bridge (for a disc adapter, the
+    /// virtual concat stream length via AVSEEK_SIZE), backing the byte-estimate seek fallback.
+    var resolvedByteSize: Int64? {
+        let size = reader.seek(offset: 0, whence: 65536)  // AVSEEK_SIZE: report length, don't move
+        return size > 0 ? size : nil
+    }
+
     init(reader: IOReader) {
         self.reader = reader
     }
@@ -68,9 +92,10 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
         // Bridge does NOT own the reader; engine/side-path owns lifetime.
     }
 
-    fileprivate func performRead(into buf: UnsafeMutablePointer<UInt8>, size: Int32) -> Int32 {
+    func performRead(into buf: UnsafeMutablePointer<UInt8>, size: Int32) -> Int32 {
         // -1 = forced abort (not EOF); mirrors AVIOReader.read so FFmpeg doesn't run EOS handling.
         guard !isClosed else { return -1 }
+        if isPastReadDeadline { readDeadlineFired = true; return -1 }
         let n = reader.read(buf, size: size)
         if n == 0 { return FFmpegErr.eof }  // IOReader uses 0 for EOF; avio expects AVERROR_EOF.
         return n

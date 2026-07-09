@@ -898,16 +898,18 @@ public final class Demuxer: @unchecked Sendable {
         accessLock.lock()
         defer { accessLock.unlock() }
         guard let ctx = formatContext else { return false }
-        let reader = avioProvider as? AVIOReader
-        reader?.beginReadDeadline(secondsFromNow: timeout)
-        defer { reader?.endReadDeadline() }
+        // #112 round 9: the deadline lives on the provider protocol. Casting to AVIOReader here left a
+        // disc-adapter source (CustomIOReaderBridge over HTTPDiscIOReader) unbounded: one positioning
+        // seek on a remote ISO sat wedged ~230 s and every later re-arm queued behind it.
+        avioProvider?.beginReadDeadline(secondsFromNow: timeout)
+        defer { avioProvider?.endReadDeadline() }
         let timestamp = Int64(seconds * Double(AV_TIME_BASE))
         let ret = avformat_seek_file(ctx, -1, Int64.min, timestamp, Int64.max, 0)
         avformat_flush(ctx)
         lastReadClipIdx = -1  // AE#105: post-seek reads may land mid-clip; require a fresh clean crossing
         // matroska may return success with a partial index after abort; deadline flag
         // is authoritative, not ret.
-        let capped = reader?.readDeadlineFired ?? false
+        let capped = avioProvider?.readDeadlineFired ?? false
         return ret >= 0 && !capped
     }
 
@@ -923,7 +925,7 @@ public final class Demuxer: @unchecked Sendable {
         accessLock.lock()
         defer { accessLock.unlock() }
         guard let ctx = formatContext,
-              let size = (avioProvider as? AVIOReader)?.resolvedFileSize,
+              let size = avioProvider?.resolvedByteSize,
               let byteTarget = Self.byteEstimateTarget(fileSize: size, duration: knownDuration, target: seconds)
         else { return false }
         let ret = avformat_seek_file(ctx, -1, Int64.min, byteTarget, Int64.max, AVSEEK_FLAG_BYTE)
@@ -947,12 +949,12 @@ public final class Demuxer: @unchecked Sendable {
     /// extraction so a disposable scrub thumbnail bounds its decode and never freezes
     /// the serial decode queue (issue #27). No-op for file:// / custom sources.
     func beginReadDeadline(secondsFromNow seconds: TimeInterval) {
-        (avioProvider as? AVIOReader)?.beginReadDeadline(secondsFromNow: seconds)
+        avioProvider?.beginReadDeadline(secondsFromNow: seconds)
     }
 
     /// Disarm the read deadline armed by `beginReadDeadline`.
     func endReadDeadline() {
-        (avioProvider as? AVIOReader)?.endReadDeadline()
+        avioProvider?.endReadDeadline()
     }
 
     /// Fast lock-free unblock: AVIO read callback returns -1, av_read_frame returns
