@@ -1,4 +1,6 @@
 import Foundation
+import Libavcodec
+import Libavutil
 
 /// #112 rework: session-lifetime retention of compressed subtitle packets harvested
 /// from the owning host's demux pump (HLSSegmentProducer or SoftwarePlaybackHost).
@@ -48,6 +50,22 @@ final class SubtitlePacketStore: @unchecked Sendable {
         }
         entriesByStream[streamIndex] = entries
         bytesByStream[streamIndex] = bytes
+    }
+
+    /// Shared pump-side harvest for both hosts: convert a raw AVPacket into a stored entry on
+    /// the source PTS axis (raw pts x time_base, matching what EmbeddedSubtitleDecoder computes
+    /// for tap packets; no start_time subtraction) and append it. Copies synchronously; the
+    /// packet pointer never escapes the calling thread.
+    func harvest(streamIndex: Int32, packet: UnsafeMutablePointer<AVPacket>, timeBase: AVRational) {
+        let pts = packet.pointee.pts
+        guard pts != Int64.min, let data = packet.pointee.data, packet.pointee.size > 0,
+              timeBase.den != 0 else { return }
+        let tbSeconds = Double(timeBase.num) / Double(timeBase.den)
+        append(streamIndex: streamIndex,
+               ptsSeconds: Double(pts) * tbSeconds,
+               durationSeconds: max(0, Double(packet.pointee.duration) * tbSeconds),
+               flags: packet.pointee.flags,
+               payload: Data(bytes: data, count: Int(packet.pointee.size)))
     }
 
     func entries(streamIndex: Int32, from: Double, through: Double) -> [StoredSubtitlePacket] {

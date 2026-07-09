@@ -272,6 +272,8 @@ public final class AetherEngine: ObservableObject {
     /// the embedded side-demuxer reader for every host, VOD and live, text and bitmap.
     var subtitleDrainTargets: [SubtitleChannel: Int32] = [:]
     var subtitleDrainerTask: Task<Void, Never>?
+    /// SW-host sessions have no HLSVideoEngine; their tap fills this store instead.
+    var softwareSubtitlePacketStore: SubtitlePacketStore?
     var subtitleDrainDecoders: [SubtitleChannel: EmbeddedSubtitleDecoder] = [:]
     var subtitleDrainCursors: [SubtitleChannel: SubtitleDrainCursor] = [:]
     nonisolated static let subtitleDrainLeadSeconds: Double = 60
@@ -2614,6 +2616,7 @@ public final class AetherEngine: ObservableObject {
         cancelEmbeddedSubtitleReader()
         stopSubtitleDrainer()                  // #112 rework: both channels
         subtitleDrainTargets.removeAll()
+        softwareSubtitlePacketStore = nil
         activeEmbeddedSubtitleStreamIndex = -1
         activeSubtitleTrackIndex = nil
         loadedSidecarURL = nil

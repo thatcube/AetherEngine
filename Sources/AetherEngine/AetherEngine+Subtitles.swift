@@ -847,15 +847,16 @@ extension AetherEngine {
 
     // MARK: - #112 rework: playhead-paced overlay drainer
 
-    /// The active session's packet store (HLS producer tap today; the SW-host tap joins in
-    /// the same rework). nil when no session is loaded.
+    /// The active session's packet store: the HLS producer tap or the SW-host tap.
+    /// nil when no session is loaded.
     var activeSubtitlePacketStore: SubtitlePacketStore? {
-        nativeVideoSession?.subtitlePacketStore
+        nativeVideoSession?.subtitlePacketStore ?? softwareSubtitlePacketStore
     }
 
     /// Build a fresh overlay decoder for the stream on whichever host owns the session demuxer.
     private func makeSubtitleDrainDecoder(streamIndex: Int32) -> EmbeddedSubtitleDecoder? {
         nativeVideoSession?.makeOverlayDecoder(streamIndex: streamIndex)
+            ?? softwareHost?.makeOverlayDecoder(streamIndex: streamIndex)
     }
 
     /// Start (or keep) the 500ms drain loop. Performs an immediate tick so a fresh selection

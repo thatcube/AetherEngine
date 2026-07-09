@@ -777,6 +777,14 @@ extension AetherEngine {
         }
         self.softwareHost = host
         applyDesiredVolume(to: host)
+        // #112 rework: SW-host subtitle tap feeds a session packet store; the shared
+        // playhead-paced drainer reads it exactly like the HLS session's store.
+        let packetStore = SubtitlePacketStore()
+        self.softwareSubtitlePacketStore = packetStore
+        host.preserveASSMarkupForSubtitleTap = loadedOptions.preserveASSMarkup
+        host.subtitleTapSink = { idx, pkt, tb in
+            packetStore.harvest(streamIndex: idx, packet: pkt, timeBase: tb)
+        }
         // SW path tracks source PTS directly; no AVPlayer-clock fold needed.
         self.playlistShiftSeconds = 0
         self.liveShiftSeams.removeAll()

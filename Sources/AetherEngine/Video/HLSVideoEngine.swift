@@ -276,21 +276,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
             }
         }
         // #112 rework: harvest every embedded subtitle stream's packets into the session
-        // store. Runs on the pump thread; the store is lock-guarded. PTS axis: identical
-        // conversion to what EmbeddedSubtitleDecoder applies to tap packets (raw pts x tb,
-        // absolute source PTS, no start_time subtraction).
+        // store. Runs on the pump thread; the store is lock-guarded.
         prod.subtitlePacketSink = { [subtitlePacketStore] idx, pkt, tb in
-            let pts = pkt.pointee.pts
-            guard pts != Int64.min, let data = pkt.pointee.data, pkt.pointee.size > 0,
-                  tb.den != 0 else { return }
-            let tbSeconds = Double(tb.num) / Double(tb.den)
-            subtitlePacketStore.append(
-                streamIndex: idx,
-                ptsSeconds: Double(pts) * tbSeconds,
-                durationSeconds: max(0, Double(pkt.pointee.duration) * tbSeconds),
-                flags: pkt.pointee.flags,
-                payload: Data(bytes: data, count: Int(pkt.pointee.size))
-            )
+            subtitlePacketStore.harvest(streamIndex: idx, packet: pkt, timeBase: tb)
         }
     }
 
