@@ -18,6 +18,17 @@ public enum SubtitleChannel: Sendable {
 private struct SideDemuxerAcquisition: Sendable {
     let demuxer: Demuxer
     let reused: Bool
+    /// #112 round 11: the source is in the engine's condemned-timestamp-seek registry; pre-latch the
+    /// demuxer so positioning skips straight to the byte estimate.
+    let timestampSeekCondemned: Bool
+}
+
+/// #112 round 11: who asked for this embedded reader start. Re-arm-origin starts (seek landing, wedge
+/// reconcile, producer-restart re-anchor) coalesce against an in-flight duplicate; an explicit user
+/// selection always starts.
+enum SubtitleStartOrigin: Sendable {
+    case explicitSelection
+    case rearm
 }
 
 extension AetherEngine {
@@ -217,7 +228,23 @@ extension AetherEngine {
     }
 
     /// Spawn the side-demuxer Task; cancellable at `cancel()`. Captures URL, stream index, start position, source video dims.
-    func startEmbeddedSubtitleTask(url: URL, reader: IOReader?, formatHint: String?, streamIndex: Int32, startAt: Double, channel: SubtitleChannel = .primary) {
+    func startEmbeddedSubtitleTask(url: URL, reader: IOReader?, formatHint: String?, streamIndex: Int32, startAt: Double, channel: SubtitleChannel = .primary, origin: SubtitleStartOrigin = .explicitSelection) {
+        // #112 round 11: one fast-forward fires both the debounced producer-restart re-anchor and the #65
+        // wedge-reconcile re-arm with the same anchor. The second start cancelled the first mid-positioning
+        // and paid the full drain budget for it (the first cannot observe its cancel inside a bounded seek),
+        // then sacrificed the warm side demuxer. A duplicate re-arm adds nothing (the in-flight start
+        // re-samples the live playhead after its open anyway), so it coalesces.
+        if origin == .rearm, let active = subtitleRearmDescriptors[channel],
+           Self.shouldCoalesceSubtitleRearm(
+               newStreamIndex: streamIndex, newStartAt: startAt,
+               activeStreamIndex: active.streamIndex, activeStartAt: active.startAt,
+               activeAgeSeconds: -active.spawnedAt.timeIntervalSinceNow) {
+            EngineLog.emit(
+                "[AetherEngine] embedded subtitle re-arm coalesced: stream=\(streamIndex) "
+                + "startAt=\(String(format: "%.2f", startAt))s duplicates the in-flight start",
+                category: .engine)
+            return
+        }
         let w = sourceVideoWidth > 0 ? sourceVideoWidth : 1920
         let h = sourceVideoHeight > 0 ? sourceVideoHeight : 1080
         let headers = loadedOptions.httpHeaders
@@ -231,6 +258,12 @@ extension AetherEngine {
         // Reuse only for URL sources: a custom source's cloned reader is single-cursor, so its side demuxer
         // can't be shared across switches (#76 part 2). nil key disables reuse for the custom path.
         let reuseKey = reader == nil ? subtitleSideDemuxerReuseKey(url: url, titleID: titleID) : nil
+        // #112 round 11: the condemned-timestamp-seek registry key is the same identity but applies to
+        // custom (disc-adapter) sources too, where reuse is disabled.
+        let condemnedKey = subtitleSideDemuxerReuseKey(url: url, titleID: titleID)
+        let rearmToken = UUID()
+        subtitleRearmDescriptors[channel] = SubtitleRearmDescriptor(
+            token: rearmToken, streamIndex: streamIndex, startAt: startAt, spawnedAt: Date())
         // Handoff: drain the predecessor before this reader touches the (possibly reused) side demuxer.
         // The side demuxer serializes reads internally, but the old loop seeking / reading after the new one
         // re-seeks would mis-order cues, so we wait for it to exit rather than markClosed it (markClosed is
@@ -246,6 +279,21 @@ extension AetherEngine {
         let prior: Task<Void, Never>? = (channel == .primary) ? embeddedSubtitleTask : secondaryEmbeddedSubtitleTask
         let task = Task.detached(priority: .userInitiated) { [weak self] () -> Void in
             prior?.cancel()
+            if prior != nil {
+                // #112 round 11: a predecessor wedged inside a bounded positioning seek cannot observe the
+                // cancel (blocking native call). Abort its in-flight read so it exits within one callback
+                // instead of riding out its budget; the demuxer survives warm and this reader clears the
+                // abort at acquisition. The 5 s drain below remains as the backstop only.
+                await MainActor.run { [weak self] in
+                    self?.subtitleSideDemuxer(for: channel)?.requestPositioningAbort()
+                }
+            }
+            defer {
+                Task { @MainActor [weak self] in
+                    guard let self, self.subtitleRearmDescriptors[channel]?.token == rearmToken else { return }
+                    self.subtitleRearmDescriptors[channel] = nil
+                }
+            }
             if let prior, await Self.awaitDrain(prior, timeoutNanos: Self.subtitleDrainBudgetNanos) == false {
                 EngineLog.emit(
                     "[AetherEngine] embedded subtitle predecessor drain timed out; abandoning its side demuxer",
@@ -269,7 +317,8 @@ extension AetherEngine {
                 headers: headers, streamIndex: streamIndex, startAt: startAt,
                 videoWidth: w, videoHeight: h, preserveASSMarkup: preserveASS,
                 callerProbesize: probesize, callerMaxAnalyzeDuration: maxAnalyzeDuration,
-                selectTitleID: titleID, channel: channel, reuseKey: reuseKey
+                selectTitleID: titleID, channel: channel, reuseKey: reuseKey,
+                condemnedKey: condemnedKey
             )
         }
         switch channel {
@@ -298,6 +347,38 @@ extension AetherEngine {
     /// A timestamp seek on an index-less remote MPEG-TS binary-searches via read_timestamp and can otherwise sit
     /// in starved range reads for minutes while the video pipeline owns the origin.
     nonisolated static let sideReaderSeekBudgetSeconds: TimeInterval = 8.0
+
+    /// #112 round 11: budget for one timestamp positioning seek when the byte-estimate fallback is viable.
+    /// On the reporter's remote ISO the read_timestamp binary search NEVER completes in time and every
+    /// recovery paid the full budget before estimating; a healthy indexed source completes well under this.
+    nonisolated static let sideReaderSeekBudgetWithEstimateSeconds: TimeInterval = 2.0
+
+    /// #112 round 11: pick the timestamp-seek attempt budget. With a viable byte estimate behind it the
+    /// attempt is a cheap probe (the estimate positions within a verified window anyway); without one the
+    /// timestamp seek is the only mechanism and keeps the full round-8 budget.
+    nonisolated static func positioningSeekBudget(estimateViable: Bool) -> TimeInterval {
+        estimateViable ? sideReaderSeekBudgetWithEstimateSeconds : sideReaderSeekBudgetSeconds
+    }
+
+    /// #112 round 11: anchors closer than this are the same recovery target (the duplicate re-arm pair
+    /// derives from one restart), farther apart is a genuinely new position.
+    nonisolated static let subtitleRearmCoalesceToleranceSeconds: Double = 0.5
+
+    /// #112 round 11: an in-flight start older than this no longer swallows re-arms (hung-task backstop,
+    /// mirrors the side reader's 30 s restart-settle cap).
+    nonisolated static let subtitleRearmCoalesceMaxAgeSeconds: Double = 30.0
+
+    /// #112 round 11: whether a re-arm duplicates the in-flight embedded reader start and should coalesce.
+    /// Only re-arm-origin starts consult this; an explicit user selection always re-arms.
+    nonisolated static func shouldCoalesceSubtitleRearm(
+        newStreamIndex: Int32, newStartAt: Double,
+        activeStreamIndex: Int32?, activeStartAt: Double?, activeAgeSeconds: Double?
+    ) -> Bool {
+        guard let activeStreamIndex, let activeStartAt, let activeAgeSeconds else { return false }
+        guard activeStreamIndex == newStreamIndex else { return false }
+        guard activeAgeSeconds >= 0, activeAgeSeconds < subtitleRearmCoalesceMaxAgeSeconds else { return false }
+        return abs(newStartAt - activeStartAt) <= subtitleRearmCoalesceToleranceSeconds
+    }
 
     /// #112 round 8: await `prior`'s completion for at most `timeoutNanos`. Returns true when it drained, false
     /// on timeout. `await prior.value` ignores cancellation, so the race is built from two unstructured tasks
@@ -386,7 +467,8 @@ extension AetherEngine {
         callerProbesize: Int64? = nil, callerMaxAnalyzeDuration: Int64? = nil,
         selectTitleID: Int? = nil,
         channel: SubtitleChannel = .primary,
-        reuseKey: String? = nil
+        reuseKey: String? = nil,
+        condemnedKey: String? = nil
     ) async {
         // #76: cap find_stream_info so a remote disc's sparse PGS tracks don't drag the open to the
         // full 50 MB budget (the reader would be superseded before it reads a packet).
@@ -400,10 +482,11 @@ extension AetherEngine {
         // predecessor reader has already drained (handoff), so nothing else is touching the demuxer.
         let acquired: SideDemuxerAcquisition? = await MainActor.run { [weak self] () -> SideDemuxerAcquisition? in
             guard !Task.isCancelled, let self else { return nil }
+            let condemned = condemnedKey.map { self.condemnedTimestampSeekSourceKeys.contains($0) } ?? false
             if reader == nil, let reuseKey,
                let retained = self.subtitleSideDemuxer(for: channel),
                self.subtitleSideDemuxerKey(for: channel) == reuseKey {
-                return SideDemuxerAcquisition(demuxer: retained, reused: true)
+                return SideDemuxerAcquisition(demuxer: retained, reused: true, timestampSeekCondemned: condemned)
             }
             // A demuxer retained for a different source/title (or a half-open one) is stale; the predecessor
             // has drained, so tear it down before replacing it. markClosed makes any AVIO-blocked read return.
@@ -414,7 +497,7 @@ extension AetherEngine {
             let fresh = Demuxer()
             self.setSubtitleSideDemuxer(fresh, for: channel)
             self.setSubtitleSideDemuxerKey(nil, for: channel)  // set after a successful open
-            return SideDemuxerAcquisition(demuxer: fresh, reused: false)
+            return SideDemuxerAcquisition(demuxer: fresh, reused: false, timestampSeekCondemned: condemned)
         }
         guard let acquired else {
             reader?.close()
@@ -422,6 +505,13 @@ extension AetherEngine {
         }
         let demuxer = acquired.demuxer
         let reused = acquired.reused
+        // #112 round 11: consume any abort this reader (or a superseded sibling) fired at the predecessor,
+        // and carry the engine-side unreliable latch onto this demuxer (a fresh one lost the demuxer-level
+        // flag with its abandoned predecessor; the audio-switch reload lost it with the whole session).
+        demuxer.clearPositioningAbort()
+        if acquired.timestampSeekCondemned {
+            demuxer.markTimestampSeekUnreliable()
+        }
 
         // Exit handler: keep the open demuxer for a superseding switch / seek to reuse (cancelled AND still the
         // slot's demuxer AND a reusable URL source). Otherwise (EOF / decoder error, or a teardown that cleared
@@ -504,14 +594,28 @@ extension AetherEngine {
         // estimate instead of paying the seek budget every time. The side demuxer's own duration is unset on
         // those sources ("no PTS found at end of file"), so the engine's display duration backs it up.
         let knownDuration = demuxer.duration > 0 ? demuxer.duration : engineDisplayDuration
+        // #112 round 11: with a viable byte estimate behind it, the timestamp-seek attempt is capped tight;
+        // on the reporter's remote ISO the read_timestamp binary search never completed in budget and every
+        // recovery paid the full 8 s before estimating anyway.
+        let timestampSeekBudget = AetherEngine.positioningSeekBudget(
+            estimateViable: demuxer.canByteEstimate(knownDuration: knownDuration))
         func positionSeek(_ target: Double) {
             let timestampSeekWorked: Bool
             if demuxer.timestampSeekUnreliable {
                 timestampSeekWorked = false
             } else {
                 timestampSeekWorked = demuxer.seekBounded(
-                    to: target, timeout: AetherEngine.sideReaderSeekBudgetSeconds)
-                if !timestampSeekWorked { demuxer.markTimestampSeekUnreliable() }
+                    to: target, timeout: timestampSeekBudget)
+                if !timestampSeekWorked {
+                    demuxer.markTimestampSeekUnreliable()
+                    // Engine-side latch (#112 round 11): survives demuxer abandonment and the
+                    // audio-switch reload, so every later side demuxer on this source skips the budget.
+                    if let condemnedKey {
+                        Task { @MainActor [weak self] in
+                            self?.condemnedTimestampSeekSourceKeys.insert(condemnedKey)
+                        }
+                    }
+                }
             }
             if !timestampSeekWorked {
                 let fellBack = demuxer.seekByteEstimate(

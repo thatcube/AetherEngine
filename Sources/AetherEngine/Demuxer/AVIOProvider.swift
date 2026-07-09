@@ -29,6 +29,17 @@ protocol AVIOProvider: AnyObject {
     /// Disarm the deadline armed by `beginReadDeadline`.
     func endReadDeadline()
 
+    /// #112 round 11: reversible cross-thread read abort. A successor side reader calls this so a
+    /// predecessor wedged inside a bounded positioning seek returns at the next read-callback boundary
+    /// (latching `readDeadlineFired`) instead of riding out its budget, WITHOUT killing the provider the
+    /// way `markClosed` does: the demuxer stays warm and reusable. One-shot; survives a
+    /// `beginReadDeadline` re-arm (so it wins the disarm/re-arm race) and is cleared explicitly by the
+    /// successor at acquisition via `clearReadAbort`.
+    func requestReadAbort()
+
+    /// Clear a pending `requestReadAbort` so the caller's own positioning reads run normally.
+    func clearReadAbort()
+
     /// True when a read aborted because the deadline passed. Authoritative over the seek's return
     /// value: matroska can report success on a partial index after an abort.
     var readDeadlineFired: Bool { get }

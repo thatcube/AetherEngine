@@ -496,6 +496,32 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         readDeadline = .distantFuture
     }
 
+    /// #112 round 11: reversible cross-thread read abort (benign-race plain Bool, same discipline as the
+    /// bridge's `isClosed`). A successor side reader sets it so a predecessor wedged inside a bounded
+    /// positioning seek returns at the next check point instead of riding out its budget; unlike
+    /// `markClosed` the reader stays usable, so the successor reuses the warm demuxer. Deliberately NOT
+    /// cleared by `beginReadDeadline` (the abort must win a disarm/re-arm race); the successor clears it
+    /// at acquisition.
+    private var readAbortRequested = false
+
+    func requestReadAbort() {
+        readAbortRequested = true
+        // Same wake set as markClosed, minus the destructive parts: nudge parked waits so the abort is
+        // observed within one poll/loop iteration instead of a full stall window.
+        prefetchReady.signal()
+        streamDataReady.signal()
+        winCond.lock()
+        winCond.broadcast()
+        winCond.unlock()
+    }
+
+    func clearReadAbort() {
+        readAbortRequested = false
+    }
+
+    /// Deadline expired or an abort was requested; both latch `readDeadlineFired` at the check sites.
+    private var readDeadlinePassedOrAborted: Bool { isPastReadDeadline || readAbortRequested }
+
     // Streaming task/session held so teardown can cancel and unblock streamDownloadSync.
     private var streamingSession: URLSession?
     private var streamingTask: URLSessionDataTask?
@@ -593,7 +619,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     fileprivate func read(into buf: UnsafeMutablePointer<UInt8>, size: Int32) -> Int32 {
         guard !isClosed else { return -1 }
-        if isPastReadDeadline { readDeadlineFired = true; return -1 }
+        if readDeadlinePassedOrAborted { readDeadlineFired = true; return -1 }
         // Check usePersistentReader before isStreaming: live feeds without
         // Content-Length must use the reconnect-capable persistent path.
         let n: Int32
@@ -615,7 +641,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // fetches so it cannot park the decode queue (issue #27). Mirrors the
             // checks readPersistent already does at its loop head.
             if isClosed { return totalRead > 0 ? Int32(totalRead) : -1 }
-            if isPastReadDeadline { readDeadlineFired = true; return totalRead > 0 ? Int32(totalRead) : -1 }
+            if readDeadlinePassedOrAborted { readDeadlineFired = true; return totalRead > 0 ? Int32(totalRead) : -1 }
 
             bufferLock.lock()
             let bufEnd = currentOffset + Int64(currentBuffer.count)
@@ -683,8 +709,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 guard let data = fetchChunk(from: position, size: fetchSize), !data.isEmpty else {
                     // An aborted fetch (supersede/close/deadline) must report a read
                     // error, not EOF (which would truncate the stream cleanly). issue #27.
-                    if isClosed || isPastReadDeadline {
-                        if isPastReadDeadline { readDeadlineFired = true }
+                    if isClosed || readDeadlinePassedOrAborted {
+                        if readDeadlinePassedOrAborted { readDeadlineFired = true }
                         return totalRead > 0 ? Int32(totalRead) : -1
                     }
                     // nil = transport failure; empty = 2xx with no body (would loop forever otherwise).
@@ -814,7 +840,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         while totalRead < requestSize {
             diag.recordIteration()
             if isClosed { return totalRead > 0 ? Int32(totalRead) : -1 }
-            if isPastReadDeadline { readDeadlineFired = true; return totalRead > 0 ? Int32(totalRead) : -1 }
+            if readDeadlinePassedOrAborted { readDeadlineFired = true; return totalRead > 0 ? Int32(totalRead) : -1 }
 
             // #93/#96 residual: time the loop-head lock acquisition. A delegate thread holding winCond
             // across its copy + backpressure window blocks the read HERE with nothing to show for it, so
@@ -881,7 +907,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         // before falling through to the rescue reconnect that serves in ~30-190ms.
                         diag.recordDetourFetchAttempt(ms: msSince(detourStart))
                         if isClosed { return totalRead > 0 ? Int32(totalRead) : -1 }
-                        if isPastReadDeadline { readDeadlineFired = true; return totalRead > 0 ? Int32(totalRead) : -1 }
+                        if readDeadlinePassedOrAborted { readDeadlineFired = true; return totalRead > 0 ? Int32(totalRead) : -1 }
                         // Hard transport failure: degrade to the OLD single-reconnect behavior.
                         timedReconnect(seek: true, at: curPosition)
                         continue
@@ -1666,7 +1692,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // open returns at once (issue #27). Playback keeps its 25s ceiling.
         let probeBudget = min(25, chunkRequestTimeout)
         if Self.awaitSignal(semaphore, budget: probeBudget, pollInterval: 0.1,
-                            shouldAbort: { [weak self] in self?.isClosed == true }) != .signaled {
+                            shouldAbort: { [weak self] in
+                                self?.isClosed == true || self?.readAbortRequested == true
+                            }) != .signaled {
             task.cancel()
             EngineLog.emit("[AVIOReader] Range probe timed out, trying HEAD", category: .demux, level: .verbose)
             return nil
@@ -1817,7 +1845,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // read aborts within ~100ms instead of riding the full budget (issue #27).
         let outcome = Self.awaitSignal(
             semaphore, budget: budget, pollInterval: 0.1,
-            shouldAbort: { [weak self] in self?.isClosed == true || self?.isPastReadDeadline == true }
+            shouldAbort: { [weak self] in self?.isClosed == true || self?.readDeadlinePassedOrAborted == true }
         )
         guard outcome == .signaled else {
             task.cancel()

@@ -34,6 +34,22 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
         readDeadline = .distantFuture
     }
 
+    /// #112 round 11: reversible cross-thread read abort (benign-race plain Bool, same discipline as
+    /// `isClosed`). A successor side reader sets it so a predecessor wedged inside a bounded positioning
+    /// seek returns at the next callback instead of riding out its budget; unlike `markClosed` the bridge
+    /// stays usable, so the successor reuses the warm demuxer. Deliberately NOT cleared by
+    /// `beginReadDeadline`: a predecessor that disarmed seek A and arms seek B before observing the abort
+    /// must still abort. The successor clears it at acquisition.
+    private var readAbortRequested = false
+
+    func requestReadAbort() {
+        readAbortRequested = true
+    }
+
+    func clearReadAbort() {
+        readAbortRequested = false
+    }
+
     /// #112 round 9: the byte axis libavformat sees through this bridge (for a disc adapter, the
     /// virtual concat stream length via AVSEEK_SIZE), backing the byte-estimate seek fallback.
     var resolvedByteSize: Int64? {
@@ -95,7 +111,7 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
     func performRead(into buf: UnsafeMutablePointer<UInt8>, size: Int32) -> Int32 {
         // -1 = forced abort (not EOF); mirrors AVIOReader.read so FFmpeg doesn't run EOS handling.
         guard !isClosed else { return -1 }
-        if isPastReadDeadline { readDeadlineFired = true; return -1 }
+        if isPastReadDeadline || readAbortRequested { readDeadlineFired = true; return -1 }
         let n = reader.read(buf, size: size)
         if n == 0 { return FFmpegErr.eof }  // IOReader uses 0 for EOF; avio expects AVERROR_EOF.
         return n

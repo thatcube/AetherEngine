@@ -626,6 +626,24 @@ public final class AetherEngine: ObservableObject {
     /// Active embedded subtitle stream index, or -1. Used by seek to decide whether to re-arm the side demuxer.
     var activeEmbeddedSubtitleStreamIndex: Int32 = -1
 
+    /// #112 round 11: per-channel descriptor of the in-flight embedded reader start, so a duplicate
+    /// re-arm for the same stream and anchor (the debounced producer-restart re-anchor and the #65
+    /// wedge-reconcile both fire for one fast-forward) coalesces instead of cancelling a healthy start
+    /// mid-positioning. Cleared by the task itself on completion (token-guarded against supersede).
+    struct SubtitleRearmDescriptor {
+        let token: UUID
+        let streamIndex: Int32
+        let startAt: Double
+        let spawnedAt: Date
+    }
+    var subtitleRearmDescriptors: [SubtitleChannel: SubtitleRearmDescriptor] = [:]
+
+    /// #112 round 11: sources ("url#titleID") on which a timestamp positioning seek has timed out or
+    /// failed. Demuxer-level `timestampSeekUnreliable` dies with an abandoned demuxer and does not
+    /// survive the audio-switch reload; this registry does, so every later side demuxer on the same
+    /// source is pre-latched and skips straight to the byte estimate. Cleared on `stop()`.
+    var condemnedTimestampSeekSourceKeys: Set<String> = []
+
     /// #95 audio tap lifecycle owner; nil when no tap installed. Torn down by stopInternal.
     var audioTapController: AudioTapController?
 
@@ -1346,6 +1364,8 @@ public final class AetherEngine: ObservableObject {
         subtitleTracks = []
         externalSubtitleRegistry = [:]
         nextExternalSubtitleOrdinal = 0
+        condemnedTimestampSeekSourceKeys = []
+        subtitleRearmDescriptors = [:]
         hostExplicitSubtitleAction = false
         activeSecondaryExternalSubtitleTrackID = nil
         externalNativeStoreFillTask?.cancel()
@@ -2121,10 +2141,10 @@ public final class AetherEngine: ObservableObject {
                 // Custom sources: clone the reader; skip re-arm if the reader can't produce a clone (forward-only).
                 if isCustomSource {
                     if let clone = customReader?.makeIndependentReader() {
-                        startEmbeddedSubtitleTask(url: url, reader: clone, formatHint: customFormatHint, streamIndex: streamIdx, startAt: anchorSourceTime)
+                        startEmbeddedSubtitleTask(url: url, reader: clone, formatHint: customFormatHint, streamIndex: streamIdx, startAt: anchorSourceTime, origin: .rearm)
                     }
                 } else {
-                    startEmbeddedSubtitleTask(url: url, reader: nil, formatHint: nil, streamIndex: streamIdx, startAt: anchorSourceTime)
+                    startEmbeddedSubtitleTask(url: url, reader: nil, formatHint: nil, streamIndex: streamIdx, startAt: anchorSourceTime, origin: .rearm)
                 }
             }
         }
@@ -2135,10 +2155,10 @@ public final class AetherEngine: ObservableObject {
             secondarySubtitleCues = []
             if isCustomSource {
                 if let clone = customReader?.makeIndependentReader() {
-                    startEmbeddedSubtitleTask(url: url, reader: clone, formatHint: customFormatHint, streamIndex: streamIdx, startAt: anchorSourceTime, channel: .secondary)
+                    startEmbeddedSubtitleTask(url: url, reader: clone, formatHint: customFormatHint, streamIndex: streamIdx, startAt: anchorSourceTime, channel: .secondary, origin: .rearm)
                 }
             } else {
-                startEmbeddedSubtitleTask(url: url, reader: nil, formatHint: nil, streamIndex: streamIdx, startAt: anchorSourceTime, channel: .secondary)
+                startEmbeddedSubtitleTask(url: url, reader: nil, formatHint: nil, streamIndex: streamIdx, startAt: anchorSourceTime, channel: .secondary, origin: .rearm)
             }
         }
     }
@@ -2178,6 +2198,8 @@ public final class AetherEngine: ObservableObject {
         subtitleTracks = []
         externalSubtitleRegistry = [:]
         nextExternalSubtitleOrdinal = 0
+        condemnedTimestampSeekSourceKeys = []
+        subtitleRearmDescriptors = [:]
         hostExplicitSubtitleAction = false
         activeSecondaryExternalSubtitleTrackID = nil
         externalNativeStoreFillTask?.cancel()
