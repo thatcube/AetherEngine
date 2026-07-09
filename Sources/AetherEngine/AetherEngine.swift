@@ -742,6 +742,11 @@ public final class AetherEngine: ObservableObject {
     /// re-anchor and the remembered rendition selection replays (its deselect/reselect busts
     /// AVKit's cached empty .vtt windows). Cancelled on load reset / stop; newer jumps supersede.
     var nativeSubtitleReanchorTask: Task<Void, Never>? = nil
+    /// #112: debounced re-anchor for the embedded (PGS/bitmap) side reader after a producer restart. A fast-forward
+    /// whose target is outside the producer's cache range restarts the producer instead of landing through seek(),
+    /// so the side reader is torn down and never re-armed (subtitles vanish until the next reload). This gives it
+    /// the same settle-then-recheck safety net the native mov_text path has. Cancelled on load reset / stop.
+    var embeddedSubtitleReanchorTask: Task<Void, Never>? = nil
     /// seekTo anchor of the currently running native subtitle readers; nil = no readers running.
     var nativeSubtitleReaderCoverageStart: Double?
     nonisolated static let subtitleReanchorJumpSeconds: Double = 60
@@ -1333,6 +1338,8 @@ public final class AetherEngine: ObservableObject {
         masterFallbackUsed = false
         nativeSubtitleReanchorTask?.cancel()
         nativeSubtitleReanchorTask = nil
+        embeddedSubtitleReanchorTask?.cancel()
+        embeddedSubtitleReanchorTask = nil
         setPendingRecoverySeekTarget(nil)
         nativeSubtitleTrackTable = []
         nativeSubtitleReapplyOrdinal = nil
@@ -2054,7 +2061,7 @@ public final class AetherEngine: ObservableObject {
     /// stale pre-wedge clock (device: up to a ~178 s cue hole). In-band CC and tap-fed overlay tracks ride
     /// the producer across the seek and only clear/backfill their on-screen cues; only the side-demuxer
     /// path actually re-seeks (reusing the open container per #76 part 2).
-    private func rearmEmbeddedSubtitleReaders(atSourceTime anchorSourceTime: Double) {
+    func rearmEmbeddedSubtitleReaders(atSourceTime anchorSourceTime: Double) {
         // #100: the playhead jumped; a held stale PGS arrival belongs to the old position.
         pgsStaleArrivalGates = [:]
 

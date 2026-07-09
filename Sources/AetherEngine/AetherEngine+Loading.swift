@@ -250,6 +250,14 @@ extension AetherEngine {
                     PresentationAxis.display(sourcePTS: $0 + self.playlistShiftSeconds, origin: self.sourcePresentationOrigin)
                 }
                 self.setNativeScrubSeek(inFlight: inFlight, target: target)
+                // #112: a producer restart settles here (out-of-range fetch on a fast-forward, or a wedge reconcile)
+                // without going through seek()'s landing, so the embedded PGS side reader is never re-armed. Give it
+                // a debounced re-anchor once the restart run drains; it no-ops unless the retained store fails to
+                // cover the playhead. onSeekStateChanged is emitted only from the restart path, never for an ordinary
+                // in-budget seek, so this does not disturb the normal seek re-arm.
+                if !inFlight {
+                    self.scheduleEmbeddedSubtitleReanchor()
+                }
             }
         }
         session.onNetworkPhaseChanged = { [weak self] phase in
@@ -982,14 +990,17 @@ extension AetherEngine {
         // subtitle re-arm so the line stays up while the re-armed reader re-primes forward (old path reconstructed
         // from scratch and the line vanished for the reconstruct duration).
         //
-        // #112 (audio-switch reanchor): capture the source-PTS playhead NOW, while the old producer's shift is still
-        // live. stopInternal below resets playlistShiftSeconds to 0, and on a disc the new producer publishes its
-        // shift asynchronously (the reload lands paused / waitingToPlay, so no clock tick has folded it back yet), so
-        // a sourceTime read during the re-arm has collapsed to the playlist axis (== resumeAt), ~shift seconds behind
-        // the true source PTS. Re-arming the PGS side demuxer there reconstructs ~shift seconds behind the line: it
-        // never covers the playhead (nothing shows) and crawls forward flooding stale open-ended cues that cycle on
-        // screen while paused. The switch does not move the playhead, so this pre-stop snapshot is the correct anchor.
-        let preSwitchSourceTime = sourceTime
+        // #112 (audio-switch reanchor): the re-arm anchor is the source PTS at the resume position, mapped the same
+        // way the seek landing maps its target (PresentationAxis.source). Do NOT read `clock.sourceTime` here: on the
+        // native path it is written only by the $renderedTime sink and discrete seek landings, never by the
+        // $currentTime tick (issue #49), so after a fast-forward that landed via a producer restart it stays pinned
+        // at the fast-forward's landing PTS while currentTime moves on. ijuniorfu's device log: switch at
+        // currentTime 1292.3 s (true source ~1304 s), but clock.sourceTime still 1211.7 s (the earlier FF landing),
+        // ~92 s behind, so the re-armed PGS reader anchored ~92 s back, reconstructed a region already passed
+        // (nothing showed) and flooded stale open-ended cues. resumeAt (== currentTime, or an explicit resume
+        // override) is fresh, so map it onto the source axis for the true playhead. The switch does not move the
+        // playhead, so this is the correct anchor for the reader re-arm and the preserved-cue snapshot.
+        let preSwitchSourceTime = PresentationAxis.source(displayTime: resumeAt, origin: sourcePresentationOrigin)
         let preservedActiveImageCues = Self.activeImageCues(in: subtitleCues, at: preSwitchSourceTime)
         let secondaryEmbeddedToResume: Int32 = activeSecondaryEmbeddedSubtitleStreamIndex
         let secondarySidecarToResume: URL? = isSecondarySubtitleActive && activeSecondaryEmbeddedSubtitleStreamIndex < 0

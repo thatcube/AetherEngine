@@ -376,7 +376,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     // resilience to all of those cases (issue #70 review #1/#3/#4).
                     tookFallback = true
                     EngineLog.emit("[AVIOReader] Data connection resolved no size, falling back to probe", category: .demux, level: .verbose)
-                    fileSize = probeFileSize()
+                    fileSize = resolveInitialFileSize()
                     if isStreaming {
                         startStreamingDownload()
                         _ = streamDataReady.wait(timeout: .now() + .seconds(15))
@@ -395,7 +395,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         } else {
             // Non-prefetch (still extraction / one-shot seekable): the size is needed up
             // front for SEEK_END and container index seeks, so keep the dedicated probe.
-            fileSize = probeFileSize()
+            fileSize = resolveInitialFileSize()
             if isStreaming {
                 startStreamingDownload()
                 _ = streamDataReady.wait(timeout: .now() + .seconds(15))
@@ -1334,6 +1334,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         if generation == connGeneration, !isLive, fileSize <= 0,
            let total = Self.sizeFromResponse(http, requestedOffset: requestedOffset) {
             fileSize = total
+            // #112: share this resolved length so a later side demuxer on the same origin can skip a probe that
+            // might be starved under this connection's load and would otherwise collapse it to forward-only.
+            SourceContentLengthCache.store(total, for: url)
             #if DEBUG
             EngineLog.emit("[AVIOReader] File size: \(total) bytes (data connection)", category: .demux)
             #endif
@@ -1593,6 +1596,25 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             return http.expectedContentLength
         }
         return nil
+    }
+
+    /// #112: resolve the source length for the open, preferring a live probe and falling back to a length another
+    /// demuxer already resolved for the same origin. A fresh probe here can be 429'd or answered without a length
+    /// while the video producer is hammering the origin, which would drop this reader to forward-only streaming so
+    /// every `avformat_seek_file` returns -1 and PGS reconstruction reads nothing. The producer's persistent open
+    /// caches the real length (SourceContentLengthCache.store at the data-connection response), so a starved probe
+    /// reuses it and stays byte-seekable. A successful probe also seeds the cache for whoever opens next.
+    private func resolveInitialFileSize() -> Int64 {
+        let probed = probeFileSize()
+        if probed > 0 {
+            SourceContentLengthCache.store(probed, for: url)
+            return probed
+        }
+        if let cached = SourceContentLengthCache.lookup(url), cached > 0 {
+            EngineLog.emit("[AVIOReader] size probe empty; reusing cached \(cached) bytes to keep seekability (#112)", category: .demux)
+            return cached
+        }
+        return probed
     }
 
     private func probeFileSize() -> Int64 {

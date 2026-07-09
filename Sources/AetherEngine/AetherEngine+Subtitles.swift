@@ -1394,6 +1394,48 @@ extension AetherEngine {
         }
     }
 
+    /// #112: whether the active embedded (side-reader) subtitle track is a bitmap codec (PGS / DVB / DVD / XSUB).
+    /// Only these use the seek-back reconstruction that a producer restart can strand; text tracks seek cleanly on
+    /// their indexed container and need no far-jump re-anchor.
+    private func activeEmbeddedSubtitleStreamIsBitmap() -> Bool {
+        let bitmapCodecs: Set<String> = ["hdmv_pgs_subtitle", "pgssub", "dvb_subtitle", "dvbsub", "dvd_subtitle", "dvdsub", "xsub"]
+        for idx in [activeEmbeddedSubtitleStreamIndex, activeSecondaryEmbeddedSubtitleStreamIndex] where idx >= 0 {
+            if let track = subtitleTracks.first(where: { $0.id == Int(idx) }),
+               bitmapCodecs.contains(track.codec.lowercased()) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// #112: debounced re-anchor for the embedded PGS/bitmap side reader after a producer restart.
+    ///
+    /// A fast-forward whose target is outside the producer's cache range restarts the producer (an out-of-range
+    /// segment fetch) instead of landing through `seek(to:)`, so `rearmEmbeddedSubtitleReaders` never runs: the side
+    /// reader is torn down and not replaced, and PGS subtitles vanish until the next reload (ijuniorfu:
+    /// "fast-forwarding... the subtitles aren't showing up"). This is the belt-and-suspenders the native mov_text
+    /// path already has (`scheduleNativeSubtitleReanchor`). Fires only from the producer-restart settle
+    /// (`onSeekStateChanged`, which is never emitted for an ordinary in-budget seek), so it does not double the
+    /// reconstruction on the common seek path. After the restart settles it re-arms the side reader at the true
+    /// playhead - unless the retained store already covers it (a healthy in-region restart), which it leaves alone.
+    func scheduleEmbeddedSubtitleReanchor() {
+        guard activeEmbeddedSubtitleStreamIsBitmap(), loadedURL != nil else { return }
+        embeddedSubtitleReanchorTask?.cancel()
+        embeddedSubtitleReanchorTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: AetherEngine.subtitleReanchorSettleNanos)
+            guard !Task.isCancelled, let self, self.activeEmbeddedSubtitleStreamIsBitmap() else { return }
+            // True source-PTS playhead: currentTime is kept fresh by the clock tick; clock.sourceTime is not (it
+            // only follows the $renderedTime sink, which a restart can leave pinned at the pre-restart landing).
+            let position = PresentationAxis.source(displayTime: self.currentTime, origin: self.sourcePresentationOrigin)
+            if self.retainedSubtitleSeekCoverage(target: position) { return }
+            EngineLog.emit(
+                "[AetherEngine] embedded subtitle reader re-anchoring after producer restart: playhead "
+                + "\(String(format: "%.2f", position))s not covered by the retained store",
+                category: .engine)
+            self.rearmEmbeddedSubtitleReaders(atSourceTime: position)
+        }
+    }
+
     /// Select or deselect the native mov_text track by ordinal (#55). nil deselects all. Matches by `extendedLanguageTag` first (language-rank-aware for same-language duplicates), falls back to positional index. No-op when no legible group or ordinal out of range.
     public func setNativeSubtitleSelected(track ordinal: Int?) {
         // Remembered before any guard: the #93 recovery reload replays the host's last request
