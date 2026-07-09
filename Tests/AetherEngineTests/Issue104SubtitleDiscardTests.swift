@@ -5,8 +5,9 @@ import Libavutil
 
 /// #104: the subtitle side demuxer must set `AVDISCARD_ALL` on video/audio so it does not pull the whole
 /// program byte-for-byte through a second connection just to reach the sparse mov_text samples (OOM on a
-/// file with many subtitle tracks, RSS growing with playback position). Both `runNativeSubtitleReaders`
-/// (native rendition) and `runEmbeddedSubtitleReader` (host overlay) rely on `discardAllStreamsExcept`.
+/// file with many subtitle tracks, RSS growing with playback position). `runNativeSubtitleReaders`
+/// (native rendition) relies on `discardAllStreamsExcept`; since the #112 rework the host overlay is
+/// fed by the producer's packet tap, whose keep-set union is covered below as well.
 ///
 /// This exercises the mechanism through the real FFmpeg mov demuxer: with the discard applied, mov skips
 /// `avio_seek`/`av_get_packet` for the discarded samples and never returns them (`mov_read_packet` line

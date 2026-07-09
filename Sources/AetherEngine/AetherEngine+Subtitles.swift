@@ -19,13 +19,6 @@ extension AetherEngine {
     // MARK: - Channel routing
 
 
-    func setLoadingSubtitles(_ value: Bool, for channel: SubtitleChannel) {
-        switch channel {
-        case .primary:   isLoadingSubtitles = value
-        case .secondary: isLoadingSecondarySubtitles = value
-        }
-    }
-
     func isSubtitleActive(for channel: SubtitleChannel) -> Bool {
         switch channel {
         case .primary:   return isSubtitleActive
@@ -736,7 +729,7 @@ extension AetherEngine {
         }
     }
 
-    /// Cancel the multi-decode reader + markClosed its side demuxer (mirrors `cancelEmbeddedSubtitleReader`).
+    /// Cancel the multi-decode reader + markClosed its side demuxer so a parked AVIO read cannot survive teardown.
     func cancelNativeSubtitleReaders() {
         nativeSubtitleReaderCoverageStart = nil
         nativeSubtitleReaderDeferralTask?.cancel()

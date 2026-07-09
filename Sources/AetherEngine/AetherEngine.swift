@@ -2014,13 +2014,9 @@ public final class AetherEngine: ObservableObject {
                         frozenPosition: avpReal, pendingSeekTarget: pendingRecoverySeekClockTarget,
                         currentRendered: avpReal)
                     reanchorProducerToPlaylistTime(recoveryAnchor)
-                    // #96: re-anchor the overlay subtitle readers at the SAME recovery target the producer
-                    // now aims at. This reconcile just snapped sourceTime to the frozen (stale-ahead) position,
-                    // and the normal-landing re-arm below is never reached (we return here), so without this the
-                    // reader stays pinned to the pre-wedge clock and never re-seeks, opening a (frozen - target)
-                    // -length cue hole (device: ~25 s / ~44 s / one ~178 s blackout). recoveryAnchor is
-                    // playlist-axis; the reader anchors in source-PTS (source = playlist + playlistShiftSeconds).
-                    // The reader's own effectiveSubtitleStart honours this anchor over the still-stale clock.
+                    // #96/#112 rework: the playhead jumped without a normal seek landing (we return
+                    // here), so reset the subtitle gates/CC tap now; the drainer's jump detection
+                    // re-decodes around the recovery target on its next tick.
                     reanchorSubtitleOverlays()
                     // pendingRecoverySeekClockTarget deliberately survives this reconcile: the UI
                     // clock gives up the phantom target, the recovery intent does not.
