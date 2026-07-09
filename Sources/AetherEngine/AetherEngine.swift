@@ -1066,6 +1066,13 @@ public final class AetherEngine: ObservableObject {
             return nil
         }
 
+        // Time-to-first-frame phase instrumentation. Emitted at .info so a host
+        // EngineLog.handler forwards each [TTFF] line off-device.
+        let ttffStart = Date()
+        func ttff(_ phase: String) {
+            EngineLog.emit("[TTFF] \(phase)=\(Int(Date().timeIntervalSince(ttffStart) * 1000))ms", category: .engine)
+        }
+
         // 1. Probe: detect format, frame rate, and track metadata.
         //    HLSVideoEngine re-opens internally; the double-open keeps the failure-mode matrix small.
         var detectedFormat: VideoFormat = .sdr
@@ -1105,6 +1112,7 @@ public final class AetherEngine: ObservableObject {
                 }
             }.value
             probeOpened = true
+            ttff("probe")
             let videoIdx = probe.videoStreamIndex
             if videoIdx >= 0, let stream = probe.stream(at: videoIdx) {
                 detectedFormat = Self.detectVideoFormat(stream: stream)
@@ -1289,6 +1297,7 @@ public final class AetherEngine: ObservableObject {
                 }
             }
         }
+        ttff("display1")
 
         // 2.5. Post-handshake panel-mode snapshot.
         //      tvOS exposes only one combined isDisplayCriteriaMatchingEnabled toggle; no API distinguishes
@@ -1448,6 +1457,7 @@ public final class AetherEngine: ObservableObject {
                 // automaticallyWaitsToMinimizeStalling=true (default) handles play-before-ready.
                 nativeHost?.play()
                 state = .playing
+                ttff("firstframe-total")
                 startMemoryProbe()
                 startLiveTelemetrySampler()
             }
