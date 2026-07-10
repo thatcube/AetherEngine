@@ -600,6 +600,27 @@ public final class Demuxer: @unchecked Sendable {
         return tracks
     }
 
+    /// #112: PGS subtitle streams whose display sets arrive split across PES packets and need
+    /// reassembly in the SubtitlePacketStore. Only the MPEG-TS demuxer splits them (Blu-ray
+    /// authoring: PCS|WDS|PDS|ODS|END as separate PES packets, some without a PTS); Matroska
+    /// carries one complete set per packet and must NOT be assembled (converters there strip
+    /// the trailing END, which the decoder's synthetic-END flush rescues per packet).
+    func splitDisplaySetSubtitleStreamIndices() -> Set<Int32> {
+        guard let ctx = formatContext,
+              let formatName = ctx.pointee.iformat?.pointee.name,
+              String(cString: formatName).split(separator: ",").contains("mpegts")
+        else { return [] }
+        var indices: Set<Int32> = []
+        for i in 0..<Int(ctx.pointee.nb_streams) {
+            guard let stream = ctx.pointee.streams[i],
+                  let codecpar = stream.pointee.codecpar,
+                  codecpar.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE,
+                  codecpar.pointee.codec_id == AV_CODEC_ID_HDMV_PGS_SUBTITLE else { continue }
+            indices.insert(Int32(i))
+        }
+        return indices
+    }
+
     func mediaMetadata() -> MediaMetadata {
         guard let ctx = formatContext else {
             return MediaMetadata(title: nil, artist: nil, album: nil, artworkData: nil)

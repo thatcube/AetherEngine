@@ -24,13 +24,32 @@ final class SubtitlePacketStore: @unchecked Sendable {
     /// re-fetched.
     static let perStreamByteCap: Int = 32 * 1024 * 1024
 
+    /// Ceiling for one in-assembly PGS display set (a 4K set stays far below this); a pending
+    /// buffer past it is malformed or mis-parsed and gets dropped rather than grown unbounded.
+    static let maxPendingDisplaySetBytes: Int = 16 * 1024 * 1024
+
+    /// One PGS display set being reassembled from split MPEG-TS PES chunks (see harvestChunk).
+    private struct PendingDisplaySet {
+        var ptsSeconds: Double
+        var durationSeconds: Double
+        var flags: Int32
+        var payload: Data
+    }
+
     private let lock = NSLock()
     private var entriesByStream: [Int32: [StoredSubtitlePacket]] = [:]
     private var bytesByStream: [Int32: Int] = [:]
+    private var pendingSetByStream: [Int32: PendingDisplaySet] = [:]
 
     func append(streamIndex: Int32, ptsSeconds: Double, durationSeconds: Double,
                 flags: Int32 = 0, payload: Data) {
         lock.lock(); defer { lock.unlock() }
+        appendLocked(streamIndex: streamIndex, ptsSeconds: ptsSeconds,
+                     durationSeconds: durationSeconds, flags: flags, payload: payload)
+    }
+
+    private func appendLocked(streamIndex: Int32, ptsSeconds: Double, durationSeconds: Double,
+                              flags: Int32, payload: Data) {
         var entries = entriesByStream[streamIndex] ?? []
         var bytes = bytesByStream[streamIndex] ?? 0
         let entry = StoredSubtitlePacket(ptsSeconds: ptsSeconds,
@@ -56,17 +75,116 @@ final class SubtitlePacketStore: @unchecked Sendable {
     /// the source PTS axis (raw pts x time_base, matching what EmbeddedSubtitleDecoder computes
     /// for tap packets; no start_time subtraction) and append it. Copies synchronously; the
     /// packet pointer never escapes the calling thread.
-    func harvest(streamIndex: Int32, packet: UnsafeMutablePointer<AVPacket>, timeBase: AVRational) {
+    ///
+    /// `assembleSplitDisplaySets` (PGS in MPEG-TS): one display set arrives as several PES
+    /// chunks (PCS|WDS|PDS|ODS|END), some without a PTS and some sharing one; per-packet
+    /// storage would drop or collapse the palette/object segments and every set would fail
+    /// with "Invalid palette id" at its END. Armed streams route through the reassembler.
+    func harvest(streamIndex: Int32, packet: UnsafeMutablePointer<AVPacket>, timeBase: AVRational,
+                 assembleSplitDisplaySets: Bool = false) {
         let pts = packet.pointee.pts
-        guard pts != Int64.min, let data = packet.pointee.data, packet.pointee.size > 0,
+        guard let data = packet.pointee.data, packet.pointee.size > 0,
               timeBase.den != 0 else { return }
         let tbSeconds = Double(timeBase.num) / Double(timeBase.den)
-        append(streamIndex: streamIndex,
-               ptsSeconds: Double(pts) * tbSeconds,
-               durationSeconds: max(0, Double(packet.pointee.duration) * tbSeconds),
-               flags: packet.pointee.flags,
-               payload: Data(bytes: data, count: Int(packet.pointee.size)))
+        harvestChunk(streamIndex: streamIndex,
+                     ptsSeconds: pts == Int64.min ? nil : Double(pts) * tbSeconds,
+                     durationSeconds: max(0, Double(packet.pointee.duration) * tbSeconds),
+                     flags: packet.pointee.flags,
+                     payload: Data(bytes: data, count: Int(packet.pointee.size)),
+                     assembleSplitDisplaySets: assembleSplitDisplaySets)
     }
+
+    /// Testable core of `harvest`. ptsSeconds nil = packet carried no PTS (AV_NOPTS_VALUE):
+    /// dropped on the per-packet path, folded into the pending set on the assembly path.
+    func harvestChunk(streamIndex: Int32, ptsSeconds: Double?, durationSeconds: Double,
+                      flags: Int32, payload: Data, assembleSplitDisplaySets: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        guard assembleSplitDisplaySets else {
+            guard let ptsSeconds else { return }
+            appendLocked(streamIndex: streamIndex, ptsSeconds: ptsSeconds,
+                         durationSeconds: durationSeconds, flags: flags, payload: payload)
+            return
+        }
+        // Mirror the decoder's SUP-wrapper rule: strip a leading "PG" 10-byte header so
+        // concatenated chunks form one clean [type][len BE][body] segment run.
+        var chunk = payload
+        if chunk.count > 10, chunk[chunk.startIndex] == 0x50, chunk[chunk.startIndex + 1] == 0x47 {
+            chunk = chunk.dropFirst(10)
+        }
+        while !chunk.isEmpty {
+            var pending = pendingSetByStream[streamIndex]
+            // A backward pts jump under an open set means the pump re-anchored mid-set;
+            // the stale partial buffer must not swallow the fresh set's segments.
+            if let pts = ptsSeconds, let open = pending, pts < open.ptsSeconds - 1.0 {
+                pending = nil
+            }
+            let firstType = Self.pgsFirstSegmentType(in: chunk)
+            if firstType == 0x16 {
+                // PCS opens a display set; an unfinished predecessor (missing END, or the
+                // restart overlap above) is undecodable on its own and gets dropped.
+                pending = nil
+                guard let pts = ptsSeconds else {
+                    pendingSetByStream[streamIndex] = nil
+                    return   // No anchor for this set; skip its chunks until the next PCS.
+                }
+                pending = PendingDisplaySet(ptsSeconds: pts, durationSeconds: durationSeconds,
+                                            flags: flags, payload: Data())
+            }
+            guard var open = pending else {
+                // Mid-set start (backfill landed between PCS and END): not decodable, drop.
+                pendingSetByStream[streamIndex] = nil
+                return
+            }
+            let endBoundary = Self.pgsEndBoundary(in: chunk)
+            let consumed: Data
+            if let endBoundary {
+                consumed = chunk.prefix(endBoundary)
+                chunk = chunk.dropFirst(endBoundary)
+            } else {
+                consumed = chunk
+                chunk = Data()
+            }
+            open.payload.append(consumed)
+            open.flags |= flags
+            if open.payload.count > Self.maxPendingDisplaySetBytes {
+                pendingSetByStream[streamIndex] = nil
+                return
+            }
+            if endBoundary != nil {
+                appendLocked(streamIndex: streamIndex, ptsSeconds: open.ptsSeconds,
+                             durationSeconds: open.durationSeconds, flags: open.flags,
+                             payload: open.payload)
+                pendingSetByStream[streamIndex] = nil
+            } else {
+                pendingSetByStream[streamIndex] = open
+            }
+        }
+    }
+
+    // MARK: - PGS segment walk (defensive, mirrors EmbeddedSubtitleDecoder's walks)
+
+    /// Type byte of the first segment, or nil when the chunk is too short.
+    static func pgsFirstSegmentType(in payload: Data) -> UInt8? {
+        payload.count >= 3 ? payload[payload.startIndex] : nil
+    }
+
+    /// Byte offset just past the first END (0x80) segment, or nil when the walk finds none.
+    /// Payload layout: a run of `[type:1][length:2 BE][body:length]`; a malformed length ends
+    /// the scan without reading past the chunk.
+    static func pgsEndBoundary(in payload: Data) -> Int? {
+        let bytes = [UInt8](payload)
+        var i = 0
+        while i + 3 <= bytes.count {
+            let type = bytes[i]
+            let len = (Int(bytes[i + 1]) << 8) | Int(bytes[i + 2])
+            let next = i + 3 + len
+            if type == 0x80 { return min(next, bytes.count) }
+            if next <= i { break }
+            i = next
+        }
+        return nil
+    }
+
 
     func entries(streamIndex: Int32, from: Double, through: Double) -> [StoredSubtitlePacket] {
         lock.lock(); defer { lock.unlock() }
@@ -94,5 +212,6 @@ final class SubtitlePacketStore: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         entriesByStream.removeAll()
         bytesByStream.removeAll()
+        pendingSetByStream.removeAll()
     }
 }

@@ -363,6 +363,9 @@ final class SoftwarePlaybackHost {
         }
         self.subtitleStreamIndices = subIndices
         self.subtitleStreamTimeBases = subTimeBases
+        // #112: split-PES PGS streams (MPEG-TS) need display-set reassembly in the packet
+        // store; the tap sink consults this per packet.
+        self.splitDisplaySetSubtitleStreamIndices = dem.splitDisplaySetSubtitleStreamIndices()
 
         // AudioOutput owns the AVSampleBufferRenderSynchronizer (master clock). Created unconditionally: video-only previously got no clock (frozen frame, currentTime=0). Layer attached in play() after the engine hangs it in the view hierarchy (attaching free-floating fails FigVideoQueueRemote -12080 on tvOS 26+).
         self.audioOutput = AudioOutput()
@@ -419,13 +422,17 @@ final class SoftwarePlaybackHost {
     /// #112 rework subtitle tap: the demux loop hands every embedded subtitle packet to this
     /// sink (nil = tap off), which copies the payload into the session's SubtitlePacketStore.
     /// Same unsynchronized-flag pattern as `audioTapSink`; the sink copies synchronously, so
-    /// the packet pointer never escapes the demux thread.
-    nonisolated(unsafe) var subtitleTapSink: (@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational) -> Void)?
+    /// the packet pointer never escapes the demux thread. The trailing Bool marks packets of
+    /// split-PES PGS streams (MPEG-TS) that need display-set reassembly in the store.
+    nonisolated(unsafe) var subtitleTapSink: (@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational, Bool) -> Void)?
 
     /// #112 rework: embedded subtitle stream indices + time bases, captured at load before the
     /// demux loop starts (the SW host applies no stream discard, so these packets already flow).
     private(set) var subtitleStreamIndices: Set<Int32> = []
     private(set) var subtitleStreamTimeBases: [Int32: AVRational] = [:]
+    /// #112: streams whose PGS display sets arrive split across PES packets (MPEG-TS) and need
+    /// reassembly in the packet store. Captured at load, read by the tap sink per packet.
+    private(set) var splitDisplaySetSubtitleStreamIndices: Set<Int32> = []
 
     /// Host's ASS markup preference for overlay decoders (mirrors the HLS session flag).
     var preserveASSMarkupForSubtitleTap = false
@@ -667,11 +674,12 @@ final class SoftwarePlaybackHost {
             self?.audioTapSink
         }
         // #112 rework: same late-install resolution for the subtitle tap.
-        let getSubtitleTapSink: @Sendable () -> ((@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational) -> Void)?) = { [weak self] in
+        let getSubtitleTapSink: @Sendable () -> ((@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational, Bool) -> Void)?) = { [weak self] in
             self?.subtitleTapSink
         }
         let subIndices = subtitleStreamIndices
         let subTimeBases = subtitleStreamTimeBases
+        let subSplitSetIndices = splitDisplaySetSubtitleStreamIndices
         let onError: @Sendable (String) -> Void = { [weak self] msg in
             Task { @MainActor [weak self] in self?.failureMessage = msg }
         }
@@ -783,6 +791,7 @@ final class SoftwarePlaybackHost {
                 audioTapSink: getAudioTapSink,
                 subtitleStreamIndices: subIndices,
                 subtitleTimeBases: subTimeBases,
+                splitDisplaySetSubtitleStreamIndices: subSplitSetIndices,
                 subtitleTapSink: getSubtitleTapSink
             )
         }
@@ -1070,7 +1079,8 @@ final class SoftwarePlaybackHost {
         audioTapSink: @Sendable () -> ((@Sendable (CMSampleBuffer) -> Void)?),
         subtitleStreamIndices: Set<Int32> = [],
         subtitleTimeBases: [Int32: AVRational] = [:],
-        subtitleTapSink: @Sendable () -> ((@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational) -> Void)?) = { nil }
+        splitDisplaySetSubtitleStreamIndices: Set<Int32> = [],
+        subtitleTapSink: @Sendable () -> ((@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational, Bool) -> Void)?) = { nil }
     ) {
         // Clock arming: one-shot latch (seekClock is not idempotent -- re-calling snaps clock back to initialClockTime). Shared with host so a seek before first audio isn't overridden by a late re-arm.
 
@@ -1276,7 +1286,8 @@ final class SoftwarePlaybackHost {
                 // into the session's SubtitlePacketStore). The SW host applies no stream discard,
                 // so these packets were already being read and dropped here.
                 sink(streamIdx, packet,
-                     subtitleTimeBases[streamIdx] ?? AVRational(num: 1, den: 1000))
+                     subtitleTimeBases[streamIdx] ?? AVRational(num: 1, den: 1000),
+                     splitDisplaySetSubtitleStreamIndices.contains(streamIdx))
             }
 
             av_packet_unref(packet)

@@ -272,9 +272,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
             }
         }
         // #112 rework: harvest every embedded subtitle stream's packets into the session
-        // store. Runs on the pump thread; the store is lock-guarded.
+        // store. Runs on the pump thread; the store is lock-guarded. Split-PES PGS streams
+        // (MPEG-TS) go through the store's display-set reassembly.
+        let assemblyIndices = demuxer?.splitDisplaySetSubtitleStreamIndices() ?? []
         prod.subtitlePacketSink = { [subtitlePacketStore] idx, pkt, tb in
-            subtitlePacketStore.harvest(streamIndex: idx, packet: pkt, timeBase: tb)
+            subtitlePacketStore.harvest(streamIndex: idx, packet: pkt, timeBase: tb,
+                                        assembleSplitDisplaySets: assemblyIndices.contains(idx))
         }
     }
 

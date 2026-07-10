@@ -779,8 +779,9 @@ extension AetherEngine {
         let packetStore = SubtitlePacketStore()
         self.softwareSubtitlePacketStore = packetStore
         host.preserveASSMarkupForSubtitleTap = loadedOptions.preserveASSMarkup
-        host.subtitleTapSink = { idx, pkt, tb in
-            packetStore.harvest(streamIndex: idx, packet: pkt, timeBase: tb)
+        host.subtitleTapSink = { idx, pkt, tb, assembleSplitSets in
+            packetStore.harvest(streamIndex: idx, packet: pkt, timeBase: tb,
+                                assembleSplitDisplaySets: assembleSplitSets)
         }
         // SW path tracks source PTS directly; no AVPlayer-clock fold needed.
         self.playlistShiftSeconds = 0
