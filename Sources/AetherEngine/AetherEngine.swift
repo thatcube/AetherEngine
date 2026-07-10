@@ -2424,8 +2424,9 @@ public final class AetherEngine: ObservableObject {
     ///   audio stream changing; keeping the criteria in place avoids
     ///   a redundant `apply` + `waitForSwitch` cycle that on some
     ///   panels (notably when paired with a Bluetooth A2DP audio route)
-    ///   never settles and times out at 5 s, adding ~12 s of black-
-    ///   screen latency per audio switch.
+    ///   never settles and burns the full settle timeout (~12 s of
+    ///   black-screen latency per audio switch on the old fixed 5 s
+    ///   poll; capped at ~2 s since #117, but still worth skipping).
     func stopInternal(resetDisplayCriteria: Bool = true, keepNativeHost: Bool = false, keepCustomReader: Bool = false) {
         // Bump generation to invalidate in-flight load() checkpoints.
         loadGeneration &+= 1
