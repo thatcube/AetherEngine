@@ -1765,12 +1765,23 @@ public final class AetherEngine: ObservableObject {
                 // demuxed-audio sources). Without this a post-load language check would reload the track already playing.
                 syncPublishedAudioStateFromNativeSession()
                 presentCurrentLayer()
-                // Gate play() on panel handshake. With appliesPreferredDisplayCriteriaAutomatically=true,
-                // AVKit drives the criteria write from the live AVPlayerItem's formatDescription (reads dvcC
-                // via private CoreMedia hooks). waitForSwitch Stage 1 gives AVKit time to fire that write;
-                // Stage 2 waits for the panel to settle so the first frame doesn't hit a mid-transition panel.
+                // Gate play() on the panel handshake — but only for the
+                // AVKit-sole-writer path. When the engine drives the criteria
+                // itself (!suppressDisplayCriteria) it ALREADY settled the panel in
+                // its pre-remux `waitForSwitch()` above (and read the settled HDR
+                // state for stream routing), so waiting again here just paid the
+                // settle a second time — on an unobservable DV panel that doubled
+                // the bounded cap (~2s -> ~4s to first frame). Under
+                // `appliesPreferredDisplayCriteriaAutomatically=true` AVKit drives
+                // the criteria write late from the live AVPlayerItem's
+                // formatDescription, so the engine skipped its pre-remux apply/wait
+                // (`suppressDisplayCriteria`); that path still needs the settle here.
+                // Stage 1 gives AVKit time to fire the write; Stage 2 waits for the
+                // panel so the first frame doesn't hit a mid-transition panel.
                 // Critical for DV P5 (no HDR10 base, requires immediate DV mode).
-                await displayCriteria.waitForSwitch()
+                if options.suppressDisplayCriteria {
+                    await displayCriteria.waitForSwitch()
+                }
                 try checkLoadCurrent(gen)
                 // automaticallyWaitsToMinimizeStalling=true (default) handles play-before-ready.
                 // #35: on a real SDR->HDR switch while serving a VOD master, drive the bounded

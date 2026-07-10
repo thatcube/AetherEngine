@@ -13,6 +13,7 @@ the public-API contract.
 ### Fixed
 
 - **Dolby Vision first frame no longer waits out a fixed 5 s poll.** `waitForSwitch()` polled `isDisplayModeSwitchInProgress` for a fixed 5 s and never watched the OS mode-switch notifications, so on panels where a DV switch is unobservable to the app — `currentEDRHeadroom` stays 1.0 and the in-progress flag never clears even though the panel visibly enters DV — it ran the full timeout every time. It now settles the instant the panel reports done (`AVDisplayManagerModeSwitchStart` / `End` notifications, or EDR headroom rising) and otherwise caps the wait at ~2 s. Measured DV first frame ~10 s → ~2 s on an unobservable panel; observable panels (HDR10 / HLG, or DV panels that post the notification) settle immediately. SDR / rate-only loads are unaffected — the wait already early-exits for them.
+- **`load()` no longer settles the display twice per DV load.** The engine-driven criteria path settled the panel pre-remux (and read the settled HDR state for stream routing), then `waitForSwitch()` ran again pre-play — paying the settle twice, which on an unobservable DV panel doubled the bounded cap. The pre-play settle is now gated on the AVKit-sole-writer path (`suppressDisplayCriteria`), where AVKit applies the criteria late and the pre-remux settle was skipped; the engine-driven path relies on the settle it already did. Halves the remaining DV first-frame wait on unobservable panels.
 
 ## [5.0.0] - 2026-07-09
 
