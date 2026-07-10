@@ -1666,6 +1666,13 @@ public final class AetherEngine: ObservableObject {
         // warming and the served master resolves 0 tracks / fails -11819; a warm start (no switch) keeps
         // the unchanged immediate-play path.
         var didSwitchPanel = false
+        // needsDisplaySettle gates the pre-play waitForSwitch() below. Only an HDR/DV load
+        // that actually triggers a panel mode switch needs the settle wait: SDR/rate-only
+        // loads (and any load with Match Content off) never raise EDR headroom, so the
+        // pre-play settle would just burn the ~1000ms Stage-1 poll waiting for a switch that
+        // never starts. apply()'s return already folds in isDisplayCriteriaMatchingEnabled +
+        // window + tvOS 17, so it is the correct gate. DV/HDR behavior is unchanged.
+        var needsDisplaySettle = false
         if !options.suppressDisplayCriteria {
             let codecTag: FourCharCode? = detectedDVProfile ? 0x64766831 : nil
             let willSwitch = displayCriteria.apply(
@@ -1676,6 +1683,7 @@ public final class AetherEngine: ObservableObject {
             )
             if willSwitch {
                 didSwitchPanel = true
+                needsDisplaySettle = true
                 await displayCriteria.waitForSwitch()
                 // Superseded during panel handshake: close local probe and unwind.
                 if loadGeneration != gen {
@@ -1686,6 +1694,12 @@ public final class AetherEngine: ObservableObject {
                     try checkLoadCurrent(gen)
                 }
             }
+        } else {
+            // AVKit-sole-writer path (suppressDisplayCriteria): AVKit fires
+            // preferredDisplayCriteria from the live AVPlayerItem formatDescription instead of
+            // the engine. Still settle for HDR content when Match Content is on; SDR / Match-off
+            // never switches, so skip the pre-play wait.
+            needsDisplaySettle = (effectiveFormat != .sdr) && options.matchContentEnabled
         }
 
         // 2.5. Post-handshake panel-mode snapshot.
@@ -1842,7 +1856,14 @@ public final class AetherEngine: ObservableObject {
                 // via private CoreMedia hooks). waitForSwitch Stage 1 gives AVKit time to fire that write;
                 // Stage 2 waits for the panel to settle so the first frame doesn't hit a mid-transition panel.
                 // Critical for DV P5 (no HDR10 base, requires immediate DV mode).
-                await displayCriteria.waitForSwitch()
+                // Gated: only wait when an HDR/DV mode switch is actually expected. SDR/rate-only
+                // loads and Match-Content-off never raise EDR headroom, so waiting here would just
+                // burn the ~1000ms Stage-1 poll on content that will never switch.
+                if needsDisplaySettle {
+                    await displayCriteria.waitForSwitch()
+                } else {
+                    EngineLog.emit("[DisplayCriteria] settle skipped (SDR/rate-only or Match Content off — no HDR mode switch expected)", category: .engine)
+                }
                 try checkLoadCurrent(gen)
                 // automaticallyWaitsToMinimizeStalling=true (default) handles play-before-ready.
                 // #35: on a real SDR->HDR switch while serving a VOD master, drive the bounded
@@ -2175,8 +2196,8 @@ public final class AetherEngine: ObservableObject {
         await seek(to: seconds)
     }
 
-    public func stop() {
-        stopInternal()
+    public func stop(resetDisplayCriteria: Bool = true) {
+        stopInternal(resetDisplayCriteria: resetDisplayCriteria)
         state = .idle
         clock.currentTime = 0
         clock.bufferedPosition = 0
