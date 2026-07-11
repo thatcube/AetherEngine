@@ -10,6 +10,14 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [5.0.2] - 2026-07-11
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.0.2))
+
+### Fixed
+
+- **Embedded SRT cues no longer duplicate after rapid seeking (#121).** The overlay drainer rebuilds the `EmbeddedSubtitleDecoder` on every seek (`.resetAndDecode`), which restarts its per-instance dedupe set and cue-id counter at zero. Because `subtitleCues` is intentionally retained across the seek, the backscan re-decoded cues still in the store, and the insert path only replaced same-start bitmap cues while always appending text cues, so identical lines accumulated (a report saw the count grow 4 to 7 to 11) and the reset decoder ids collided with retained ids (`ForEach(id:)` "occurs multiple times"). Both invariants now live at the retained-store insert funnel, which sees the whole session rather than one decoder generation: a text cue already present with the same start, end, and text is dropped (content, not id, so simultaneous distinct speaker lines and genuine repeats at new timestamps still insert), and every cue that lands is stamped with a session-monotonic id. Thanks to wunax for the source-level diagnosis and the exact repro.
+
 ## [5.0.1] - 2026-07-10
 
 ([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.0.1))
