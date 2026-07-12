@@ -579,6 +579,7 @@ final class NativeAVPlayerHost {
     // MARK: - Playback control
 
     var isEffectivelyPlaying: Bool { avPlayer.timeControlStatus != .paused }
+    var intendsToPlay: Bool { playIntent }
 
     /// End of the last seekable time range (seconds); tracks the live edge for EVENT playlists.
     var seekableEnd: Double {
