@@ -2087,50 +2087,50 @@ public final class AetherEngine: ObservableObject {
                 // Deadline expired. Only the surviving (winning) generation reconciles; a superseded seek
                 // returns at the guard below and lets the newer seek own the final state.
                 guard loadGeneration == gen, seekGeneration == seekGen else { return }
-                if let host = nativeHost,
-                   host.isEffectivelyPlaying, // #65: a paused seek lands while paused and is not a wedge; only reconcile a starved seek the player actually wants to play
-                   seekIsWedged(renderedTime: host.renderedTime, bufferedEnd: host.bufferedEnd) {
-                    // Genuine wedge: snap the clock back to AVPlayer's REAL rendered position (not the
-                    // unreachable optimistic target). The producer, unlike the clock, keeps aiming at
-                    // the TARGET (#93 retest): after a hard zero-tolerance seek AVPlayer only requests
-                    // media at the target, so a re-anchor on the frozen position would pull the producer
-                    // away from the window the seek's own restart just anchored (and its refill can
-                    // evict the target's segments from retention).
-                    let avpReal = host.renderedTime
-                    nativeClockSeconds = avpReal
-                    // currentTime on the 0-based display axis (AE#105 origin); sourceTime stays source PTS for subs.
-                    clock.currentTime = PresentationAxis.display(sourcePTS: avpReal + playlistShiftSeconds,
-                                                                 origin: sourcePresentationOrigin)
-                    clock.sourceTime = avpReal + playlistShiftSeconds
-                    setProgrammaticSeek(inFlight: false, target: nil)
-                    // Hand state to AVPlayer's ACTUAL transport status, not the phantom .playing the normal
-                    // finalize forces nor the stuck .seeking we entered with: the $timeControlStatus sink is
-                    // gated on state already being .playing/.paused, so leaving .seeking would latch it there
-                    // forever even after the producer re-anchor recovers playback.
-                    state = (host.timeControlStatus == .paused) ? .paused : .playing
-                    isBuffering = host.timeControlStatus == .waitingToPlayAtSpecifiedRate
-                    let recoveryAnchor = Self.recoveryAnchorPosition(
-                        frozenPosition: avpReal, pendingSeekTarget: pendingRecoverySeekClockTarget,
-                        currentRendered: avpReal)
-                    reanchorProducerToPlaylistTime(recoveryAnchor)
-                    // #96/#112 rework: the playhead jumped without a normal seek landing (we return
-                    // here), so reset the subtitle gates/CC tap now; the drainer's jump detection
-                    // re-decodes around the recovery target on its next tick.
-                    reanchorSubtitleOverlays()
-                    // pendingRecoverySeekClockTarget deliberately survives this reconcile: the UI
-                    // clock gives up the phantom target, the recovery intent does not.
+                guard let host = nativeHost else {
                     EngineLog.emit(
-                        "[AetherEngine] #65 seek did not land within \(Self.nativeSeekReconcileBudgetSeconds)s "
-                        + "and AVPlayer is starved (rendered=\(String(format: "%.2f", avpReal))s "
-                        + "buffered=\(String(format: "%.2f", host.bufferedEnd))s); reconciled clock to rendered "
-                        + "position, producer + recovery keep aiming at "
-                        + "\(String(format: "%.2f", clockTarget))s",
+                        "[AetherEngine] seek deadline expired after native host teardown",
                         category: .engine
                     )
                     return
                 }
-                // Slow-but-buffering: preserve the #37/#38 await-real-landing contract.
-                await nativeHost?.seek(to: clockTarget)
+                // Eight seconds is a hard interactive cap. A second unbounded AVPlayer seek could
+                // inherit repeated 20 s source stalls and leave the caller suspended for 40+ s.
+                // Keep the original pending seek alive, but re-anchor the producer at the requested
+                // target whether AVPlayer is starved, still reports old forward buffer, or is paused.
+                let avpReal = host.renderedTime
+                let wasStarved = seekIsWedged(
+                    renderedTime: avpReal, bufferedEnd: host.bufferedEnd)
+                nativeClockSeconds = avpReal
+                // currentTime on the 0-based display axis (AE#105 origin); sourceTime stays source PTS for subs.
+                clock.currentTime = PresentationAxis.display(sourcePTS: avpReal + playlistShiftSeconds,
+                                                             origin: sourcePresentationOrigin)
+                clock.sourceTime = avpReal + playlistShiftSeconds
+                setProgrammaticSeek(inFlight: false, target: nil)
+                // Restore the latest transport intent, not a transient AVPlayer status observed
+                // mid-seek. This also honors a user pause/play pressed during the deadline window.
+                state = host.intendsToPlay ? .playing : .paused
+                isBuffering = host.intendsToPlay
+                    && host.timeControlStatus == .waitingToPlayAtSpecifiedRate
+                let recoveryAnchor = Self.recoveryAnchorPosition(
+                    frozenPosition: avpReal, pendingSeekTarget: pendingRecoverySeekClockTarget,
+                    currentRendered: avpReal)
+                reanchorProducerToPlaylistTime(recoveryAnchor)
+                // The playhead will jump when the still-pending seek lands, so reset stale overlay
+                // gates now; the drainer re-decodes around the recovery target on its next tick.
+                reanchorSubtitleOverlays()
+                // pendingRecoverySeekClockTarget deliberately survives this reconcile: the UI
+                // clock gives up the phantom target, but recovery keeps aiming there until rendered
+                // output reaches it or organic playback proves AVPlayer abandoned the seek.
+                EngineLog.emit(
+                    "[AetherEngine] seek did not land within \(Self.nativeSeekReconcileBudgetSeconds)s "
+                    + "(\(wasStarved ? "starved" : "old position still buffered"), "
+                    + "rendered=\(String(format: "%.2f", avpReal))s "
+                    + "buffered=\(String(format: "%.2f", host.bufferedEnd))s); reconciled clock and "
+                    + "re-anchored producer at \(String(format: "%.2f", recoveryAnchor))s",
+                    category: .engine
+                )
+                return
             }
         }
         // Guard: stop/load during the await tore the session down; writing clock state would publish a phantom.
@@ -2176,16 +2176,15 @@ public final class AetherEngine: ObservableObject {
         }
     }
 
-    /// #65: re-base the loopback producer onto AVPlayer's real (playlist-axis) position after a seek-deadline
-    /// wedge reconcile, so the segments AVPlayer is starved for get produced. requestRestart does blocking
-    /// teardown (old.stop + waitForFinish up to 5s) and is designed to run off-main, so dispatch it detached.
+    /// Re-base the loopback producer onto the recovery position after a seek deadline, so the
+    /// segments AVPlayer is waiting for get produced. requestRestart does blocking teardown
+    /// (old.stop + waitForFinish up to 5s) and is designed to run off-main, so dispatch it detached.
     private func reanchorProducerToPlaylistTime(_ seconds: Double) {
         guard let session = nativeVideoSession else { return }
         Task.detached {
             let idx = session.segmentIndexForPlaylistTime(seconds)
-            // #79: authoritative re-anchor. `seconds` is AVPlayer's REAL rendered position (the clock was
-            // just reconciled to it), so it must win the coalescer over any stale in-flight scrub target.
-            // Without this a burst-tail scrub overrode it and the producer stayed ~1600s off the playhead.
+            // Authoritative re-anchor: deadline recovery must win the coalescer over any stale
+            // in-flight scrub target.
             session.requestRestart(at: idx, authoritative: true)
         }
     }

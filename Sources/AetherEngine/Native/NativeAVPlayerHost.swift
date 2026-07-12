@@ -579,6 +579,7 @@ final class NativeAVPlayerHost {
     // MARK: - Playback control
 
     var isEffectivelyPlaying: Bool { avPlayer.timeControlStatus != .paused }
+    var intendsToPlay: Bool { playIntent }
 
     /// #122: durable transport intent (the last play/pause/setRate command), untouched by a seek.
     /// Unlike `isEffectivelyPlaying` (instantaneous, momentarily `.paused`/`.waitingToPlay` right

@@ -52,4 +52,15 @@ struct RecoverySeekTargetTests {
         // unrelated stall cannot teleport to a minutes-old target.
         #expect(AetherEngine.isPendingSeekStale(progressWhilePending: 3.5))
     }
+
+    @MainActor
+    @Test("deadline recovery reads the host's latest transport intent")
+    func nativeHostTransportIntent() {
+        let host = NativeAVPlayerHost()
+        #expect(!host.intendsToPlay)
+        host.play()
+        #expect(host.intendsToPlay)
+        host.pause()
+        #expect(!host.intendsToPlay)
+    }
 }
