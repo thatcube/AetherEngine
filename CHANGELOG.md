@@ -10,6 +10,14 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [5.0.4] - 2026-07-13
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.0.4))
+
+### Fixed
+
+- **Subtitle cues no longer pace ahead of a frozen picture during a queued seek chase (#123).** Under sustained *queued* skip bursts on a heavy 4K Dolby Vision asset (a new burst issued into an unfinished settle), the engine's reported clock adopted each new target immediately while the underlying player rebuilt, and `sourceTime` (documented as the on-screen frame, not the scrub target, #49) parked tens of seconds ahead of the picture for 14 to 33 s. Any host pacing subtitle cues off `sourceTime` then rendered cues for positions 10 to 30 s ahead over a still frame until convergence. The VOD seek finalize and the native host's seek completion stamped `sourceTime` (and `renderedTime`) onto the target unconditionally at landing, but during a chase the player is `waitingToPlayAtSpecifiedRate` with the picture frozen behind the target, and the 100 ms periodic observer that would walk the clock back to the rendered frame is silent while buffering, so the stamp stuck. Both stamps are now gated on whether the landed frame is actually presented: a playing or paused landing shows the target frame and settles onto it immediately (isolated and paused scrubs are unchanged), while a landing still buffering toward the target holds `sourceTime` on the rendered frame and lets the observer settle it when playback resumes and the frame is delivered. Cues glued to `sourceTime` stay glued to the picture through the chase, and `abs(currentTime - sourceTime)` stays honest as a converging gap a host can gate cue rendering on. The phase logs ruled out the producer restart coalescer (nine cheap restarts across roughly 107 seeks, the long stretches had zero rebuilds and were pure player buffering). Thanks to rrgomes for the triangulated three-clock traces and the phase breakdown that isolated the finalize stamp.
+
 ## [5.0.3] - 2026-07-12
 
 ([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.0.3))
