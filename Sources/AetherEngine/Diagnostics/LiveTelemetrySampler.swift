@@ -56,6 +56,12 @@ final class LiveTelemetrySampler {
     /// [LagDiag] tick-over-tick state (#93 post-recovery lag diagnosis).
     private var lagLastClock: Double?
     private var lagLastDroppedSum: Int = 0
+    /// Tick counter so the [LagDiag] line can promote to `.info` (host handler /
+    /// on-device journal) while the player is not cleanly advancing, plus a low-rate
+    /// heartbeat while healthy — without flooding a bounded journal during smooth
+    /// playback (stall-diagnosis: SMB/DV first-segment wedge after the DV switch).
+    private var lagTickCount: Int = 0
+    private var lagLastServerRequestCount: Int = -1
 
     init(engine: AetherEngine) {
         self.engine = engine
@@ -74,6 +80,8 @@ final class LiveTelemetrySampler {
         sessionStartBytes = 0
         lagLastClock = nil
         lagLastDroppedSum = 0
+        lagTickCount = 0
+        lagLastServerRequestCount = -1
         task = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 self?.tick()
@@ -242,16 +250,34 @@ final class LiveTelemetrySampler {
         @unknown default: thermal = "unknown"
         }
         let fmt2 = { (v: Double) in String(format: "%.2f", v) }
+        // Server-request delta: on the loopback path this is the count of segment/
+        // playlist GETs AVPlayer has issued. When it stops climbing while the clock
+        // is frozen, AVPlayer has WEDGED (stopped requesting) rather than
+        // re-requesting a reset segment — the exact SMB/DV first-segment stall
+        // signature. Captured here so one line proves wedge vs re-request.
+        let serverReq = engine.serverRequestCount
+        let reqDelta = lagLastServerRequestCount >= 0 ? serverReq - lagLastServerRequestCount : 0
+        lagLastServerRequestCount = serverReq
+        // "Healthy" = playing AND the clock advanced this tick. Anything else
+        // (waiting, paused-mid-play, or a frozen clock while rate>0) promotes the
+        // line to `.info` so it lands in the host journal; healthy ticks stay
+        // `.verbose` (os_log only) except a 1-in-10 heartbeat so the journal shows
+        // the sampler is alive without flooding a bounded ring during smooth play.
+        lagTickCount &+= 1
+        let advanced = (dclk ?? 0) > 0.05
+        let healthy = player.timeControlStatus == .playing && advanced
+        let level: EngineLog.Level = (!healthy || lagTickCount % 10 == 0) ? .info : .verbose
         EngineLog.emit(
             "[LagDiag] clk=\(clock.isFinite ? fmt2(clock) : "-") dclk=\(dclk.map(fmt2) ?? "-") "
             + "tcs=\(tcs) rate=\(fmt2(Double(player.rate))) wait=\(player.reasonForWaitingToPlay?.rawValue ?? "-") "
+            + "req=\(serverReq) dreq=\(reqDelta) "
             + "fwd=\(forwardBuffer.map { String(format: "%.1f", $0) } ?? "-") "
             + "keepUp=\(item.isPlaybackLikelyToKeepUp ? "y" : "n") empty=\(item.isPlaybackBufferEmpty ? "y" : "n") "
             + "drop=\(droppedSum)+\(dDrop) stall=\(engine.nativeHost?.stallCount ?? 0) "
             + "ready=\((engine.nativeHost?.playerLayer.isReadyForDisplay ?? false) ? "y" : "n") "
             + "thermal=\(thermal) net=\(netMbps.map { String(format: "%.1f", $0) } ?? "-") "
             + "restarts=\(engine.producerRestartCount)",
-            category: .engine, level: .verbose
+            category: .engine, level: level
         )
     }
 
