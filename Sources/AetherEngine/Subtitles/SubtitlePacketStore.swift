@@ -16,12 +16,13 @@ struct StoredSubtitlePacket: Sendable {
 }
 
 final class SubtitlePacketStore: @unchecked Sendable {
-    /// Trailing retention behind the playhead; matches subtitleCueRetentionSeconds.
-    static let retentionSeconds: Double = 300
-    /// Safety cap per stream. Forward exposure is naturally bounded by the producer's
-    /// forward-buffer park (#102); this guards pathological interleaves. Oldest entries
-    /// evict first: they are already consumed by the drainer, ahead entries cannot be
-    /// re-fetched.
+    /// #125: byte-bounded retention is the store's PRIMARY bound. The drainer no longer time-prunes
+    /// behind the playhead (a trailing playhead-relative prune evicted packets a backward seek into
+    /// cache-resident content could still land on, and the pump never re-harvests that region, so
+    /// cues starved permanently). Oldest entries evict first when a stream exceeds the cap: text
+    /// tracks stay far below it and keep the whole session; a bitmap track keeps a wide trailing
+    /// window. A backward seek past a bitmap stream's evicted edge is the deferred windowed-re-read
+    /// case (#125). Forward exposure is still naturally bounded by the producer's forward park (#102).
     static let perStreamByteCap: Int = 32 * 1024 * 1024
 
     /// Ceiling for one in-assembly PGS display set (a 4K set stays far below this); a pending

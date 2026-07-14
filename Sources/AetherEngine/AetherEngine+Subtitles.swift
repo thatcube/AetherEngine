@@ -217,7 +217,7 @@ extension AetherEngine {
         if subtitleDrainTargets.isEmpty { stopSubtitleDrainer() }
     }
 
-    private func subtitleDrainTick() {
+    func subtitleDrainTick() {
         guard !subtitleDrainTargets.isEmpty, let store = activeSubtitlePacketStore else { return }
         let playhead = sourceTime
         for (channel, streamIndex) in subtitleDrainTargets {
@@ -272,7 +272,15 @@ extension AetherEngine {
                 lastDecodedPts: lastDecoded ?? window.from,
                 lastPlayhead: playhead)
         }
-        store.prune(before: playhead - SubtitlePacketStore.retentionSeconds)
+        // #125: the packet store is NOT time-pruned here. A trailing playhead-relative prune
+        // (was: playhead - retentionSeconds) evicted packets a backward seek could still land on:
+        // a backward jump into segment-cache-resident content is served without a producer restart,
+        // and the pump (the store's only writer) stays parked forward, so that region is never
+        // re-harvested. Once pruned, the drain window landed permanently empty and cues starved
+        // (every re-arm logged "backfilled 0 cues"). Retention is byte-bounded instead, via
+        // SubtitlePacketStore.perStreamByteCap (evict-oldest per stream): text tracks keep the whole
+        // session, bitmap tracks keep a wide trailing window. Mirrors the segment cache retaining
+        // history for backward seeks rather than clamping to a time window ahead of the playhead.
     }
 
     /// Rebuild an AVPacket from a stored entry and decode it. PTS/duration ride a 1/1000
