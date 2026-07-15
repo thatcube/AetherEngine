@@ -401,6 +401,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
     var onPlaylistShiftRebased: (@Sendable (Double, Double) -> Void)?
     /// Fires on `PumpExitReason.sourceReplay`; host must re-negotiate a fresh session.
     var onLiveSourceReset: (@Sendable () -> Void)?
+    /// #126: fires when a VOD pump dies on a read error having produced nothing (zero packets
+    /// written, empty cache). The playlist exists but no segment will ever land, so AVPlayer
+    /// would sit in waitingToPlay forever; the engine surfaces a fatal error instead.
+    var onVODSourceFailed: (@Sendable (Int32) -> Void)?
     /// Session-long FLAC bridge for codecs illegal in fMP4. Engine-owned (not producer-owned) so
     /// encoder state survives producer restarts; `startSegment()` rebases PTS on each restart.
     var audioBridge: AudioBridge?

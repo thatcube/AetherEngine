@@ -1735,12 +1735,14 @@ public final class AetherEngine: ObservableObject {
             fieldOrder: detectedFieldOrder,
             av1Available: VTCapabilityProbe.av1Available
         )
-        // Forward-only custom sources can't serve the native path's seeks (cue prewarm, segment seeks).
-        // Live custom sources are exempt: the live producer never seeks backward, scrub previews come from the
-        // DVR segment cache, and audio-switch is already no-op for forward-only sources.
-        if isCustomSource && !probe.isSourceSeekable && !options.isLive {
+        // Forward-only sources can't serve the native path's seeks (cue prewarm, segment seeks).
+        // Covers custom readers AND URL sources whose AVIOReader resolved no size and degraded to
+        // the forward-only streaming reader (#126: unknown-length HTTP MP4 produced zero segments).
+        // Live sources are exempt: the live producer never seeks backward, scrub previews come from
+        // the DVR segment cache, and audio-switch is already no-op for forward-only sources.
+        if !probe.isSourceSeekable && !options.isLive {
             useSoftwarePath = true
-            EngineLog.emit("[AetherEngine] custom source is forward-only, forcing software path", category: .engine)
+            EngineLog.emit("[AetherEngine] source is forward-only, forcing software path", category: .engine)
         }
         // TEST-ONLY: forces SW path for aetherctl live --sw; unset in shipping builds.
         if Self.forceSoftwarePathForTesting {

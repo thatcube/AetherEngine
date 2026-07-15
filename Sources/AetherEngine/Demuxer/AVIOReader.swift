@@ -124,7 +124,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     private var isStreaming: Bool { fileSize <= 0 }
 
-    var isSeekable: Bool { true }
+    /// #126: a VOD source that resolved no size runs the forward-only streaming reader
+    /// (1 MB back-window, no reconnect); it must not be routed onto seek-dependent paths.
+    /// Live keeps true: the persistent reader owns reconnection and live routing never
+    /// seeks backward. Meaningful only after `open()` has resolved the mode.
+    var isSeekable: Bool { isLive || !isStreaming }
 
     private(set) var context: UnsafeMutablePointer<AVIOContext>?
     private var buffer: UnsafeMutablePointer<UInt8>?
@@ -405,6 +409,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     currentOffset = 0
                 }
             }
+        }
+
+        // #126: a VOD source that finishes open() without a resolved size runs the forward-only
+        // streaming reader; FFmpeg must not believe pb is seekable. With a seekable-flagged pb the
+        // mov demuxer far-forward-skips to a tail moov (buffering the entire skipped span in RAM),
+        // parses an index it can never rewind to, and every sample read then dies with "partial
+        // file" / zero produced packets. Non-seekable pb makes moov-at-end fail cleanly at open
+        // and keeps faststart files on honest sequential reads.
+        if !isLive, isStreaming, let ctx = context {
+            ctx.pointee.seekable = 0
         }
     }
 
@@ -1633,23 +1647,36 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // Range bytes=0- probe (AetherEngine#8: HEAD breaks on Cloudflare-fronted
         // origins returning 405). Without a known size, streaming mode is used and
         // SEEK_SET/SEEK_END return -1, breaking MKV/AVI index seeks and scrubbing.
-        if let size = rangeProbeFileSize(), size > 0 {
+        if let size = rangeProbeFileSize(range: "bytes=0-"), size > 0 {
             #if DEBUG
             EngineLog.emit("[AVIOReader] File size: \(size) bytes (Range probe)", category: .demux)
             #endif
             return size
         }
-        return headProbeFileSize()
+        let headSize = headProbeFileSize()
+        if headSize > 0 { return headSize }
+        // #126: origins that answer bytes=0- with 200/chunked (no length) and reject HEAD can
+        // still honor real ranges (Emby behind a buffering proxy). A bounded two-byte range is
+        // the last probe before degrading to forward-only streaming mode; a 206 carries the
+        // total in Content-Range.
+        if let size = rangeProbeFileSize(range: "bytes=0-1"), size > 0 {
+            EngineLog.emit("[AVIOReader] File size: \(size) bytes (bounded-range fallback)", category: .demux)
+            return size
+        }
+        EngineLog.emit("[AVIOReader] no probe resolved a size, streaming mode (forward-only)", category: .demux)
+        return -1
     }
 
-    /// Open-ended Range bytes=0- GET cancelled at didReceive response (no body transfers).
-    /// Returns the total from Content-Range on 206, or expectedContentLength on 2xx (origins
-    /// that ignore Range). bytes=0- over bytes=0-0: some origins special-case the single-byte
-    /// form and omit length, then 429 the HEAD fallback (issue #70); bytes=0- answers with a
-    /// proper Content-Range in one shot.
-    private func rangeProbeFileSize() -> Int64? {
+    /// Range GET cancelled at didReceive response (no body transfers). Returns the total from
+    /// Content-Range on 206, or expectedContentLength on 2xx (origins that ignore Range).
+    /// The primary probe is the open-ended bytes=0- form; bytes=0- over bytes=0-0: some origins
+    /// special-case the single-byte form and omit length, then 429 the HEAD fallback (issue #70);
+    /// bytes=0- answers with a proper Content-Range in one shot. The bounded bytes=0-1 form is
+    /// the #126 last-resort probe for origins that answer bytes=0- without a length but honor
+    /// real ranges.
+    private func rangeProbeFileSize(range: String) -> Int64? {
         var request = URLRequest(url: url)
-        request.setValue("bytes=0-", forHTTPHeaderField: "Range")
+        request.setValue(range, forHTTPHeaderField: "Range")
         request.timeoutInterval = 20
         applyExtraHeaders(&request)
 
@@ -1673,12 +1700,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                                 self?.isClosed == true
                             }) != .signaled {
             task.cancel()
-            EngineLog.emit("[AVIOReader] Range probe timed out, trying HEAD", category: .demux, level: .verbose)
+            EngineLog.emit("[AVIOReader] Range probe (\(range)) timed out", category: .demux, level: .verbose)
             return nil
         }
 
         if delegate.totalSize == nil {
-            EngineLog.emit("[AVIOReader] Range probe didn't yield a size, trying HEAD", category: .demux, level: .verbose)
+            EngineLog.emit("[AVIOReader] Range probe (\(range)) didn't yield a size", category: .demux, level: .verbose)
         }
         return delegate.totalSize
     }
@@ -1696,16 +1723,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             let (_, response) = try syncRequest(request, budget: chunkRequestTimeout)
             guard let http = response as? HTTPURLResponse,
                   (200...299).contains(http.statusCode) else {
-                EngineLog.emit("[AVIOReader] HEAD failed (HTTP \((response as? HTTPURLResponse)?.statusCode ?? -1)), streaming mode", category: .demux, level: .verbose)
+                EngineLog.emit("[AVIOReader] HEAD failed (HTTP \((response as? HTTPURLResponse)?.statusCode ?? -1))", category: .demux, level: .verbose)
                 return -1
             }
             let length = http.expectedContentLength
             #if DEBUG
-            EngineLog.emit("[AVIOReader] File size: \(length) bytes (HEAD fallback)\(length <= 0 ? " streaming mode" : "")", category: .demux)
+            EngineLog.emit("[AVIOReader] File size: \(length) bytes (HEAD fallback)", category: .demux)
             #endif
             return length
         } catch {
-            EngineLog.emit("[AVIOReader] HEAD probe failed: \(error.localizedDescription), streaming mode", category: .demux, level: .verbose)
+            EngineLog.emit("[AVIOReader] HEAD probe failed: \(error.localizedDescription)", category: .demux, level: .verbose)
             return -1
         }
     }

@@ -10,6 +10,10 @@ the public-API contract.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Unknown-length HTTP MP4 no longer enters a seek-dependent path and silently produces zero packets (#126).** When no size probe resolved a length (an origin answering `bytes=0-` with 200/chunked and rejecting HEAD, e.g. Emby behind a buffering proxy), the AVIO reader degraded to forward-only streaming mode but still advertised itself as seekable, so the mov demuxer parsed a tail moov it could never rewind to and every sample read died with "partial file" while the host waited on a playlist that never gained a segment. Three layers: a last-resort bounded `bytes=0-1` range probe recovers the real size from origins that honor ranges but omit lengths on open-ended requests (full seekable playback, the common case); a source that genuinely resolves no size now reports itself non-seekable to both FFmpeg and the routing layer, so moov-at-end files fail cleanly at open and faststart files route to the sequential software path; and a VOD producer that dies on a read error having produced nothing now surfaces a fatal load error instead of leaving AVPlayer in `waitingToPlay` until the host's timeout. Thanks to YangHanqing for the precise log capture and the VLC control test.
+
 ## [5.0.6] - 2026-07-15
 
 ([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.0.6))

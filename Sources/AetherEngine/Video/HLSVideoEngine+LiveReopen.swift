@@ -2,6 +2,19 @@ import Foundation
 
 extension HLSVideoEngine {
 
+    /// #126 pure decision: a non-live pump exit on a read error with nothing ever produced
+    /// (no packets written, empty segment cache) is a dead source. The playlist exists but no
+    /// segment will ever land, so AVPlayer parks in waitingToPlay forever unless this surfaces.
+    static func isFatalVODPumpExit(
+        reason: HLSSegmentProducer.PumpExitReason,
+        isLive: Bool,
+        packetsWritten: Int,
+        cachedSegments: Int
+    ) -> Bool {
+        guard !isLive, case .readError = reason else { return false }
+        return packetsWritten == 0 && cachedSegments == 0
+    }
+
     func handlePumpFinished(_ prod: HLSSegmentProducer,
                                     reason: HLSSegmentProducer.PumpExitReason) {
         // #65 (VOD only): a broken backpressure wedge means AVPlayer is stuck behind a parked producer.
@@ -16,6 +29,27 @@ extension HLSVideoEngine {
         // and re-arms (post-EOF: rebuilds) the audio bridge.
         if case .muxerFailed = reason, !isLiveSession {
             handleVODMuxerFailure()
+            return
+        }
+        // #126: a VOD pump that dies on a read error having produced NOTHING (no packets
+        // written, empty segment cache) is a dead source: the playlist exists but no segment
+        // will ever land, no restart arm covers readError, and AVPlayer parks in waitingToPlay
+        // until the host's first-frame timeout. Surface it as fatal instead of dying silently.
+        // Mid-session read errors (packets/segments already produced) keep the existing
+        // behavior: AVIO absorbs transients, the scrub/wedge arms cover recovery.
+        if case .readError(let code) = reason, !isLiveSession {
+            if Self.isFatalVODPumpExit(
+                reason: reason, isLive: isLiveSession,
+                packetsWritten: prod.packetsWrittenCount,
+                cachedSegments: cache?.count ?? 0
+            ) {
+                EngineLog.emit(
+                    "[HLSVideoEngine] VOD pump died before producing anything "
+                    + "(readError \(code)); surfacing fatal source failure",
+                    category: .session
+                )
+                onVODSourceFailed?(code)
+            }
             return
         }
         guard isLiveSession else { return }
