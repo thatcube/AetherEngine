@@ -10,6 +10,14 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [5.0.6] - 2026-07-15
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.0.6))
+
+### Fixed
+
+- **Playback resumes after system audio-session interruptions that end with `.shouldResume` (Sodalite iOS device report).** The engine had no `AVAudioSession` interruption handling at all: a foreign session claiming audio (a phone call, Siri, or a live-camera PiP with record priority) paused AVPlayer through the system, and when the interruption ended playback stayed silent until a manual play. The system pause never goes through `pause()`, so the native host's durable `playIntent` (#122) survives the interruption and arms a resume; on interruption end the engine re-issues `play()` only when the system grants `.shouldResume` (a call ending, Siri dismissing). Sessions that end without it, such as a camera PiP closing, stay paused by design and resume manually. An explicit user `pause()` or stop disarms the resume; in the background only audio backends may resume. Interruptions are also logged with type, reason, options, and session state, so foreign-session conflicts are visible in captures.
+
 ## [5.0.5] - 2026-07-14
 
 ([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.0.5))
