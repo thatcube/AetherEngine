@@ -2694,7 +2694,11 @@ public final class AetherEngine: ObservableObject {
             let began = (info[AVAudioSessionInterruptionTypeKey] as? UInt)
                 .flatMap(AVAudioSession.InterruptionType.init(rawValue:)) == .began
             let options = info[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+            #if os(iOS)
             let reason = (info[AVAudioSessionInterruptionReasonKey] as? UInt).map(String.init) ?? "n/a"
+            #else
+            let reason = "n/a"
+            #endif
             let session = AVAudioSession.sharedInstance()
             EngineLog.emit("[AetherEngine] AVAudioSession interruption \(began ? "BEGAN" : "ENDED") reason=\(reason) options=\(options) otherAudio=\(session.isOtherAudioPlaying) silenceHint=\(session.secondaryAudioShouldBeSilencedHint)", category: .engine)
         }
