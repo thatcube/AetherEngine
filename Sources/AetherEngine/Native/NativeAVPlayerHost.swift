@@ -579,9 +579,9 @@ final class NativeAVPlayerHost {
     // MARK: - Playback control
 
     var isEffectivelyPlaying: Bool { avPlayer.timeControlStatus != .paused }
-    var intendsToPlay: Bool { playIntent }
 
-    /// #122: durable transport intent (the last play/pause/setRate command), untouched by a seek.
+    /// #122: durable engine-routed transport intent (the last play/pause/setRate command), untouched
+    /// by a seek. External AVKit / MediaRemote commands are reflected by `timeControlStatus` instead.
     /// Unlike `isEffectivelyPlaying` (instantaneous, momentarily `.paused`/`.waitingToPlay` right
     /// after a landing) this survives a scrub, so the engine's seek finalize can land a paused
     /// scrub paused instead of forcing `.playing`.

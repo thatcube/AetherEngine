@@ -41,4 +41,19 @@ struct Issue37RecoveryClockHoldTests {
         engine.applyNativeHostClockTick(634.0)
         #expect(engine.clock.currentTime == 634.0)
     }
+
+    @Test("a late paused landing settles the public clock while retiring recovery intent")
+    func latePausedLandingSettlesClock() throws {
+        let engine = try AetherEngine()
+        engine.clock.currentTime = 40.0
+        engine.setPendingRecoverySeekTarget(120.0)
+
+        #expect(!engine.settleRecoveryClockIfRenderedTargetLanded(rendered: 80.0, shift: 0))
+        #expect(engine.pendingRecoverySeekClockTarget == 120.0)
+        #expect(engine.clock.currentTime == 40.0)
+
+        #expect(engine.settleRecoveryClockIfRenderedTargetLanded(rendered: 120.0, shift: 0))
+        #expect(engine.pendingRecoverySeekClockTarget == nil)
+        #expect(engine.clock.currentTime == 120.0)
+    }
 }

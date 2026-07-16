@@ -53,14 +53,43 @@ struct RecoverySeekTargetTests {
         #expect(AetherEngine.isPendingSeekStale(progressWhilePending: 3.5))
     }
 
-    @MainActor
-    @Test("deadline recovery reads the host's latest transport intent")
-    func nativeHostTransportIntent() {
-        let host = NativeAVPlayerHost()
-        #expect(!host.intendsToPlay)
-        host.play()
-        #expect(host.intendsToPlay)
-        host.pause()
-        #expect(!host.intendsToPlay)
+    @Test("deadline recovery restarts only a starved producer")
+    func deadlineRestartDecision() {
+        #expect(AetherEngine.shouldReanchorProducerAfterSeekDeadline(isStarved: true))
+        #expect(!AetherEngine.shouldReanchorProducerAfterSeekDeadline(isStarved: false))
+    }
+
+    @Test("deadline state preserves recovery intent but accepts a stable external pause")
+    func deadlineStateDecision() {
+        #expect(AetherEngine.seekDeadlineRecoveryState(
+            transportIntentIsPlaying: false,
+            statusIsPaused: false,
+            isStarved: true,
+            inStallRecoveryWindow: true
+        ) == .paused)
+        #expect(AetherEngine.seekDeadlineRecoveryState(
+            transportIntentIsPlaying: true,
+            statusIsPaused: true,
+            isStarved: false,
+            inStallRecoveryWindow: false
+        ) == .paused)
+        #expect(AetherEngine.seekDeadlineRecoveryState(
+            transportIntentIsPlaying: true,
+            statusIsPaused: true,
+            isStarved: true,
+            inStallRecoveryWindow: false
+        ) == .playing)
+        #expect(AetherEngine.seekDeadlineRecoveryState(
+            transportIntentIsPlaying: true,
+            statusIsPaused: true,
+            isStarved: false,
+            inStallRecoveryWindow: true
+        ) == .playing)
+        #expect(AetherEngine.seekDeadlineRecoveryState(
+            transportIntentIsPlaying: true,
+            statusIsPaused: false,
+            isStarved: false,
+            inStallRecoveryWindow: false
+        ) == .playing)
     }
 }

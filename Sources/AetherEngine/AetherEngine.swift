@@ -1070,6 +1070,23 @@ public final class AetherEngine: ObservableObject {
         transportIntentIsPlaying ? .playing : .paused
     }
 
+    /// Reconcile the state exposed when a native seek exceeds its deadline. Durable engine-routed
+    /// intent wins for normal and starved recovery, but a stable `.paused` on a healthy pipeline
+    /// outside the recovery window is an external AVKit / MediaRemote pause that arrived while the
+    /// regular time-control sink was gated by `.seeking`.
+    nonisolated static func seekDeadlineRecoveryState(
+        transportIntentIsPlaying: Bool,
+        statusIsPaused: Bool,
+        isStarved: Bool,
+        inStallRecoveryWindow: Bool
+    ) -> PlaybackState {
+        guard transportIntentIsPlaying else { return .paused }
+        if statusIsPaused, !isStarved, !inStallRecoveryWindow {
+            return .paused
+        }
+        return .playing
+    }
+
     /// #123: whether a seek landing (host completion + engine finalize) may settle `sourceTime` /
     /// `renderedTime` onto the seek target. `sourceTime` is the on-screen frame (#49), not the scrub
     /// target. When the landed frame is presented (the player is playing or paused at the position)
@@ -1666,13 +1683,6 @@ public final class AetherEngine: ObservableObject {
         // warming and the served master resolves 0 tracks / fails -11819; a warm start (no switch) keeps
         // the unchanged immediate-play path.
         var didSwitchPanel = false
-        // needsDisplaySettle gates the pre-play waitForSwitch() below. Only an HDR/DV load
-        // that actually triggers a panel mode switch needs the settle wait: SDR/rate-only
-        // loads (and any load with Match Content off) never raise EDR headroom, so the
-        // pre-play settle would just burn the ~1000ms Stage-1 poll waiting for a switch that
-        // never starts. apply()'s return already folds in isDisplayCriteriaMatchingEnabled +
-        // window + tvOS 17, so it is the correct gate. DV/HDR behavior is unchanged.
-        var needsDisplaySettle = false
         if !options.suppressDisplayCriteria {
             let codecTag: FourCharCode? = detectedDVProfile ? 0x64766831 : nil
             let willSwitch = displayCriteria.apply(
@@ -1683,7 +1693,6 @@ public final class AetherEngine: ObservableObject {
             )
             if willSwitch {
                 didSwitchPanel = true
-                needsDisplaySettle = true
                 await displayCriteria.waitForSwitch()
                 // Superseded during panel handshake: close local probe and unwind.
                 if loadGeneration != gen {
@@ -1694,12 +1703,6 @@ public final class AetherEngine: ObservableObject {
                     try checkLoadCurrent(gen)
                 }
             }
-        } else {
-            // AVKit-sole-writer path (suppressDisplayCriteria): AVKit fires
-            // preferredDisplayCriteria from the live AVPlayerItem formatDescription instead of
-            // the engine. Still settle for HDR content when Match Content is on; SDR / Match-off
-            // never switches, so skip the pre-play wait.
-            needsDisplaySettle = (effectiveFormat != .sdr) && options.matchContentEnabled
         }
 
         // 2.5. Post-handshake panel-mode snapshot.
@@ -1856,14 +1859,9 @@ public final class AetherEngine: ObservableObject {
                 // via private CoreMedia hooks). waitForSwitch Stage 1 gives AVKit time to fire that write;
                 // Stage 2 waits for the panel to settle so the first frame doesn't hit a mid-transition panel.
                 // Critical for DV P5 (no HDR10 base, requires immediate DV mode).
-                // Gated: only wait when an HDR/DV mode switch is actually expected. SDR/rate-only
-                // loads and Match-Content-off never raise EDR headroom, so waiting here would just
-                // burn the ~1000ms Stage-1 poll on content that will never switch.
-                if needsDisplaySettle {
-                    await displayCriteria.waitForSwitch()
-                } else {
-                    EngineLog.emit("[DisplayCriteria] settle skipped (SDR/rate-only or Match Content off — no HDR mode switch expected)", category: .engine)
-                }
+                // Unconditional by design: SDR Match-Frame-Rate loads also switch the panel,
+                // and a failed probe leaves format discovery to AVKit after the item loads.
+                await displayCriteria.waitForSwitch()
                 try checkLoadCurrent(gen)
                 // automaticallyWaitsToMinimizeStalling=true (default) handles play-before-ready.
                 // #35: on a real SDR->HDR switch while serving a VOD master, drive the bounded
@@ -2096,8 +2094,9 @@ public final class AetherEngine: ObservableObject {
                 }
                 // Eight seconds is a hard interactive cap. A second unbounded AVPlayer seek could
                 // inherit repeated 20 s source stalls and leave the caller suspended for 40+ s.
-                // Keep the original pending seek alive, but re-anchor the producer at the requested
-                // target whether AVPlayer is starved, still reports old forward buffer, or is paused.
+                // Keep the original pending seek alive. Re-anchor only a starved producer; a
+                // healthy-but-slow producer is already filling toward the target and restarting it
+                // would throw away useful progress.
                 let avpReal = host.renderedTime
                 let wasStarved = seekIsWedged(
                     renderedTime: avpReal, bufferedEnd: host.bufferedEnd)
@@ -2107,18 +2106,26 @@ public final class AetherEngine: ObservableObject {
                                                              origin: sourcePresentationOrigin)
                 clock.sourceTime = avpReal + playlistShiftSeconds
                 setProgrammaticSeek(inFlight: false, target: nil)
-                // Restore the latest transport intent, not a transient AVPlayer status observed
-                // mid-seek. This also honors a user pause/play pressed during the deadline window.
-                state = host.intendsToPlay ? .playing : .paused
-                isBuffering = host.intendsToPlay
+                // Prefer durable engine-routed transport intent, while accepting a stable external
+                // pause on a healthy pipeline outside the stall-recovery window.
+                let transportIntentIsPlaying = host.transportIntentIsPlaying
+                let recoveredState = Self.seekDeadlineRecoveryState(
+                    transportIntentIsPlaying: transportIntentIsPlaying,
+                    statusIsPaused: host.timeControlStatus == .paused,
+                    isStarved: wasStarved,
+                    inStallRecoveryWindow: Date() < stallRecoveryWindowUntil
+                )
+                state = recoveredState
+                isBuffering = recoveredState == .playing
                     && host.timeControlStatus == .waitingToPlayAtSpecifiedRate
                 let recoveryAnchor = Self.recoveryAnchorPosition(
                     frozenPosition: avpReal, pendingSeekTarget: pendingRecoverySeekClockTarget,
                     currentRendered: avpReal)
-                reanchorProducerToPlaylistTime(recoveryAnchor)
-                // The playhead will jump when the still-pending seek lands, so reset stale overlay
-                // gates now; the drainer re-decodes around the recovery target on its next tick.
-                reanchorSubtitleOverlays()
+                if Self.shouldReanchorProducerAfterSeekDeadline(isStarved: wasStarved) {
+                    reanchorProducerToPlaylistTime(recoveryAnchor)
+                    // The playhead will jump when the restarted producer lets the pending seek land.
+                    reanchorSubtitleOverlays()
+                }
                 // pendingRecoverySeekClockTarget deliberately survives this reconcile: the UI
                 // clock gives up the phantom target, but recovery keeps aiming there until rendered
                 // output reaches it or organic playback proves AVPlayer abandoned the seek.
@@ -2126,8 +2133,10 @@ public final class AetherEngine: ObservableObject {
                     "[AetherEngine] seek did not land within \(Self.nativeSeekReconcileBudgetSeconds)s "
                     + "(\(wasStarved ? "starved" : "old position still buffered"), "
                     + "rendered=\(String(format: "%.2f", avpReal))s "
-                    + "buffered=\(String(format: "%.2f", host.bufferedEnd))s); reconciled clock and "
-                    + "re-anchored producer at \(String(format: "%.2f", recoveryAnchor))s",
+                    + "buffered=\(String(format: "%.2f", host.bufferedEnd))s); reconciled clock"
+                    + (wasStarved
+                        ? " and re-anchored producer at \(String(format: "%.2f", recoveryAnchor))s"
+                        : " without restarting the progressing producer"),
                     category: .engine
                 )
                 return
@@ -2187,6 +2196,10 @@ public final class AetherEngine: ObservableObject {
             // in-flight scrub target.
             session.requestRestart(at: idx, authoritative: true)
         }
+    }
+
+    nonisolated static func shouldReanchorProducerAfterSeekDeadline(isStarved: Bool) -> Bool {
+        isStarved
     }
 
     /// Deprecated alias. The engine clock is now unified onto source PTS; prefer `seek(to:)` in new code.
