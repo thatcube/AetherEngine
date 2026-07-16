@@ -65,6 +65,26 @@ struct RecoverySeekTargetTests {
         ))
     }
 
+    @MainActor
+    @Test("starting or clearing a recovery target resets deadline lifecycle state")
+    func targetLifecycleReset() throws {
+        let engine = try AetherEngine()
+        engine.setPendingRecoverySeekTarget(42)
+        engine.pendingRecoverySeekDeadlineExpired = true
+        engine.pendingRecoverySeekSubtitlesReanchored = true
+
+        // A superseding seek to the same target is still a new lifecycle.
+        engine.setPendingRecoverySeekTarget(42)
+        #expect(!engine.pendingRecoverySeekDeadlineExpired)
+        #expect(!engine.pendingRecoverySeekSubtitlesReanchored)
+
+        engine.pendingRecoverySeekDeadlineExpired = true
+        engine.pendingRecoverySeekSubtitlesReanchored = true
+        engine.setPendingRecoverySeekTarget(nil)
+        #expect(!engine.pendingRecoverySeekDeadlineExpired)
+        #expect(!engine.pendingRecoverySeekSubtitlesReanchored)
+    }
+
     @Test("seek recovery reasserts only pauses covered by the bounded recovery policy")
     func recoveredStateDecision() {
         #expect(AetherEngine.seekRecoveredState(

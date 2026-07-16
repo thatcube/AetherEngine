@@ -766,6 +766,9 @@ public final class AetherEngine: ObservableObject {
     /// the target's neighbourhood, on organic playback progress elsewhere (stale: AVPlayer
     /// abandoned the seek), and on load reset / stop.
     var pendingRecoverySeekClockTarget: Double? = nil
+    /// The rendered-time sink owns clock/subtitle finalization only after the bounded seek wait
+    /// expires. Ordinary in-flight seeks remain owned by their normal continuation.
+    var pendingRecoverySeekDeadlineExpired = false
     /// True when a starved deadline already reset subtitle discontinuity state before the pending
     /// seek landed. Healthy late landings perform that reset in the rendered-time sink instead.
     var pendingRecoverySeekSubtitlesReanchored = false
@@ -778,9 +781,8 @@ public final class AetherEngine: ObservableObject {
     /// Single write path for the recovery seek intent: the MainActor field and its off-main mirror
     /// must never diverge (a stale mirror would teleport a wedge re-anchor to a retired target).
     func setPendingRecoverySeekTarget(_ target: Double?) {
-        if target != pendingRecoverySeekClockTarget {
-            pendingRecoverySeekSubtitlesReanchored = false
-        }
+        pendingRecoverySeekDeadlineExpired = false
+        pendingRecoverySeekSubtitlesReanchored = false
         pendingRecoverySeekClockTarget = target
         recoverySeekTargetMirror.set(target)
     }
@@ -2143,6 +2145,7 @@ public final class AetherEngine: ObservableObject {
                     )
                     return
                 }
+                pendingRecoverySeekDeadlineExpired = true
                 // Eight seconds is a hard interactive cap. A second unbounded AVPlayer seek could
                 // inherit repeated 20 s source stalls and leave the caller suspended for 40+ s.
                 // Keep the original pending seek alive. Re-anchor only a starved producer; a

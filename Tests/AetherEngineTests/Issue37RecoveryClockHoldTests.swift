@@ -48,6 +48,9 @@ struct Issue37RecoveryClockHoldTests {
         engine.clock.currentTime = 40.0
         engine.setPendingRecoverySeekTarget(120.0)
 
+        // Before the bounded wait expires, the normal seek continuation owns finalization.
+        #expect(!engine.settleRecoveryClockIfRenderedTargetLanded(rendered: 120.0, shift: 0))
+        engine.pendingRecoverySeekDeadlineExpired = true
         #expect(!engine.settleRecoveryClockIfRenderedTargetLanded(rendered: 80.0, shift: 0))
         #expect(engine.pendingRecoverySeekClockTarget == 120.0)
         #expect(engine.clock.currentTime == 40.0)

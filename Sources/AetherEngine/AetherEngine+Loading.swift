@@ -42,7 +42,8 @@ extension AetherEngine {
     /// a paused landing does not wait forever for another periodic clock tick.
     @discardableResult
     func settleRecoveryClockIfRenderedTargetLanded(rendered: Double, shift: Double) -> Bool {
-        guard let pending = pendingRecoverySeekClockTarget,
+        guard pendingRecoverySeekDeadlineExpired,
+              let pending = pendingRecoverySeekClockTarget,
               Self.pendingSeekLanded(rendered: rendered, target: pending) else {
             return false
         }
