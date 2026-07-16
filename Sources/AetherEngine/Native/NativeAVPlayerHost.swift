@@ -56,6 +56,10 @@ final class NativeAVPlayerHost {
 
     /// Suppresses currentTime publishing while a seek is in flight; the loopback source lands seeks seconds after the call, so the observer would otherwise bounce the clock back through the pre-seek position (issue #37).
     private(set) var seekInFlight: Bool = false
+    /// Set before the latest seek completion publishes currentTime/renderedTime. Deadline recovery
+    /// uses this to catch a landing whose publication won the MainActor queue race against the
+    /// resumed deadline continuation.
+    private(set) var latestSeekCompletionPublished = false
 
     // MARK: - Output
 
@@ -648,6 +652,7 @@ final class NativeAVPlayerHost {
         seekGeneration &+= 1
         let gen = seekGeneration
         seekInFlight = true
+        latestSeekCompletionPublished = false
         let resumeGuard = SeekResumeGuard()
         return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
             if let deadlineSeconds, deadlineSeconds > 0 {
@@ -671,6 +676,7 @@ final class NativeAVPlayerHost {
                     // Superseded seek: leave the newer generation's flags intact.
                     if gen == self.seekGeneration {
                         self.seekInFlight = false
+                        self.latestSeekCompletionPublished = true
                         let landed = self.avPlayer.currentTime().seconds
                         if landed.isFinite {
                             self.currentTime = landed

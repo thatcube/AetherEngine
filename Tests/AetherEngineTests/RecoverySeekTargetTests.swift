@@ -65,6 +65,12 @@ struct RecoverySeekTargetTests {
         ))
     }
 
+    @Test("a published completion is the authoritative deadline catch-up signal")
+    func completionPublicationDecision() {
+        #expect(AetherEngine.shouldCatchUpDeadlineLanding(completionPublished: true))
+        #expect(!AetherEngine.shouldCatchUpDeadlineLanding(completionPublished: false))
+    }
+
     @MainActor
     @Test("starting or clearing a recovery target resets deadline lifecycle state")
     func targetLifecycleReset() throws {

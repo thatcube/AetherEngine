@@ -2152,6 +2152,27 @@ public final class AetherEngine: ObservableObject {
                 // healthy-but-slow producer is already filling toward the target and restarting it
                 // would throw away useful progress.
                 let avpReal = host.renderedTime
+                // The deadline continuation and AVPlayer completion are both MainActor jobs. If the
+                // completion published renderedTime first, its sink still saw deadlineExpired=false.
+                // Catch that ordering now; otherwise the later publication will settle through the sink.
+                if Self.shouldCatchUpDeadlineLanding(
+                    completionPublished: host.latestSeekCompletionPublished
+                ),
+                   settleRecoveryClockIfRenderedTargetLanded(
+                       rendered: avpReal,
+                       shift: playlistShiftSeconds
+                   ) {
+                    nativeClockSeconds = avpReal
+                    clock.sourceTime = avpReal + playlistShiftSeconds
+                    setProgrammaticSeek(inFlight: false, target: nil)
+                    reconcileNativeSeekTransport(host: host, isStarved: false)
+                    EngineLog.emit(
+                        "[AetherEngine] seek landed while deadline ownership transferred; "
+                        + "reconciled from rendered \(String(format: "%.2f", avpReal))s",
+                        category: .engine
+                    )
+                    return
+                }
                 let wasStarved = seekIsWedged(
                     renderedTime: avpReal, bufferedEnd: host.bufferedEnd)
                 nativeClockSeconds = avpReal
@@ -2248,6 +2269,10 @@ public final class AetherEngine: ObservableObject {
 
     nonisolated static func shouldReanchorProducerAfterSeekDeadline(isStarved: Bool) -> Bool {
         isStarved
+    }
+
+    nonisolated static func shouldCatchUpDeadlineLanding(completionPublished: Bool) -> Bool {
+        completionPublished
     }
 
     /// Deprecated alias. The engine clock is now unified onto source PTS; prefer `seek(to:)` in new code.
