@@ -10,6 +10,16 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [Unreleased]
+
+### Added
+
+- **`AetherEngine.probeDetectingAtmos(url:/source:)`: opt-in, authoritative E-AC-3 JOC (Dolby Atmos) detection.** FFmpeg only populates `AVCodecContext.profile == AV_PROFILE_EAC3_DDP_ATMOS` (30) after decoding an audio frame, so the lightweight `probe(url:)`/`probe(source:)` path (demux + `avformat_find_stream_info` only, no decoders) cannot reliably report `TrackInfo.isAtmos` for JOC. The new API opens the EAC3 decoder and decodes the minimum packets/one frame needed to read the authoritative post-decode profile, bounded by `AtmosDetectionOptions` (packet/byte/wall-clock caps, default 64 packets / 8 MiB / 2 s) with no video decode, no HLS server, and no playback session; it tolerates malformed/no-audio/non-EAC3 sources by degrading to "not confirmed" rather than throwing, and only ever flips a track's `isAtmos` from `false` to `true` (never overwrites an existing `true`). `probe(url:)`/`probe(source:)` themselves are completely unmodified -- this is a separate, strictly-opt-in entry point for hosts (e.g. a details screen) that need an authoritative Atmos badge, not a flag on the default probe.
+
+### Fixed
+
+- **A DV/SMB forward seek into thin buffer no longer reverts to the pre-seek position.** A forward VOD seek issued shortly after load into not-yet-buffered territory on a slow source (Dolby Vision over SMB, HLS re-mux path) could miss its 8 s deadline and revert the reported clock to the old position, then park flapping paused/playing on a slow-serving producer. The deadline reconcile only re-anchored the producer on a "starved" signal (`seekIsWedged`), which measures the buffer contiguous with AVPlayer's *old* playhead and so mis-reads a thin surviving forward buffer as healthy while the forward target is nowhere near loaded. The reconcile now also re-anchors the producer at the recovery target whenever that target is not yet inside AVPlayer's contiguous forward buffer, so a forward-into-unbuffered seek recovers; a seek whose target is already buffered still skips the needless restart, and starved wedges still always re-anchor. VOD vs live and native vs software/audio host paths are unchanged. Thanks to thatcube.
+
 ## [5.6.1] - 2026-07-17
 
 ([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.6.1))
