@@ -59,37 +59,27 @@ struct RecoverySeekTargetTests {
         #expect(!AetherEngine.shouldReanchorProducerAfterSeekDeadline(isStarved: false))
     }
 
-    @Test("deadline state preserves recovery intent but accepts a stable external pause")
-    func deadlineStateDecision() {
-        #expect(AetherEngine.seekDeadlineRecoveryState(
+    @Test("seek recovery reasserts only pauses covered by the bounded recovery policy")
+    func recoveredStateDecision() {
+        #expect(AetherEngine.seekRecoveredState(
             transportIntentIsPlaying: false,
             statusIsPaused: false,
-            isStarved: true,
-            inStallRecoveryWindow: true
+            shouldReassertPausedStatus: true
         ) == .paused)
-        #expect(AetherEngine.seekDeadlineRecoveryState(
+        #expect(AetherEngine.seekRecoveredState(
             transportIntentIsPlaying: true,
             statusIsPaused: true,
-            isStarved: false,
-            inStallRecoveryWindow: false
+            shouldReassertPausedStatus: false
         ) == .paused)
-        #expect(AetherEngine.seekDeadlineRecoveryState(
+        #expect(AetherEngine.seekRecoveredState(
             transportIntentIsPlaying: true,
             statusIsPaused: true,
-            isStarved: true,
-            inStallRecoveryWindow: false
+            shouldReassertPausedStatus: true
         ) == .playing)
-        #expect(AetherEngine.seekDeadlineRecoveryState(
-            transportIntentIsPlaying: true,
-            statusIsPaused: true,
-            isStarved: false,
-            inStallRecoveryWindow: true
-        ) == .playing)
-        #expect(AetherEngine.seekDeadlineRecoveryState(
+        #expect(AetherEngine.seekRecoveredState(
             transportIntentIsPlaying: true,
             statusIsPaused: false,
-            isStarved: false,
-            inStallRecoveryWindow: false
+            shouldReassertPausedStatus: false
         ) == .playing)
     }
 }

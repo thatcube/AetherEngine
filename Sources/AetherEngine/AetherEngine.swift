@@ -1070,21 +1070,56 @@ public final class AetherEngine: ObservableObject {
         transportIntentIsPlaying ? .playing : .paused
     }
 
-    /// Reconcile the state exposed when a native seek exceeds its deadline. Durable engine-routed
-    /// intent wins for normal and starved recovery, but a stable `.paused` on a healthy pipeline
-    /// outside the recovery window is an external AVKit / MediaRemote pause that arrived while the
-    /// regular time-control sink was gated by `.seeking`.
-    nonisolated static func seekDeadlineRecoveryState(
+    /// Reconcile native seek completion with a pause observed while the regular time-control sink
+    /// was gated by `.seeking`. Engine-routed pause intent always wins. A live `.paused` is external
+    /// unless the bounded stall-recovery policy deliberately reasserts playback.
+    nonisolated static func seekRecoveredState(
         transportIntentIsPlaying: Bool,
         statusIsPaused: Bool,
-        isStarved: Bool,
-        inStallRecoveryWindow: Bool
+        shouldReassertPausedStatus: Bool
     ) -> PlaybackState {
         guard transportIntentIsPlaying else { return .paused }
-        if statusIsPaused, !isStarved, !inStallRecoveryWindow {
+        if statusIsPaused, !shouldReassertPausedStatus {
             return .paused
         }
         return .playing
+    }
+
+    /// Apply the same transport reconciliation after a normal native seek landing and after a
+    /// deadline recovery. A starved deadline opens the bounded reassert window; a stable pause on a
+    /// healthy path is treated as an external AVKit / MediaRemote command. When recovery overrides a
+    /// spurious pause, replay play() because the paused KVO was consumed while state was `.seeking`.
+    private func reconcileNativeSeekTransport(
+        host: NativeAVPlayerHost,
+        isStarved: Bool
+    ) {
+        let now = Date()
+        if isStarved, now >= stallRecoveryWindowUntil {
+            stallRecoveryWindowUntil = now.addingTimeInterval(Self.stallRecoveryWindowSeconds)
+            stallRecoveryReasserts = 0
+        }
+        let statusIsPaused = host.timeControlStatus == .paused
+        let transportIntentIsPlaying = host.transportIntentIsPlaying
+        let shouldReassertPausedStatus = Self.shouldReassertPlayDuringRecovery(
+            statusIsPaused: statusIsPaused,
+            engineStateIsPlaying: transportIntentIsPlaying,
+            now: now,
+            windowUntil: stallRecoveryWindowUntil,
+            reasserts: stallRecoveryReasserts
+        )
+        let recoveredState = Self.seekRecoveredState(
+            transportIntentIsPlaying: transportIntentIsPlaying,
+            statusIsPaused: statusIsPaused,
+            shouldReassertPausedStatus: shouldReassertPausedStatus
+        )
+        state = recoveredState
+        isBuffering = recoveredState == .playing
+            && host.timeControlStatus == .waitingToPlayAtSpecifiedRate
+        if shouldReassertPausedStatus {
+            stallRecoveryReasserts += 1
+            playIntentMirror.set(true)
+            host.play()
+        }
     }
 
     /// #123: whether a seek landing (host completion + engine finalize) may settle `sourceTime` /
@@ -2106,18 +2141,7 @@ public final class AetherEngine: ObservableObject {
                                                              origin: sourcePresentationOrigin)
                 clock.sourceTime = avpReal + playlistShiftSeconds
                 setProgrammaticSeek(inFlight: false, target: nil)
-                // Prefer durable engine-routed transport intent, while accepting a stable external
-                // pause on a healthy pipeline outside the stall-recovery window.
-                let transportIntentIsPlaying = host.transportIntentIsPlaying
-                let recoveredState = Self.seekDeadlineRecoveryState(
-                    transportIntentIsPlaying: transportIntentIsPlaying,
-                    statusIsPaused: host.timeControlStatus == .paused,
-                    isStarved: wasStarved,
-                    inStallRecoveryWindow: Date() < stallRecoveryWindowUntil
-                )
-                state = recoveredState
-                isBuffering = recoveredState == .playing
-                    && host.timeControlStatus == .waitingToPlayAtSpecifiedRate
+                reconcileNativeSeekTransport(host: host, isStarved: wasStarved)
                 let recoveryAnchor = Self.recoveryAnchorPosition(
                     frozenPosition: avpReal, pendingSeekTarget: pendingRecoverySeekClockTarget,
                     currentRendered: avpReal)
@@ -2165,7 +2189,11 @@ public final class AetherEngine: ObservableObject {
         // after a paused scrub and the #93 recovery reassert can't misread the paused landing as a
         // spurious pause and call host.play(). A seek on any non-native host keeps the prior
         // `.playing` default (those paths do not carry the durable intent and are not affected).
-        state = Self.seekFinalizeState(transportIntentIsPlaying: nativeHost?.transportIntentIsPlaying ?? true)
+        if let nativeHost {
+            reconcileNativeSeekTransport(host: nativeHost, isStarved: false)
+        } else {
+            state = .playing
+        }
         setProgrammaticSeek(inFlight: false, target: nil)
     }
 
