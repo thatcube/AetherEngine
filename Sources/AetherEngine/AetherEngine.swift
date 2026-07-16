@@ -2080,7 +2080,11 @@ public final class AetherEngine: ObservableObject {
             clock.currentTime = target
             clock.sourceTime = target
             // publishLiveWindow on the next tick recomputes behindLiveSeconds.
-            state = .playing
+            if let nativeHost {
+                reconcileNativeSeekTransport(host: nativeHost, isStarved: false)
+            } else {
+                state = .playing
+            }
             setProgrammaticSeek(inFlight: false, target: nil)
             return
         }
