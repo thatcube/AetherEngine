@@ -41,6 +41,97 @@ extension AetherEngine {
         return makeSourceProbe(demuxer: demuxer, displayURL: displayURL)
     }
 
+    // MARK: - Bounded, opt-in Atmos/JOC detail probe
+
+    /// `probe(url:)` plus a bounded, OPT-IN decode pass that authoritatively resolves E-AC-3 JOC (Dolby Atmos)
+    /// on the default (or explicitly named) audio track.
+    ///
+    /// FFmpeg's E-AC-3 decoder only populates `AVCodecContext.profile == AV_PROFILE_EAC3_DDP_ATMOS` (30) AFTER
+    /// decoding at least one audio frame. The lightweight `probe(url:)` / `probe(source:)` path never opens a
+    /// decoder -- it only demuxes and runs `avformat_find_stream_info` -- so `TrackInfo.isAtmos` from those
+    /// calls reflects only whatever `codecpar.profile` the container already carries pre-decode, which is
+    /// unresolved for JOC in the common case. Call `probeDetectingAtmos` instead of `probe(url:)` ONLY when a
+    /// host specifically needs an authoritative "Dolby Atmos" badge (e.g. a details screen): it is strictly
+    /// more expensive than `probe(url:)` (it opens a real EAC3 decoder and decodes at least one frame) and
+    /// MUST NOT be used on the playback-start critical path. `probe(url:)` / `probe(source:)` themselves are
+    /// completely unmodified by this API and remain byte-for-byte the same lightweight demux-only probe --
+    /// this is an additive, separate entry point, not a flag on the existing one.
+    ///
+    /// The decode pass is bounded by `atmosDetection` (packet-count / byte / wall-clock caps -- see
+    /// `AtmosDetectionOptions`): it stops at the first successfully decoded audio frame, or at whichever cap
+    /// is hit first. There is no video decode, no HLS server, and no playback session. The demuxer, decoder
+    /// context, packet, and frame are all closed / freed before returning on every path, including error
+    /// paths. A malformed / no-audio / non-EAC3 source is tolerated: the decode pass simply degrades to "not
+    /// authoritatively Atmos" (the base probe's `TrackInfo.isAtmos`, which a pre-existing container-declared
+    /// profile 30 can still leave `true` -- this API only ever ADDS confirmation, never removes a pre-decode
+    /// signal) instead of throwing or hanging.
+    ///
+    /// - Parameters:
+    ///   - url: Media source, forwarded verbatim to `probe(url:)`.
+    ///   - options: Forwarded verbatim to `probe(url:)` (`httpHeaders` only; other flags ignored, same as `probe(url:)`).
+    ///   - atmosDetection: Bounds + optional explicit track override for the decode pass. Defaults resolve the
+    ///     demuxer's own default audio track (`Demuxer.audioStreamIndex`) and cap the decode attempt at 64
+    ///     packets / 8 MiB / 2 s wall clock (soft -- see `AtmosDetectionOptions` doc for the same
+    ///     AVIO-blocking caveat `Demuxer.seekBounded` already documents: a single blocking `av_read_frame()`
+    ///     on a stalled remote socket can still run past the wall-clock budget before the next check fires).
+    /// - Throws: Any error the demuxer raises during open / probe -- identical to `probe(url:)`. Decode-side
+    ///   failures (bad EAC3 extradata, no decoder built, a malformed frame, EOF before any frame decodes) are
+    ///   NEVER thrown; they only affect whether Atmos gets confirmed.
+    public nonisolated static func probeDetectingAtmos(
+        url: URL,
+        options: LoadOptions = .init(),
+        atmosDetection: AtmosDetectionOptions = .init()
+    ) throws -> SourceProbe {
+        try probeDetectingAtmos(source: .url(url), options: options, atmosDetection: atmosDetection)
+    }
+
+    /// `probeDetectingAtmos(url:)` for a custom byte source. Same reader-ownership contract as `probe(source:)`:
+    /// the caller retains ownership, the cursor is left at an unspecified position, and `close()` is NOT called.
+    public nonisolated static func probeDetectingAtmos(
+        source: MediaSource,
+        options: LoadOptions = .init(),
+        atmosDetection: AtmosDetectionOptions = .init()
+    ) throws -> SourceProbe {
+        let demuxer = Demuxer()
+        let displayURL: URL
+        switch source {
+        case .url(let u):
+            try demuxer.open(url: u, extraHeaders: options.httpHeaders)
+            displayURL = u
+        case .custom(let reader, let formatHint):
+            try demuxer.open(reader: reader, formatHint: formatHint)
+            displayURL = URL(string: "aether-custom://source")!
+        }
+        defer { demuxer.close() }
+
+        let base = makeSourceProbe(demuxer: demuxer, displayURL: displayURL)
+        let targetIndex = Self.atmosDecodeTargetIndex(
+            options: atmosDetection, defaultAudioStreamIndex: demuxer.audioStreamIndex)
+        let outcome = Self.detectAtmos(demuxer: demuxer, targetIndex: targetIndex, options: atmosDetection)
+        guard outcome.confirmedAtmos else { return base }
+
+        // Additive only: a track already marked isAtmos by the base probe (a container that pre-declares
+        // profile 30) is left untouched; this only ever flips false -> true for the one confirmed track.
+        let enrichedTracks = base.audioTracks.map { track -> TrackInfo in
+            guard track.id == Int(targetIndex), !track.isAtmos else { return track }
+            return TrackInfo(
+                id: track.id, name: track.name, codec: track.codec, language: track.language,
+                channels: track.channels, bitrate: track.bitrate, isDefault: track.isDefault,
+                isForced: track.isForced, isHearingImpaired: track.isHearingImpaired,
+                isCommentary: track.isCommentary, isAtmos: true, assHeader: track.assHeader,
+                isExternal: track.isExternal
+            )
+        }
+        return SourceProbe(
+            url: base.url, durationSeconds: base.durationSeconds, videoFormat: base.videoFormat,
+            videoCodecID: base.videoCodecID, videoCodecName: base.videoCodecName,
+            videoWidth: base.videoWidth, videoHeight: base.videoHeight, videoFrameRate: base.videoFrameRate,
+            isDolbyVision: base.isDolbyVision, dvProfile: base.dvProfile,
+            audioTracks: enrichedTracks, subtitleTracks: base.subtitleTracks,
+            metadata: base.metadata, isLive: base.isLive
+        )
+    }
+
     /// Assemble a `SourceProbe` from an open demuxer. Shared by static probe entry points and `load(source:)`'s internal probe stage so all report identical metadata.
     nonisolated static func makeSourceProbe(
         demuxer: Demuxer,
