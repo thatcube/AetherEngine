@@ -122,6 +122,10 @@ final class SoftwarePlaybackHost {
     nonisolated(unsafe) private var _feedCursor: Int = 0
     nonisolated(unsafe) private var _sourceEnded = false
 
+    /// Audio look-ahead pump cursor (#107 audio chopping): the feeder advances it ahead of
+    /// `_feedCursor`, seek paths reset it alongside `setFeedCursor`.
+    private let audioLookahead = AudioLookaheadState()
+
     nonisolated private func readFeedCursor() -> Int {
         feedLock.lock(); defer { feedLock.unlock() }
         return _feedCursor
@@ -140,6 +144,7 @@ final class SoftwarePlaybackHost {
         feedLock.lock()
         _feedCursor = value
         feedLock.unlock()
+        audioLookahead.reset(to: value)
         demuxCondition.lock()
         demuxCondition.broadcast()
         demuxCondition.unlock()
@@ -163,6 +168,7 @@ final class SoftwarePlaybackHost {
         _clockArmed = false
         _clockSessionZero = 0
         feedLock.unlock()
+        audioLookahead.reset(to: 0)
     }
 
     /// Whether the synchronizer clock has been anchored this session. Shared with seek paths so a DVR seek before feeder arming is not overwritten by a late re-arm.
@@ -779,6 +785,7 @@ final class SoftwarePlaybackHost {
                     subtitleTapSink: getSubtitleTapSink
                 )
             }
+            let lookahead = audioLookahead
             feedQueue.async {
                 Self.runLiveFeederLoop(
                     videoDecoder: vDec,
@@ -789,6 +796,7 @@ final class SoftwarePlaybackHost {
                     renderer: rndr,
                     condition: condition,
                     ring: ring,
+                    audioLookahead: lookahead,
                     videoTimeBaseSeconds: vTbSec,
                     audioTimeBaseSeconds: aTbSec,
                     readCursor: readCursor,
@@ -1006,6 +1014,7 @@ final class SoftwarePlaybackHost {
         renderer: SampleBufferRenderer,
         condition: NSCondition,
         ring: PacketRingBuffer,
+        audioLookahead: AudioLookaheadState,
         videoTimeBaseSeconds: Double,
         audioTimeBaseSeconds: Double,
         readCursor: @Sendable () -> Int,
@@ -1020,6 +1029,110 @@ final class SoftwarePlaybackHost {
         onEnd: @Sendable () -> Void,
         audioTapSink: @Sendable () -> ((@Sendable (CMSampleBuffer) -> Void)?)
     ) {
+        // Audio look-ahead pump (#107 audio chopping): feed audio packets ahead of the
+        // combined cursor so the audio renderer holds AudioLookaheadPolicy.targetLeadSeconds
+        // of decoded audio regardless of video decode pace. Without it audio lead is capped
+        // by the video renderer queue (<1 s) and any feeder stall is an audible dropout.
+        var preArmPacketsFed = 0
+        var hadLead = false
+        var rebuffering = false
+        var lastLowLeadLog = DispatchTime(uptimeNanoseconds: 0)
+        func pumpAudio() {
+            guard let aDec = audioDecoder, let aOut = audioOutput, audioStreamIndex >= 0 else { return }
+            var seq = audioLookahead.align(to: readCursor())
+            while !stopRequested() && isPlaying() {
+                let armed = clockArmed()
+                guard AudioLookaheadPolicy.decide(
+                    clockArmed: armed,
+                    preArmPacketsFed: preArmPacketsFed,
+                    lastFedAudioPTS: audioLookahead.lastFedAudioPTS,
+                    clockSeconds: aOut.currentTimeSeconds
+                ) == .feed else { break }
+                guard seq < ring.seqBounds.end else { break }  // live edge: nothing to pump yet
+                guard let pkt = ring.packet(atSeq: seq) else {
+                    // Evicted/unreadable under the pump: skip, same as the combined loop.
+                    guard audioLookahead.advance(from: seq, fedPTS: nil) else { break }
+                    seq += 1
+                    continue
+                }
+                if pkt.isVideo {
+                    guard audioLookahead.advance(from: seq, fedPTS: nil) else { break }
+                    seq += 1
+                    continue
+                }
+                let producedAudio = feedRingPacket(
+                    pkt,
+                    videoDecoder: videoDecoder,
+                    audioDecoder: aDec,
+                    audioOutput: aOut,
+                    videoStreamIndex: videoStreamIndex,
+                    audioStreamIndex: audioStreamIndex,
+                    videoTimeBaseSeconds: videoTimeBaseSeconds,
+                    audioTimeBaseSeconds: audioTimeBaseSeconds,
+                    audioTapSink: audioTapSink()
+                )
+                if !armed {
+                    preArmPacketsFed += 1
+                    if producedAudio {
+                        // First decoded buffers arm the clock at their packet PTS, exactly as
+                        // the combined loop did before the pump took over audio delivery.
+                        let armTime = CMTime(seconds: pkt.pts, preferredTimescale: 90000)
+                        aOut.seekClock(to: armTime, rate: currentRate())
+                        markClockArmed()
+                    }
+                }
+                guard audioLookahead.advance(from: seq, fedPTS: pkt.pts) else { break }
+                seq += 1
+            }
+            // Live-edge underrun handling (#107): a source delivering below real time would
+            // otherwise leave the free-running clock permanently ahead of the stream, and
+            // every later sample lands in the clock's past (continuous chopping that never
+            // recovers). Pause the clock, refill, resume; the native path gets the same
+            // behavior from AVPlayer's stall handling.
+            if clockArmed(), isPlaying() {
+                let lastPTS = audioLookahead.lastFedAudioPTS
+                let lead = lastPTS.isFinite ? lastPTS - aOut.currentTimeSeconds : 0
+                switch AudioLookaheadPolicy.clockAction(
+                    rebuffering: rebuffering,
+                    lastFedAudioPTS: lastPTS,
+                    clockSeconds: aOut.currentTimeSeconds,
+                    atRingEnd: audioLookahead.current >= ring.seqBounds.end,
+                    sourceEnded: sourceEnded()
+                ) {
+                case .pauseForRebuffer:
+                    rebuffering = true
+                    EngineLog.emit(
+                        "[SWHost] live source underrun: pausing clock to rebuffer "
+                        + "(lead=\(String(format: "%.2f", lead))s)",
+                        category: .swPlayback
+                    )
+                    aOut.pause()
+                case .resume:
+                    rebuffering = false
+                    EngineLog.emit(
+                        "[SWHost] rebuffered: resuming clock (lead=\(String(format: "%.2f", lead))s)",
+                        category: .swPlayback
+                    )
+                    aOut.setRate(currentRate())
+                case .none:
+                    // Decode-lag visibility for device logs: only after lead was once
+                    // healthy (startup fill must not trip it), rate-limited to one per 5 s.
+                    if lead >= 0.5 { hadLead = true }
+                    if hadLead, lead < 0.1, !rebuffering {
+                        let now = DispatchTime.now()
+                        if now.uptimeNanoseconds &- lastLowLeadLog.uptimeNanoseconds > 5_000_000_000 {
+                            lastLowLeadLog = now
+                            EngineLog.emit(
+                                "[SWHost] audio lead low: \(String(format: "%.2f", lead))s "
+                                + "(ring end=\(ring.seqBounds.end) audioSeq=\(audioLookahead.current))",
+                                category: .swPlayback
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
         while !stopRequested() {
             if !isPlaying() {
                 condition.lock()
@@ -1029,6 +1142,9 @@ final class SoftwarePlaybackHost {
                 condition.unlock()
                 continue
             }
+
+            // Keep the audio renderer topped up before (possibly expensive) video work.
+            pumpAudio()
 
             let cursor = readCursor()
             let bounds = ring.seqBounds
@@ -1073,11 +1189,19 @@ final class SoftwarePlaybackHost {
 
             if pkt.isVideo {
                 // Back-pressure against renderer queue; also bail on pause without consuming.
+                // The wait can outlast the audio lead, so keep pumping audio while parked.
+                var waitTicks = 0
                 while !renderer.isReadyForMoreMediaData && !stopRequested() && isPlaying() {
                     Thread.sleep(forTimeInterval: 0.005)
+                    waitTicks += 1
+                    if waitTicks % 20 == 0 { pumpAudio() }
                 }
                 if stopRequested() { break }
                 if !isPlaying() { continue }
+            } else if cursor < audioLookahead.current {
+                // Audio the pump already delivered: consume the slot without re-decoding.
+                advanceCursor(cursor)
+                continue
             }
 
             let producedAudio = feedRingPacket(
