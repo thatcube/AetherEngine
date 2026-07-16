@@ -129,7 +129,12 @@ struct SegmentFetchWaitTests {
         // initialRestartIndex the cold-start heuristic (abs(index - 0) > 2) restarted it immediately.
         let provider = makeProvider(cache: cache, recorder: recorder, activity: .never(),
                                     initialRestartIndex: 40)
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
+        // The anchored cold path polls no hooks, so the mid-wait delivery needs a timer. A
+        // dedicated thread, NOT DispatchQueue.asyncAfter: on an oversubscribed CI runner the
+        // GCD timer was delayed past the entire 30 s cold-wait budget and this test failed
+        // three runs in a row (2026-07-16) while kernel-scheduled threads kept running.
+        Thread.detachNewThread {
+            Thread.sleep(forTimeInterval: 0.25)
             cache.store(index: 40, data: Data(repeating: 0x11, count: 8))
         }
         let served = provider.mediaSegment(at: 40)
