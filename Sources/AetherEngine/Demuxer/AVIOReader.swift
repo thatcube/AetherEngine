@@ -1643,28 +1643,70 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return probed
     }
 
+    /// Concurrent queue for the staggered open-time size probes; each probe blocks its
+    /// worker on a semaphore-driven URLSession round-trip.
+    private static let sizeProbeQueue = DispatchQueue(label: "aether.avio.size-probe", attributes: .concurrent)
+
+    /// How long the primary open-ended range probe runs alone before the two fallback
+    /// probes fire. Fast origins resolve well inside this window and never see a
+    /// fallback request (identical wire behavior to the old sequential ladder).
+    static let sizeProbeStaggerSeconds: TimeInterval = 0.75
+
     private func probeFileSize() -> Int64 {
-        // Range bytes=0- probe (AetherEngine#8: HEAD breaks on Cloudflare-fronted
-        // origins returning 405). Without a known size, streaming mode is used and
-        // SEEK_SET/SEEK_END return -1, breaking MKV/AVI index seeks and scrubbing.
-        if let size = rangeProbeFileSize(range: "bytes=0-"), size > 0 {
-            #if DEBUG
-            EngineLog.emit("[AVIOReader] File size: \(size) bytes (Range probe)", category: .demux)
-            #endif
-            return size
+        // Staggered-concurrent ladder (#107 follow-up). The probes themselves are unchanged:
+        // Range bytes=0- primary (AetherEngine#8: HEAD breaks on Cloudflare-fronted origins
+        // returning 405), HEAD for live-transcode endpoints that reject Range, and the #126
+        // bounded bytes=0-1 for origins that answer bytes=0- with 200/chunked but honor real
+        // ranges. Sequentially each failing probe cost a full origin round-trip; a live tuner
+        // pays its ~4 s tune-in on EVERY connection, so the ladder tripled the open latency
+        // of every genuinely length-less source. The fallbacks now start after a short
+        // stagger and run in parallel; the first positive size wins.
+        let cond = NSCondition()
+        var resolvedSize: Int64 = -1
+        var outstanding = 0
+
+        func launch(after delay: TimeInterval, name: String, _ run: @escaping () -> Int64) {
+            cond.lock(); outstanding += 1; cond.unlock()
+            Self.sizeProbeQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                cond.lock()
+                let alreadyResolved = resolvedSize > 0
+                cond.unlock()
+                let closed = self?.isClosed ?? true
+                let size = (alreadyResolved || closed) ? -1 : run()
+                cond.lock()
+                if size > 0, resolvedSize <= 0 {
+                    resolvedSize = size
+                    EngineLog.emit("[AVIOReader] File size: \(size) bytes (\(name))", category: .demux)
+                }
+                outstanding -= 1
+                cond.broadcast()
+                cond.unlock()
+            }
         }
-        let headSize = headProbeFileSize()
-        if headSize > 0 { return headSize }
-        // #126: origins that answer bytes=0- with 200/chunked (no length) and reject HEAD can
-        // still honor real ranges (Emby behind a buffering proxy). A bounded two-byte range is
-        // the last probe before degrading to forward-only streaming mode; a 206 carries the
-        // total in Content-Range.
-        if let size = rangeProbeFileSize(range: "bytes=0-1"), size > 0 {
-            EngineLog.emit("[AVIOReader] File size: \(size) bytes (bounded-range fallback)", category: .demux)
-            return size
+
+        launch(after: 0, name: "Range probe") { [weak self] in
+            self?.rangeProbeFileSize(range: "bytes=0-") ?? -1
         }
-        EngineLog.emit("[AVIOReader] no probe resolved a size, streaming mode (forward-only)", category: .demux)
-        return -1
+        launch(after: Self.sizeProbeStaggerSeconds, name: "HEAD fallback") { [weak self] in
+            self?.headProbeFileSize() ?? -1
+        }
+        launch(after: Self.sizeProbeStaggerSeconds, name: "bounded-range fallback") { [weak self] in
+            self?.rangeProbeFileSize(range: "bytes=0-1") ?? -1
+        }
+
+        // Budget mirrors a single sequential probe (its own 20-25 s ceiling) plus the stagger;
+        // isClosed teardown breaks the individual probes, which then signal outstanding down.
+        let deadline = Date(timeIntervalSinceNow: Self.sizeProbeStaggerSeconds + min(25, chunkRequestTimeout) + 2)
+        cond.lock()
+        while resolvedSize <= 0 && outstanding > 0 {
+            if !cond.wait(until: deadline) { break }
+        }
+        let size = resolvedSize
+        cond.unlock()
+        if size <= 0 {
+            EngineLog.emit("[AVIOReader] no probe resolved a size, streaming mode (forward-only)", category: .demux)
+        }
+        return size > 0 ? size : -1
     }
 
     /// Range GET cancelled at didReceive response (no body transfers). Returns the total from
