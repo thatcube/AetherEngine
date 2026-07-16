@@ -10,6 +10,116 @@ the public-API contract.
 
 ## [Unreleased]
 
+### Added
+
+- **`AetherEngine.probeDetectingAtmos(url:/source:)`: opt-in, authoritative E-AC-3 JOC (Dolby Atmos) detection.** FFmpeg only populates `AVCodecContext.profile == AV_PROFILE_EAC3_DDP_ATMOS` (30) after decoding an audio frame, so the lightweight `probe(url:)`/`probe(source:)` path (demux + `avformat_find_stream_info` only, no decoders) cannot reliably report `TrackInfo.isAtmos` for JOC. The new API opens the EAC3 decoder and decodes the minimum packets/one frame needed to read the authoritative post-decode profile, bounded by `AtmosDetectionOptions` (packet/byte/wall-clock caps, default 64 packets / 8 MiB / 2 s) with no video decode, no HLS server, and no playback session; it tolerates malformed/no-audio/non-EAC3 sources by degrading to "not confirmed" rather than throwing, and only ever flips a track's `isAtmos` from `false` to `true` (never overwrites an existing `true`). `probe(url:)`/`probe(source:)` themselves are completely unmodified -- this is a separate, strictly-opt-in entry point for hosts (e.g. a details screen) that need an authoritative Atmos badge, not a flag on the default probe.
+
+## [5.3.1] - 2026-07-16
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.3.1))
+
+### Fixed
+
+- **Credential headers are no longer replayed onto cross-origin redirect targets (#126 follow-up).** The redirect handler shared by the persistent reader and both size probes reapplied every caller-supplied header, including `Authorization`, to whatever URL a redirect landed on. A media server 307-redirecting to a cross-origin presigned object-storage URL (query-string auth) then rejected the request with 400 (two conflicting auth mechanisms), every probe went blind, and the reader degraded to forward-only streaming mode, breaking moov-at-end MP4s against a fully byte-seekable target. It also disclosed the media-server token to foreign hosts. Credentials (`Authorization`, `Proxy-Authorization`, `Cookie`, Emby/Jellyfin token headers) are now replayed only to a same-host target with no TLS downgrade; `Range` and non-credential extra headers still survive cross-host redirects for header-dependent proxies (#8 behavior unchanged). Thanks to YangHanqing for the precise A/B diagnosis.
+
+## [5.3.0] - 2026-07-16
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.3.0))
+
+### Added
+
+- **Live audio delivery is decoupled from video decode pace (#107).** The software live (DVR) feeder fed audio interleaved behind the video renderer's back-pressure gate, capping the audio renderer's lead over the clock below one second; on devices where software 1080i decode plus deinterlacing runs near real time that margin is zero and every feeder stall was an audible dropout. An audio look-ahead pump now decodes and enqueues audio from the DVR ring up to a 4 s lead independent of the video path, so a slow video decode degrades to late video frames under smooth audio. DVR seeks reset the pump cursor atomically alongside the combined cursor.
+- **Live-edge source underruns pause and rebuffer instead of chopping forever (#107).** When the source itself briefly delivers below real time and playback drains the ring at the live edge, the free-running synchronizer clock used to outrun the stream permanently, leaving every later sample in the clock's past (continuous chopping that never recovered). The clock now pauses at 0.15 s of remaining audio lead, refills, and resumes at 2 s, mirroring AVPlayer's stall handling on the native path.
+- **`aetherctl play --audio-stats` and `--host-calls seekback`.** The play harness can now tap the decoded PCM and report per-second audio lead plus source-PTS continuity gaps, and script a DVR rewind plus live-edge return; this is the tooling the audio-chopping report was diagnosed and verified with.
+
+## [5.2.1] - 2026-07-16
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.2.1))
+
+### Changed
+
+- **Open-time size probes run concurrently (#107 follow-up).** The Range / HEAD / bounded-range fallback ladder for origins whose data connection resolves no length ran sequentially, tripling open latency on genuinely length-less sources (each probe pays the origin's full connect latency). The primary open-ended range probe still fires first and alone; the two fallbacks start 750 ms later in parallel, first positive size wins. Origins that resolve the primary inside the stagger window see identical wire traffic. Verified 17.2 s to 12.1 s against a 3 s-latency length-less origin; probe requests and budgets unchanged.
+
+## [5.2.0] - 2026-07-16
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.2.0))
+
+### Added
+
+- **Teletext subtitles render on the overlay with page-state semantics (#107).** DVB teletext (libzvbi) captions now reach `subtitleCues` on every software session shape. libzvbi emits page content open-ended ("until replaced") and page erases as rect-less clear events; both now carry a text trim that closes earlier open cues at the event start, so live roll-up captions build and replace cleanly instead of accumulating. Open-ended windows are additionally capped at 120 s as a ghost-line bound. Validated end-to-end against Australian FTA broadcasts (1080i25 H.264, captions on page 801). Thanks to tresby for the tuner access that made the live validation possible.
+- **`aetherctl play`.** Full load+play session smoke test: 1 Hz transport telemetry, `--live` / `--dvr-window`, `--subs <codec-or-lang>` cue logging, and `--host-calls` mimicry of host post-load call sequences. Fails loud when the clock does not advance or a selected subtitle track produces no cues.
+
+### Fixed
+
+- **Mid-stream-joined sources no longer freeze on the first frame (#107).** A live tuner MPEG-TS opened without `isLive`, live without a DVR window, or a capture file cut mid-broadcast delivers its first samples hours past the load anchor; the combined demux loop armed the synchronizer at the load anchor (0 on a fresh load), scheduling every A/V sample far in the future. The clock now re-anchors at the first decoded sample PTS when it deviates from the load anchor by more than 2 s (`SWClockAnchorPolicy`); positions stay session-relative through the anchor's session zero while `sourceTime` rides the raw source axis, matching the native path's split.
+- **Live-DVR sessions feed subtitle packets again (#107).** The live reader loop only ring-buffered audio/video; subtitle packets never reached the session packet store, starving the overlay drainer on every live+DVR session.
+- **Host rate changes before clock arming no longer wedge the session (#107).** A `setRate` issued between `load()` and the demux loop's clock arming requested a rate at a clock time where no media will ever exist; `AVSampleBufferRenderSynchronizer`'s delayed-rate-change machinery then held the effective rate at 0 permanently. `setRate` / `pause` / play-resume now gate the synchronizer call on the armed-clock latch, and arming applies the latest host rate. `AudioOutput` logs every clock mutation.
+
+## [5.1.0] - 2026-07-16
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.1.0))
+
+### Added
+
+- **Paused-background grace window on iOS (#127).** A paused session used to tear down the moment the app backgrounded, so a 10-30 s app switch paid a full pipeline rebuild. The teardown is now deferred by `backgroundTeardownGraceSeconds` (default 15 s, 0 restores the immediate teardown), held under a background-task assertion; returning inside the window resumes on the live pipeline with no reload. At expiry the background action is re-evaluated (PiP / lock-screen play can change mid-window) and the wedge-safe teardown runs while the app is still genuinely running, never across an idle suspension. A playing session with background playback disabled still tears down immediately; tvOS keeps the unconditional teardown. Thanks to dlev02 for the proposals and device logs.
+- **Public `isSessionReady` (#127).** `@Published` engine flag, true once the active session's transport is ready to accept seeks and report real time (native path: AVPlayerItem readyToPlay), false across every teardown. Hosts gate corrective actions (restore watchdogs, position clamps) on it instead of inferring readiness from `currentTime` being pinned at 0.
+
+### Fixed
+
+- **Pre-ready host seeks no longer clamp to 0:00 (#127).** A host seek forwarded while the AVPlayer item was pre-ready clamped to 0 against empty seekable ranges and replaced `load()`'s own pending start-position seek, restarting playback from the file head. Such seeks are now deferred and the latest one replays at readiness.
+
+## [5.0.7] - 2026-07-15
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.0.7))
+
+### Fixed
+
+- **Unknown-length HTTP MP4 no longer enters a seek-dependent path and silently produces zero packets (#126).** When no size probe resolved a length (an origin answering `bytes=0-` with 200/chunked and rejecting HEAD, e.g. Emby behind a buffering proxy), the AVIO reader degraded to forward-only streaming mode but still advertised itself as seekable, so the mov demuxer parsed a tail moov it could never rewind to and every sample read died with "partial file" while the host waited on a playlist that never gained a segment. Three layers: a last-resort bounded `bytes=0-1` range probe recovers the real size from origins that honor ranges but omit lengths on open-ended requests (full seekable playback, the common case); a source that genuinely resolves no size now reports itself non-seekable to both FFmpeg and the routing layer, so moov-at-end files fail cleanly at open and faststart files route to the sequential software path; and a VOD producer that dies on a read error having produced nothing now surfaces a fatal load error instead of leaving AVPlayer in `waitingToPlay` until the host's timeout. Thanks to YangHanqing for the precise log capture and the VLC control test.
+
+## [5.0.6] - 2026-07-15
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.0.6))
+
+### Fixed
+
+- **Playback resumes after system audio-session interruptions that end with `.shouldResume` (Sodalite iOS device report).** The engine had no `AVAudioSession` interruption handling at all: a foreign session claiming audio (a phone call, Siri, or a live-camera PiP with record priority) paused AVPlayer through the system, and when the interruption ended playback stayed silent until a manual play. The system pause never goes through `pause()`, so the native host's durable `playIntent` (#122) survives the interruption and arms a resume; on interruption end the engine re-issues `play()` only when the system grants `.shouldResume` (a call ending, Siri dismissing). Sessions that end without it, such as a camera PiP closing, stay paused by design and resume manually. An explicit user `pause()` or stop disarms the resume; in the background only audio backends may resume. Interruptions are also logged with type, reason, options, and session state, so foreign-session conflicts are visible in captures.
+
+## [5.0.5] - 2026-07-14
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.0.5))
+
+### Added
+
+- **A host can now mount media paused with `LoadOptions.autoplay` (#124).** Every load path ended in an unconditional autostart, so a host that wanted to hold a pause at mount (a synchronized-start lobby that loads several devices and starts them together on a signal, or a hold-at-mount / resume prompt) always received one engine-initiated resume at load completion and had to claw it back with a racy state-sink clamp, the same declared-versus-real split as #122/#123. `LoadOptions.autoplay` defaults to `true`, so every current caller is byte-identical. Set it to `false` and the load skips its terminal `play()` and `state = .playing` across all paths (native VOD, software, both audio backends, and the lean native remote-HLS path), leaves `playIntent` false, and settles `.loading` to `.paused` through the existing `host.$isReady` readiness waypoint; the host resumes later with `play()`. On the native VOD path the SDR-to-HDR cold-start readiness gate is skipped for a paused mount, since it is an autostart-path recovery that plays to poll readiness. The `reloadAtCurrentPosition` path (audio switch, live rejoin) is unchanged. Thanks to rrgomes for the device traces and the code-level shape of the fix.
+
+### Fixed
+
+- **Subtitle cues no longer starve permanently after a backward seek into cache-resident content (#125).** During a long mixed-direction seek storm on a heavy 4K Dolby Vision remux with embedded PGS and SubRip tracks, subtitle cues could stop rendering partway through and never return, each track re-arm logging `backfilled 0 cues` over an armed but empty store. The #112 overlay is fed only from the session's `SubtitlePacketStore`, whose single writer is the producer demux pump, and the playhead-paced drainer pruned that store every tick at `playhead - retentionSeconds`. A backward jump into segment-cache-resident content is served without a producer restart and the pump stays parked forward, so once a forward excursion pushed the prune cutoff past the returned region its packets were gone and never re-harvested, leaving the drain window permanently empty. The trailing time-prune is removed; the store is now bounded only by its existing per-stream byte cap (evict-oldest), so text tracks keep the whole session and bitmap tracks keep a wide trailing window, matching how the segment cache retains history for backward seeks rather than clamping to a window ahead of the playhead. A backward seek past a bitmap stream's evicted edge is a deferred windowed-re-read fallback. Thanks to rrgomes for the code-level diagnosis (the pump as the store's only writer, the cache-resident backward jump that skips the restart) and the byte-retention fix direction.
+
+## [5.0.4] - 2026-07-13
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.0.4))
+
+### Fixed
+
+- **Subtitle cues no longer pace ahead of a frozen picture during a queued seek chase (#123).** Under sustained *queued* skip bursts on a heavy 4K Dolby Vision asset (a new burst issued into an unfinished settle), the engine's reported clock adopted each new target immediately while the underlying player rebuilt, and `sourceTime` (documented as the on-screen frame, not the scrub target, #49) parked tens of seconds ahead of the picture for 14 to 33 s. Any host pacing subtitle cues off `sourceTime` then rendered cues for positions 10 to 30 s ahead over a still frame until convergence. The VOD seek finalize and the native host's seek completion stamped `sourceTime` (and `renderedTime`) onto the target unconditionally at landing, but during a chase the player is `waitingToPlayAtSpecifiedRate` with the picture frozen behind the target, and the 100 ms periodic observer that would walk the clock back to the rendered frame is silent while buffering, so the stamp stuck. Both stamps are now gated on whether the landed frame is actually presented: a playing or paused landing shows the target frame and settles onto it immediately (isolated and paused scrubs are unchanged), while a landing still buffering toward the target holds `sourceTime` on the rendered frame and lets the observer settle it when playback resumes and the frame is delivered. Cues glued to `sourceTime` stay glued to the picture through the chase, and `abs(currentTime - sourceTime)` stays honest as a converging gap a host can gate cue rendering on. The phase logs ruled out the producer restart coalescer (nine cheap restarts across roughly 107 seeks, the long stretches had zero rebuilds and were pure player buffering). Thanks to rrgomes for the triangulated three-clock traces and the phase breakdown that isolated the finalize stamp.
+
+## [5.0.3] - 2026-07-12
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.0.3))
+
+### Fixed
+
+- **A seek issued while paused no longer re-engages playback (#122).** With playback paused by the host, a skip or scrub commit spontaneously resumed the underlying player (rate 1) with no host `play()` call. The normal seek finalize forced `state = .playing` regardless of the transport intent in effect when the seek was issued. That both reported playing after a paused scrub and weaponised the #93 stall-recovery reassert: the seek's own paused landing (`timeControlStatus == .paused`), arriving while `state == .playing` inside an open recovery window (a backward skip's rebuffer opens one), was misread as a spurious pause, so the engine called `host.play()`. The finalize now derives its state from the durable transport intent (the native host's `playIntent`, which a seek never touches), so a paused scrub lands paused, presenting the new frame, and `engineStateIsPlaying` stays honest so the reassert only fires on genuine stalls. A playing scrub is unchanged. Thanks to rrgomes for the traces isolating the three trigger points and confirming a plain pause is never affected.
+
+## [5.0.2] - 2026-07-11
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.0.2))
+
+### Fixed
+
+- **Embedded SRT cues no longer duplicate after rapid seeking (#121).** The overlay drainer rebuilds the `EmbeddedSubtitleDecoder` on every seek (`.resetAndDecode`), which restarts its per-instance dedupe set and cue-id counter at zero. Because `subtitleCues` is intentionally retained across the seek, the backscan re-decoded cues still in the store, and the insert path only replaced same-start bitmap cues while always appending text cues, so identical lines accumulated (a report saw the count grow 4 to 7 to 11) and the reset decoder ids collided with retained ids (`ForEach(id:)` "occurs multiple times"). Both invariants now live at the retained-store insert funnel, which sees the whole session rather than one decoder generation: a text cue already present with the same start, end, and text is dropped (content, not id, so simultaneous distinct speaker lines and genuine repeats at new timestamps still insert), and every cue that lands is stamped with a session-monotonic id. Thanks to wunax for the source-level diagnosis and the exact repro.
+
 ## [5.0.1] - 2026-07-10
 
 ([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.0.1))
