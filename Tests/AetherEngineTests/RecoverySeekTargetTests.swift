@@ -67,8 +67,30 @@ struct RecoverySeekTargetTests {
 
     @Test("a published completion is the authoritative deadline catch-up signal")
     func completionPublicationDecision() {
-        #expect(AetherEngine.shouldCatchUpDeadlineLanding(completionPublished: true))
-        #expect(!AetherEngine.shouldCatchUpDeadlineLanding(completionPublished: false))
+        #expect(AetherEngine.shouldCatchUpDeadlineLanding(renderedTimePublished: true))
+        #expect(!AetherEngine.shouldCatchUpDeadlineLanding(renderedTimePublished: false))
+    }
+
+    @Test("a short seek needs rendered movement or completion evidence")
+    func shortSeekLandingEvidence() {
+        #expect(!AetherEngine.pendingSeekHasRenderedLandingEvidence(
+            rendered: 40,
+            target: 43,
+            initialRendered: 40,
+            completionRenderedTimePublished: false
+        ))
+        #expect(AetherEngine.pendingSeekHasRenderedLandingEvidence(
+            rendered: 43,
+            target: 43,
+            initialRendered: 40,
+            completionRenderedTimePublished: false
+        ))
+        #expect(AetherEngine.pendingSeekHasRenderedLandingEvidence(
+            rendered: 40,
+            target: 43,
+            initialRendered: 40,
+            completionRenderedTimePublished: true
+        ))
     }
 
     @MainActor
@@ -96,6 +118,11 @@ struct RecoverySeekTargetTests {
         #expect(AetherEngine.seekRecoveredState(
             transportIntentIsPlaying: false,
             statusIsPaused: false,
+            shouldReassertPausedStatus: true
+        ) == .playing)
+        #expect(AetherEngine.seekRecoveredState(
+            transportIntentIsPlaying: false,
+            statusIsPaused: true,
             shouldReassertPausedStatus: true
         ) == .paused)
         #expect(AetherEngine.seekRecoveredState(

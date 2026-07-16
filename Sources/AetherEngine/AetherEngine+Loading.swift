@@ -41,10 +41,19 @@ extension AetherEngine {
     /// Settle the public clock from the rendered frame when that late landing retires the target so
     /// a paused landing does not wait forever for another periodic clock tick.
     @discardableResult
-    func settleRecoveryClockIfRenderedTargetLanded(rendered: Double, shift: Double) -> Bool {
+    func settleRecoveryClockIfRenderedTargetLanded(
+        rendered: Double,
+        shift: Double,
+        completionRenderedTimePublished: Bool
+    ) -> Bool {
         guard pendingRecoverySeekDeadlineExpired,
               let pending = pendingRecoverySeekClockTarget,
-              Self.pendingSeekLanded(rendered: rendered, target: pending) else {
+              Self.pendingSeekHasRenderedLandingEvidence(
+                  rendered: rendered,
+                  target: pending,
+                  initialRendered: pendingSeekInitialRenderedPosition,
+                  completionRenderedTimePublished: completionRenderedTimePublished
+              ) else {
             return false
         }
         if Self.shouldReanchorSubtitlesOnLateSeekLanding(
@@ -609,7 +618,9 @@ extension AetherEngine {
                 if let pending = self.pendingRecoverySeekClockTarget {
                     if !self.settleRecoveryClockIfRenderedTargetLanded(
                         rendered: value,
-                        shift: shift
+                        shift: shift,
+                        completionRenderedTimePublished:
+                            self.nativeHost?.latestSeekRenderedTimePublished ?? false
                     ) {
                         let prev = self.lastRenderedForPendingSeek
                         if value > prev, value - prev < 1.0 {

@@ -772,6 +772,9 @@ public final class AetherEngine: ObservableObject {
     /// True when a starved deadline already reset subtitle discontinuity state before the pending
     /// seek landed. Healthy late landings perform that reset in the rendered-time sink instead.
     var pendingRecoverySeekSubtitlesReanchored = false
+    /// Rendered frame parked on screen when the current native seek began. Distinguishes a genuine
+    /// late landing from a short seek whose unchanged old frame is already within the 5 s window.
+    var pendingSeekInitialRenderedPosition: Double = 0
     /// Off-main mirror of `pendingRecoverySeekClockTarget` so the session's wedge re-anchor can aim
     /// the producer at the pending target (#93 retest). Kept in sync via `setPendingRecoverySeekTarget`.
     let recoverySeekTargetMirror = AtomicOptionalDouble()
@@ -784,6 +787,9 @@ public final class AetherEngine: ObservableObject {
         pendingRecoverySeekDeadlineExpired = false
         pendingRecoverySeekSubtitlesReanchored = false
         pendingRecoverySeekClockTarget = target
+        if target == nil {
+            pendingSeekInitialRenderedPosition = 0
+        }
         recoverySeekTargetMirror.set(target)
     }
     nonisolated static let pendingSeekLandedEpsilon: Double = 5.0
@@ -814,6 +820,24 @@ public final class AetherEngine: ObservableObject {
     /// Pure decision: rendered output near the target means the seek effectively landed.
     nonisolated static func pendingSeekLanded(rendered: Double, target: Double) -> Bool {
         abs(rendered - target) < pendingSeekLandedEpsilon
+    }
+
+    nonisolated static func pendingSeekHasRenderedLandingEvidence(
+        rendered: Double,
+        target: Double,
+        initialRendered: Double,
+        completionRenderedTimePublished: Bool
+    ) -> Bool {
+        guard pendingSeekLanded(rendered: rendered, target: target) else { return false }
+        if completionRenderedTimePublished { return true }
+
+        let initialDistance = abs(initialRendered - target)
+        let currentDistance = abs(rendered - target)
+        guard abs(rendered - initialRendered) > 0.1 else { return false }
+        if initialDistance < pendingSeekLandedEpsilon {
+            return currentDistance <= 0.5
+        }
+        return true
     }
 
     nonisolated static func shouldReanchorSubtitlesOnLateSeekLanding(
@@ -1084,17 +1108,18 @@ public final class AetherEngine: ObservableObject {
         transportIntentIsPlaying ? .playing : .paused
     }
 
-    /// Reconcile native seek completion with a pause observed while the regular time-control sink
-    /// was gated by `.seeking`. Engine-routed pause intent always wins. A live `.paused` is external
-    /// unless the bounded stall-recovery policy deliberately reasserts playback.
+    /// Reconcile native seek completion while the regular time-control sink was gated by `.seeking`.
+    /// Live AVPlayer status captures an external play that superseded older engine pause intent; a
+    /// live pause wins unless the bounded stall-recovery policy deliberately reasserts playback.
     nonisolated static func seekRecoveredState(
         transportIntentIsPlaying: Bool,
         statusIsPaused: Bool,
         shouldReassertPausedStatus: Bool
     ) -> PlaybackState {
-        guard transportIntentIsPlaying else { return .paused }
-        if statusIsPaused, !shouldReassertPausedStatus {
-            return .paused
+        if statusIsPaused {
+            guard transportIntentIsPlaying, shouldReassertPausedStatus else {
+                return .paused
+            }
         }
         return .playing
     }
@@ -1112,7 +1137,8 @@ public final class AetherEngine: ObservableObject {
             stallRecoveryWindowUntil = now.addingTimeInterval(Self.stallRecoveryWindowSeconds)
             stallRecoveryReasserts = 0
         }
-        let statusIsPaused = host.timeControlStatus == .paused
+        let liveStatus = host.liveTimeControlStatus
+        let statusIsPaused = liveStatus == .paused
         let transportIntentIsPlaying = host.transportIntentIsPlaying
         let shouldReassertPausedStatus = Self.shouldReassertPlayDuringRecovery(
             statusIsPaused: statusIsPaused,
@@ -1128,7 +1154,7 @@ public final class AetherEngine: ObservableObject {
         )
         state = recoveredState
         isBuffering = recoveredState == .playing
-            && host.timeControlStatus == .waitingToPlayAtSpecifiedRate
+            && liveStatus == .waitingToPlayAtSpecifiedRate
         if shouldReassertPausedStatus {
             stallRecoveryReasserts += 1
             playIntentMirror.set(true)
@@ -2128,7 +2154,9 @@ public final class AetherEngine: ObservableObject {
             // never lands and the recovery chain must aim here, not at the frozen clock.
             setPendingRecoverySeekTarget(clockTarget)
             pendingSeekProgressAccum = 0
-            lastRenderedForPendingSeek = nativeHost?.renderedTime ?? 0
+            let renderedAtSeekStart = nativeHost?.renderedTime ?? 0
+            pendingSeekInitialRenderedPosition = renderedAtSeekStart
+            lastRenderedForPendingSeek = renderedAtSeekStart
             // Await real AVPlayer landing so isSeeking spans it (#37/#38), but bound the wait (#65): a seek
             // AVPlayer can never land (producer-wedge starvation) must not leave the optimistic clock latched
             // forever. A normal/slow-but-buffering seek lands or keeps buffering well within the budget.
@@ -2156,11 +2184,12 @@ public final class AetherEngine: ObservableObject {
                 // completion published renderedTime first, its sink still saw deadlineExpired=false.
                 // Catch that ordering now; otherwise the later publication will settle through the sink.
                 if Self.shouldCatchUpDeadlineLanding(
-                    completionPublished: host.latestSeekCompletionPublished
+                    renderedTimePublished: host.latestSeekRenderedTimePublished
                 ),
                    settleRecoveryClockIfRenderedTargetLanded(
                        rendered: avpReal,
-                       shift: playlistShiftSeconds
+                       shift: playlistShiftSeconds,
+                       completionRenderedTimePublished: true
                    ) {
                     nativeClockSeconds = avpReal
                     clock.sourceTime = avpReal + playlistShiftSeconds
@@ -2271,8 +2300,10 @@ public final class AetherEngine: ObservableObject {
         isStarved
     }
 
-    nonisolated static func shouldCatchUpDeadlineLanding(completionPublished: Bool) -> Bool {
-        completionPublished
+    nonisolated static func shouldCatchUpDeadlineLanding(
+        renderedTimePublished: Bool
+    ) -> Bool {
+        renderedTimePublished
     }
 
     /// Deprecated alias. The engine clock is now unified onto source PTS; prefer `seek(to:)` in new code.
