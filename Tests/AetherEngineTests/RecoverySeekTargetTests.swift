@@ -57,6 +57,12 @@ struct RecoverySeekTargetTests {
     func deadlineRestartDecision() {
         #expect(AetherEngine.shouldReanchorProducerAfterSeekDeadline(isStarved: true))
         #expect(!AetherEngine.shouldReanchorProducerAfterSeekDeadline(isStarved: false))
+        #expect(AetherEngine.shouldReanchorSubtitlesOnLateSeekLanding(
+            alreadyReanchored: false
+        ))
+        #expect(!AetherEngine.shouldReanchorSubtitlesOnLateSeekLanding(
+            alreadyReanchored: true
+        ))
     }
 
     @Test("seek recovery reasserts only pauses covered by the bounded recovery policy")

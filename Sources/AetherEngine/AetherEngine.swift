@@ -766,6 +766,9 @@ public final class AetherEngine: ObservableObject {
     /// the target's neighbourhood, on organic playback progress elsewhere (stale: AVPlayer
     /// abandoned the seek), and on load reset / stop.
     var pendingRecoverySeekClockTarget: Double? = nil
+    /// True when a starved deadline already reset subtitle discontinuity state before the pending
+    /// seek landed. Healthy late landings perform that reset in the rendered-time sink instead.
+    var pendingRecoverySeekSubtitlesReanchored = false
     /// Off-main mirror of `pendingRecoverySeekClockTarget` so the session's wedge re-anchor can aim
     /// the producer at the pending target (#93 retest). Kept in sync via `setPendingRecoverySeekTarget`.
     let recoverySeekTargetMirror = AtomicOptionalDouble()
@@ -775,6 +778,9 @@ public final class AetherEngine: ObservableObject {
     /// Single write path for the recovery seek intent: the MainActor field and its off-main mirror
     /// must never diverge (a stale mirror would teleport a wedge re-anchor to a retired target).
     func setPendingRecoverySeekTarget(_ target: Double?) {
+        if target != pendingRecoverySeekClockTarget {
+            pendingRecoverySeekSubtitlesReanchored = false
+        }
         pendingRecoverySeekClockTarget = target
         recoverySeekTargetMirror.set(target)
     }
@@ -806,6 +812,12 @@ public final class AetherEngine: ObservableObject {
     /// Pure decision: rendered output near the target means the seek effectively landed.
     nonisolated static func pendingSeekLanded(rendered: Double, target: Double) -> Bool {
         abs(rendered - target) < pendingSeekLandedEpsilon
+    }
+
+    nonisolated static func shouldReanchorSubtitlesOnLateSeekLanding(
+        alreadyReanchored: Bool
+    ) -> Bool {
+        !alreadyReanchored
     }
 
     /// Pure decision: organic playback progress far from the target means AVPlayer abandoned the
@@ -2153,6 +2165,7 @@ public final class AetherEngine: ObservableObject {
                     reanchorProducerToPlaylistTime(recoveryAnchor)
                     // The playhead will jump when the restarted producer lets the pending seek land.
                     reanchorSubtitleOverlays()
+                    pendingRecoverySeekSubtitlesReanchored = true
                 }
                 // pendingRecoverySeekClockTarget deliberately survives this reconcile: the UI
                 // clock gives up the phantom target, but recovery keeps aiming there until rendered

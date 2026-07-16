@@ -46,6 +46,11 @@ extension AetherEngine {
               Self.pendingSeekLanded(rendered: rendered, target: pending) else {
             return false
         }
+        if Self.shouldReanchorSubtitlesOnLateSeekLanding(
+            alreadyReanchored: pendingRecoverySeekSubtitlesReanchored
+        ) {
+            reanchorSubtitleOverlays()
+        }
         setPendingRecoverySeekTarget(nil)
         clock.currentTime = PresentationAxis.display(
             sourcePTS: rendered + shift,
