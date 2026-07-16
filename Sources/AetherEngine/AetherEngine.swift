@@ -2388,8 +2388,8 @@ public final class AetherEngine: ObservableObject {
         await seek(to: seconds)
     }
 
-    public func stop() {
-        stopInternal()
+    public func stop(resetDisplayCriteria: Bool = true) {
+        stopInternal(resetDisplayCriteria: resetDisplayCriteria)
         state = .idle
         clock.currentTime = 0
         clock.bufferedPosition = 0
