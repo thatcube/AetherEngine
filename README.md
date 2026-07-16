@@ -289,7 +289,7 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 
 - **[docs/architecture.md](docs/architecture.md)**: the three playback pipelines, the source-file map, dependencies, the SwiftUI `Menu` pattern.
 - **[docs/formats.md](docs/formats.md)**: codec / container coverage, HDR routing, audio bridging, subtitles, frame extraction, disc playback, live ingest, and known limitations.
-- **[docs/cli.md](docs/cli.md)**: the `aetherctl` repro CLI (twenty subcommands).
+- **[docs/cli.md](docs/cli.md)**: the `aetherctl` repro CLI (twenty-one subcommands).
 - **[CHANGELOG.md](CHANGELOG.md)**: per-release index.
 
 ## Stability and versioning

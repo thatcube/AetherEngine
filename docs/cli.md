@@ -8,6 +8,7 @@ swift run aetherctl serve <url>          # park the engine's loopback HLS-fMP4 s
 swift run aetherctl validate <url>       # serve + run mediastreamvalidator, exit
 swift run aetherctl segverify <url>      # SW-decode each loopback segment in isolation; report independence (#92)
 swift run aetherctl swdecode <url>       # open SoftwareVideoDecoder, decode N packets, report
+swift run aetherctl play <url>           # full load+play session smoke test: 1 Hz telemetry, cue log, host-call mimicry
 swift run aetherctl dovitest <url>       # convert a DV Profile 7 stream to 8.1, dump for dovi_tool
 swift run aetherctl pktdump <url>        # dump raw demuxer packet timing (dts/pts/keyframe) per open profile
 swift run aetherctl dualsubs <file> ...  # dual subtitle-track render probe (--primary / --secondary stream index)
@@ -26,7 +27,7 @@ swift run aetherctl smbtest <smb-url>    # play a file off an SMB2/3 share via t
 swift run aetherctl <url>                # alias for serve (backwards compat)
 ```
 
-Twenty subcommands plus the bare-URL `serve` alias.
+Twenty-one subcommands plus the bare-URL `serve` alias.
 
 ## probe
 
@@ -64,6 +65,20 @@ Opens `SoftwareVideoDecoder` for the source's video stream, feeds up to N packet
 - SW decode end-to-end healthy (if real playback still hangs, the failure is downstream in `SoftwarePlaybackHost` frame-enqueue, display-layer attach, or audio-clock sync)
 
 Backed by the public `AetherEngine.swDecodeProbe(url:maxPackets:options:)` static API returning `SoftwareDecodeProbeResult`. Hosts can use the same probe in their own diagnostic overlays.
+
+## play
+
+Runs a full `load()` + `play()` session exactly like a host app and prints 1 Hz transport telemetry (state, phase, currentTime, sourceTime, buffered frontier, duration). Where `swdecode` proves the decoder, `play` proves the transport: it fails loud on the two silent failure modes of a session that "loads fine" but never actually plays (#107): exit 2 when the clock does not advance, exit 3 when a selected subtitle track produces no cues.
+
+```bash
+swift run aetherctl play <url>                                  # VOD load, 30 s telemetry
+swift run aetherctl play --seconds 60 <url>                     # longer window
+swift run aetherctl play --live --dvr-window 1800 <url>         # live path with a DVR ring
+swift run aetherctl play --subs teletext <url>                  # activate the first matching subtitle track, log every cue + trim
+swift run aetherctl play --host-calls reloadlive,play,extractor,setrate <url>   # mimic a host's post-load call sequence
+```
+
+`--subs <codec-or-lang>` matches against the track's libavcodec name or language and logs every overlay cue and cue trim as it lands. `--host-calls` replays host post-load behavior against the fresh session: `play`, `extractor` (`makeFrameExtractor`), `setrate` (`setRate(1.0)`), and `reloadlive` (reload the URL on the live path when the probe flags it live, the AetherPlayer Open URL flow); this is how the pre-arming `setRate` wedge was isolated.
 
 ## segverify
 
