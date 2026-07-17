@@ -734,28 +734,37 @@ final class NativeAVPlayerHost {
         let gen = seekGeneration
         let wasInFlight = seekInFlight
         if !seekInFlight { seekInFlight = true }
-        try? await Task.sleep(nanoseconds: UInt64(deadlineSeconds * 1_000_000_000))
-        // A newer seek arrived while we waited: let it own the final state.
-        guard gen == seekGeneration else { return false }
-        let now = avPlayer.currentTime().seconds
-        // The original seek's completion clears seekInFlight for this generation when it physically lands;
-        // if it fired during our wait that is authoritative. Otherwise fall back to a directional position
-        // check: a zero-tolerance seek lands AT the target, then a playing item advances in the seek
-        // direction, so a forward seek can render PAST the target (and a backward seek a hair past,
-        // downward). Accept an overshoot in the seek direction; the pinned pre-seek playhead sits far on
-        // the opposite side, so it is never mistaken for a landing. This stops a forward overshoot from
-        // reading as "still pending" and triggering a backward-yank re-seek on an already-playing item.
-        let completionLanded = wasInFlight && !seekInFlight
-        let positionLanded = now.isFinite
-            && (forward ? now >= seconds - 0.75 : now <= seconds + 0.75)
-        let landed = completionLanded || positionLanded
-        if landed {
-            // The completion may not have run its MainActor job yet; settle so the observer stays gated
-            // until the engine finalizes and mirror what the completion would publish.
-            seekInFlight = false
-            if now.isFinite { currentTime = now }
+        // Poll for landing rather than sleeping the whole window: on a slow extend-path seek AVPlayer can
+        // resume playing partway through the wait, and finalize (which clears the consumer's loading
+        // spinner) must not lag that edge by a full ~4s tick -- that left the spinner up over already-
+        // playing video (device: timeControlStatus=playing at 25360.989 but seek END at 25363.415).
+        // Edge-detect the landing at ~AVPlayer's own 100ms observer cadence so finalize tracks it.
+        let pollInterval = 0.1
+        let deadline = Date().addingTimeInterval(deadlineSeconds)
+        while Date() < deadline {
+            try? await Task.sleep(nanoseconds: UInt64(pollInterval * 1_000_000_000))
+            // A newer seek arrived while we waited: let it own the final state.
+            guard gen == seekGeneration else { return false }
+            let now = avPlayer.currentTime().seconds
+            // The original seek's completion clears seekInFlight for this generation when it physically
+            // lands; if it fired during our wait that is authoritative. Otherwise fall back to a directional
+            // position check: a zero-tolerance seek lands AT the target, then a playing item advances in the
+            // seek direction, so a forward seek can render PAST the target (and a backward seek a hair past,
+            // downward). Accept an overshoot in the seek direction; the pinned pre-seek playhead sits far on
+            // the opposite side, so it is never mistaken for a landing. This stops a forward overshoot from
+            // reading as "still pending" and triggering a backward-yank re-seek on an already-playing item.
+            let completionLanded = wasInFlight && !seekInFlight
+            let positionLanded = now.isFinite
+                && (forward ? now >= seconds - 0.75 : now <= seconds + 0.75)
+            if completionLanded || positionLanded {
+                // The completion may not have run its MainActor job yet; settle so the observer stays gated
+                // until the engine finalizes and mirror what the completion would publish.
+                seekInFlight = false
+                if now.isFinite { currentTime = now }
+                return true
+            }
         }
-        return landed
+        return false
     }
 
     func setRate(_ value: Float) {
