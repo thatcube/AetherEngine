@@ -170,6 +170,40 @@ struct RecoverySeekTargetTests {
             islandFloor: AetherEngine.nativeSeekProgressIslandFloorSeconds))
     }
 
+    @Test("the device-trace backward-into-unbuffered seek does not extend and re-anchors, holding at target")
+    @MainActor
+    func deviceTraceBackwardSeekReanchorsAndHoldsAtTarget() {
+        // Reconstruct SEEK 3 (c5f3cd5 trace): BACK 2643.20 -> 741.78 into unbuffered content, at deadline
+        // rendered==buffered==2643.50 (AVPlayer drained to its buffer edge at the old position). The target
+        // sits BEHIND the frozen playhead, so avPlayerBufferAheadSeconds() (which counts only ranges ahead
+        // of `now`) never sees it: the disjoint forward island is structurally 0. The engine must NOT
+        // extend (no forward island filling) and must fall through to recovery.
+        let island = AetherEngine.disjointForwardIslandSeconds(
+            totalForwardAhead: 0.0, contiguousForwardAhead: 2643.50 - 2643.50)
+        #expect(island == 0.0)
+        #expect(!AetherEngine.shouldExtendSeekDeadlineForProgress(
+            disjointIslandSeconds: island, extensionsUsed: 0,
+            maxExtensions: AetherEngine.nativeSeekMaxDeadlineExtensions,
+            islandFloor: AetherEngine.nativeSeekProgressIslandFloorSeconds))
+
+        // buffered == rendered => no forward buffer => genuinely starved (unlike the forward-island case
+        // where the metric misreads a slow-but-working seek as starved).
+        let starved = seekIsWedged(renderedTime: 2643.50, bufferedEnd: 2643.50)
+        #expect(starved)
+        // A starved deadline MUST re-anchor the producer regardless of the (upper-bound-only)
+        // within-buffer read, so the segments the target needs get produced.
+        let targetWithinBuffer = AetherEngine.seekTargetWithinContiguousBuffer(
+            target: 741.78, bufferedEnd: 2643.50)
+        #expect(AetherEngine.shouldReanchorProducerAfterSeekDeadline(
+            isStarved: starved, targetWithinContiguousBuffer: targetWithinBuffer))
+
+        // The recovery re-anchor drives the producer to the TARGET (not the frozen old position), so the
+        // held clock and the producer converge on 741.78 rather than reverting to 2643.50.
+        let anchor = AetherEngine.recoveryAnchorPosition(
+            frozenPosition: 2643.50, pendingSeekTarget: 741.78, currentRendered: 2643.50)
+        #expect(anchor == 741.78)
+    }
+
     @Test("a published completion is the authoritative deadline catch-up signal")
     func completionPublicationDecision() {
         #expect(AetherEngine.shouldCatchUpDeadlineLanding(renderedTimePublished: true))

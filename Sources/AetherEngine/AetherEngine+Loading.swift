@@ -629,12 +629,17 @@ extension AetherEngine {
                 // reaches its neighbourhood) or goes stale (organic progress far from it, i.e.
                 // AVPlayer abandoned the seek and playback runs elsewhere).
                 if let pending = self.pendingRecoverySeekClockTarget {
-                    if !self.settleRecoveryClockIfRenderedTargetLanded(
+                    if self.settleRecoveryClockIfRenderedTargetLanded(
                         rendered: value,
                         shift: shift,
                         completionRenderedTimePublished:
                             self.nativeHost?.latestSeekRenderedTimePublished ?? false
                     ) {
+                        // A late landing settled the clock onto the target; if the deadline loop held the
+                        // clock at the target and returned without finalizing (slow-source spinner path),
+                        // leave `.seeking` now that the frame is presented.
+                        self.finalizeLateRecoverySeekLanding()
+                    } else {
                         let prev = self.lastRenderedForPendingSeek
                         if value > prev, value - prev < 1.0 {
                             self.pendingSeekProgressAccum += (value - prev)

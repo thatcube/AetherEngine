@@ -130,6 +130,22 @@ public final class AetherEngine: ObservableObject {
         recomputeSeekSignal(target: target)
     }
 
+    /// Complete the seek state after a late async recovery landing settled the clock through the
+    /// `$renderedTime` sink. The deadline loop holds the clock at the target and returns without
+    /// finalizing when a pathologically slow source has not served the target GOP within the whole
+    /// extension budget (spinner-at-target rather than the old revert + flap). When the re-anchored
+    /// producer finally serves the target, the sink settles the clock onto it; clear the
+    /// programmatic-seek gate and reconcile the transport here so `state`/`isSeeking` leave `.seeking`
+    /// instead of parking a spinner over a now-live frame. No-op unless a programmatic seek is still in
+    /// flight (the normal in-budget landing finalizes inline and clears this before the sink fires).
+    func finalizeLateRecoverySeekLanding() {
+        guard programmaticSeekInFlight else { return }
+        setProgrammaticSeek(inFlight: false, target: nil)
+        if let nativeHost {
+            reconcileNativeSeekTransport(host: nativeHost, isStarved: false)
+        }
+    }
+
     /// Wired to `HLSVideoEngine.onSeekStateChanged`; see `requestRestart`.
     func setNativeScrubSeek(inFlight: Bool, target: Double?) {
         nativeScrubSeekInFlight = inFlight
@@ -2265,6 +2281,11 @@ public final class AetherEngine: ObservableObject {
             // AVPlayer can never land (producer-wedge starvation) must not leave the optimistic clock latched
             // forever. A normal/slow-but-buffering seek lands or keeps buffering well within the budget.
             var deadlineExtensionsUsed = 0
+            // Recovery fallthrough state (backward-into-unbuffered / true wedge / budget exhausted):
+            // once the producer is re-anchored at the target we hold the clock there and wait on the
+            // re-issued seek for a bounded number of windows rather than reverting to the old position.
+            var reanchored = false
+            var postReanchorWaits = 0
             var landed = await nativeHost?.seek(to: clockTarget,
                                                 deadlineSeconds: Self.nativeSeekReconcileBudgetSeconds) ?? true
             deadlineLoop: while !landed {
@@ -2341,45 +2362,86 @@ public final class AetherEngine: ObservableObject {
                         deadlineSeconds: Self.nativeSeekExtensionBudgetSeconds)
                     continue deadlineLoop
                 }
-                // True wedge (no forward island) or extensions exhausted: reconcile the clock to the real
-                // rendered position and re-anchor a genuinely starved / target-unbuffered producer.
+                // No forward island (or extend budget exhausted). This is a true wedge, a
+                // backward-into-unbuffered seek (the target sits BEHIND the frozen playhead, so
+                // `avPlayerBufferAheadSeconds` never counts it -> island is structurally 0), or a
+                // forward seek that spent its whole extension budget. The old recovery reverted the
+                // clock to the frozen rendered position and reconciled the transport, which on a slow
+                // DV/SMB source is exactly the device-reported failure: the scrubber visibly jumps back
+                // to the pre-seek spot and the session flaps paused<->playing for ~40s while the old
+                // segment drains. Instead HOLD the clock at the target (same UX contract as the extend
+                // branch: scrubber parked at target + buffering spinner), re-anchor the producer to the
+                // target once, re-issue the seek so AVPlayer abandons the old-position buffer and targets
+                // the re-anchored region, and wait for it to land -- reconciling FORWARD to the target,
+                // never back to the rendered position.
                 let wasStarved = seekIsWedged(
                     renderedTime: avpReal, bufferedEnd: host.bufferedEnd)
                 // The pending target sits on AVPlayer's HLS clock axis, same axis `bufferedEnd`
                 // reports, so they compare directly (both are pre-display-origin playlist seconds).
                 let targetWithinBuffer = Self.seekTargetWithinContiguousBuffer(
                     target: pendingRecoverySeekClockTarget, bufferedEnd: host.bufferedEnd)
-                nativeClockSeconds = avpReal
-                // currentTime on the 0-based display axis (AE#105 origin); sourceTime stays source PTS for subs.
-                clock.currentTime = PresentationAxis.display(sourcePTS: avpReal + playlistShiftSeconds,
-                                                             origin: sourcePresentationOrigin)
-                clock.sourceTime = avpReal + playlistShiftSeconds
-                setProgrammaticSeek(inFlight: false, target: nil)
-                reconcileNativeSeekTransport(host: host, isStarved: wasStarved)
-                let recoveryAnchor = Self.recoveryAnchorPosition(
-                    frozenPosition: avpReal, pendingSeekTarget: pendingRecoverySeekClockTarget,
-                    currentRendered: avpReal)
-                let didReanchor = Self.shouldReanchorProducerAfterSeekDeadline(
-                    isStarved: wasStarved, targetWithinContiguousBuffer: targetWithinBuffer)
-                if didReanchor {
-                    reanchorProducerToPlaylistTime(recoveryAnchor)
-                    // The playhead will jump when the restarted producer lets the pending seek land.
-                    reanchorSubtitleOverlays()
-                    pendingRecoverySeekSubtitlesReanchored = true
+                // Hold the optimistic clock at the target; pendingRecoverySeekClockTarget stays set so
+                // applyNativeHostClockTick keeps it there between ticks (no revert to the old playhead).
+                nativeClockSeconds = clockTarget
+                clock.currentTime = target
+                if !reanchored {
+                    reanchored = true
+                    postReanchorWaits = 0
+                    let recoveryAnchor = Self.recoveryAnchorPosition(
+                        frozenPosition: avpReal, pendingSeekTarget: pendingRecoverySeekClockTarget,
+                        currentRendered: avpReal)
+                    let didReanchor = Self.shouldReanchorProducerAfterSeekDeadline(
+                        isStarved: wasStarved, targetWithinContiguousBuffer: targetWithinBuffer)
+                    if didReanchor {
+                        reanchorProducerToPlaylistTime(recoveryAnchor)
+                        // The playhead will jump when the restarted producer lets the pending seek land.
+                        reanchorSubtitleOverlays()
+                        pendingRecoverySeekSubtitlesReanchored = true
+                    }
+                    EngineLog.emit(
+                        "[AetherEngine] seek did not land within budget "
+                        + "(\(deadlineExtensionsUsed) extension\(deadlineExtensionsUsed == 1 ? "" : "s"); "
+                        + "\(wasStarved ? "starved" : (targetWithinBuffer ? "target buffered" : "target unbuffered")), "
+                        + "island=\(String(format: "%.2f", disjointIsland))s, "
+                        + "rendered=\(String(format: "%.2f", avpReal))s "
+                        + "buffered=\(String(format: "%.2f", host.bufferedEnd))s); holding clock at target "
+                        + "\(String(format: "%.2f", target))s"
+                        + (didReanchor
+                            ? " and re-anchored producer at \(String(format: "%.2f", recoveryAnchor))s, re-seeking"
+                            : ", re-seeking without restarting the progressing producer"),
+                        category: .engine
+                    )
+                    // Re-issue the seek toward the (re-anchored) target. A deadline does not cancel the
+                    // prior seek, but this fresh zero-tolerance seek supersedes it and points AVPlayer at
+                    // the re-anchored region so it stops waiting on the abandoned old-position segments.
+                    landed = await host.seek(to: clockTarget,
+                                             deadlineSeconds: Self.nativeSeekExtensionBudgetSeconds)
+                    continue deadlineLoop
                 }
-                // pendingRecoverySeekClockTarget deliberately survives this reconcile: the UI
-                // clock gives up the phantom target, but recovery keeps aiming there until rendered
-                // output reaches it or organic playback proves AVPlayer abandoned the seek.
+                // Already re-anchored + re-seeked. Keep holding the clock at the target and wait on the
+                // re-issued seek for a bounded number of windows; the re-anchored producer is serving the
+                // target so it should land within a couple of GOP fetches on any workable source.
+                if postReanchorWaits < Self.nativeSeekMaxDeadlineExtensions {
+                    postReanchorWaits += 1
+                    EngineLog.emit(
+                        "[AetherEngine] holding clock at target \(String(format: "%.2f", target))s while "
+                        + "re-anchored producer serves it (wait \(postReanchorWaits)/"
+                        + "\(Self.nativeSeekMaxDeadlineExtensions))",
+                        category: .engine
+                    )
+                    landed = await host.awaitPendingSeekLanding(
+                        target: clockTarget,
+                        deadlineSeconds: Self.nativeSeekExtensionBudgetSeconds)
+                    continue deadlineLoop
+                }
+                // Budget fully spent and still buffering after the re-anchor: leave the spinner parked at
+                // the target (state stays .seeking, clock held, observer gated by awaitPendingSeekLanding)
+                // rather than reverting + flapping. The $renderedTime sink settles the clock and clears
+                // the seek state when the re-anchored producer finally serves the target.
                 EngineLog.emit(
-                    "[AetherEngine] seek did not land within budget "
-                    + "(\(deadlineExtensionsUsed) extension\(deadlineExtensionsUsed == 1 ? "" : "s"); "
-                    + "\(wasStarved ? "starved" : (targetWithinBuffer ? "target buffered" : "target unbuffered")), "
-                    + "island=\(String(format: "%.2f", disjointIsland))s, "
-                    + "rendered=\(String(format: "%.2f", avpReal))s "
-                    + "buffered=\(String(format: "%.2f", host.bufferedEnd))s); reconciled clock"
-                    + (didReanchor
-                        ? " and re-anchored producer at \(String(format: "%.2f", recoveryAnchor))s"
-                        : " without restarting the progressing producer"),
+                    "[AetherEngine] seek still buffering after re-anchor + full budget "
+                    + "(\(Self.nativeSeekMaxDeadlineExtensions) waits); holding clock at target "
+                    + "\(String(format: "%.2f", target))s (no revert)",
                     category: .engine
                 )
                 return
