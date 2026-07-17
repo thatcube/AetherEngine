@@ -10,6 +10,14 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [5.6.0] - 2026-07-17
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.6.0))
+
+### Added
+
+- **A53/SEI-embedded CEA-608 captions are now extracted and rendered (#131).** US broadcast and cable-sourced feeds carry closed captions as ATSC A/53 `cc_data` inside the video bitstream rather than as a demuxable caption stream, so the #77 closed-caption tap never armed and captioned live channels played with no subtitle option. The segment producer now scans H.264/HEVC video packets for `user_data_registered_itu_t_t35` SEI (GA94), reorders the decode-order caption groups to presentation order, and feeds the existing line-21 decoder; the software-decode path (MPEG-2 and friends) feeds the same tap from `AV_FRAME_DATA_A53_CC` decoded-frame side data. A synthetic `eia_608` track surfaces lazily on the first real caption pair, so uncaptioned channels never show a dead menu entry and hosts need no changes. Overlay-only for now (no native WebVTT rendition); CEA-708 stays out of scope, matching #77's field-1/CC1 first cut. Thanks to dlev02 for the precise engine audit that scoped the fix.
+
 ## [5.5.1] - 2026-07-17
 
 ([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.5.1))
