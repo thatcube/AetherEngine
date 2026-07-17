@@ -204,6 +204,31 @@ struct RecoverySeekTargetTests {
         #expect(anchor == 741.78)
     }
 
+    @Test("a forward overshoot landing is accepted, never re-seeked backward")
+    func forwardOvershootLandingAccepted() {
+        // Device SEEK (83e705e trace, target=1288.14): AVPlayer landed and kept PLAYING past the
+        // zero-tolerance target, so at the deadline rendered=1289.70 (1.56s past target). The old
+        // abs(rendered-target) <= 0.75 rejected this as "not landed" and re-seeked backward to 1288.14,
+        // yanking a playing playhead back and re-stalling it. A forward overshoot must read as LANDED.
+        #expect(AetherEngine.seekLandedAtTarget(rendered: 1289.70, target: 1288.14, forward: true))
+        // A generous overshoot (a full GOP past) is still landed for a forward seek.
+        #expect(AetherEngine.seekLandedAtTarget(rendered: 1293.00, target: 1288.14, forward: true))
+        // Exact / near-exact landing is landed either direction.
+        #expect(AetherEngine.seekLandedAtTarget(rendered: 1288.14, target: 1288.14, forward: true))
+
+        // Pre-landing: a forward seek's playhead is pinned far BELOW the target (old position). Must NOT
+        // read as landed, so the extend/recovery logic still runs.
+        #expect(!AetherEngine.seekLandedAtTarget(rendered: 445.30, target: 1288.14, forward: true))
+
+        // Backward seek: the pinned pre-seek playhead sits far ABOVE the target (old position 2643.50 vs
+        // target 741.78) and must NOT be mistaken for a landing (that was the false-positive risk of a
+        // one-sided "rendered >= target" rule).
+        #expect(!AetherEngine.seekLandedAtTarget(rendered: 2643.50, target: 741.78, forward: false))
+        // A backward seek that reached the target (or a hair past it, playing forward) is landed.
+        #expect(AetherEngine.seekLandedAtTarget(rendered: 741.78, target: 741.78, forward: false))
+        #expect(AetherEngine.seekLandedAtTarget(rendered: 742.40, target: 741.78, forward: false))
+    }
+
     @Test("a published completion is the authoritative deadline catch-up signal")
     func completionPublicationDecision() {
         #expect(AetherEngine.shouldCatchUpDeadlineLanding(renderedTimePublished: true))

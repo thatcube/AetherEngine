@@ -727,23 +727,33 @@ final class NativeAVPlayerHost {
     ///
     /// - Returns: `true` once the pending seek has landed (AVPlayer's `currentTime` reached `target`),
     ///   `false` if it is still pending after `deadlineSeconds` or a newer seek superseded it.
-    func awaitPendingSeekLanding(target seconds: Double, deadlineSeconds: Double) async -> Bool {
+    func awaitPendingSeekLanding(target seconds: Double, deadlineSeconds: Double, forward: Bool) async -> Bool {
         // Re-gate: the prior deadline cleared seekInFlight, so the periodic observer would otherwise
         // publish AVPlayer's still-pre-seek position and un-latch the optimistic clock. The original
         // seek's completion clears this again when it lands.
         let gen = seekGeneration
+        let wasInFlight = seekInFlight
         if !seekInFlight { seekInFlight = true }
         try? await Task.sleep(nanoseconds: UInt64(deadlineSeconds * 1_000_000_000))
         // A newer seek arrived while we waited: let it own the final state.
         guard gen == seekGeneration else { return false }
         let now = avPlayer.currentTime().seconds
-        // Zero-tolerance seeks complete with currentTime AT the target; a small window covers timescale rounding.
-        let landed = now.isFinite && abs(now - seconds) <= 0.75
+        // The original seek's completion clears seekInFlight for this generation when it physically lands;
+        // if it fired during our wait that is authoritative. Otherwise fall back to a directional position
+        // check: a zero-tolerance seek lands AT the target, then a playing item advances in the seek
+        // direction, so a forward seek can render PAST the target (and a backward seek a hair past,
+        // downward). Accept an overshoot in the seek direction; the pinned pre-seek playhead sits far on
+        // the opposite side, so it is never mistaken for a landing. This stops a forward overshoot from
+        // reading as "still pending" and triggering a backward-yank re-seek on an already-playing item.
+        let completionLanded = wasInFlight && !seekInFlight
+        let positionLanded = now.isFinite
+            && (forward ? now >= seconds - 0.75 : now <= seconds + 0.75)
+        let landed = completionLanded || positionLanded
         if landed {
             // The completion may not have run its MainActor job yet; settle so the observer stays gated
             // until the engine finalizes and mirror what the completion would publish.
             seekInFlight = false
-            currentTime = now
+            if now.isFinite { currentTime = now }
         }
         return landed
     }

@@ -2277,6 +2277,9 @@ public final class AetherEngine: ObservableObject {
             let renderedAtSeekStart = nativeHost?.renderedTime ?? 0
             pendingSeekInitialRenderedPosition = renderedAtSeekStart
             lastRenderedForPendingSeek = renderedAtSeekStart
+            // Direction of travel for landing detection: a forward seek's playhead climbs from the old
+            // position toward (and, once playing, PAST) the target; a backward seek's descends to it.
+            let seekIsForward = clockTarget >= renderedAtSeekStart
             // Await real AVPlayer landing so isSeeking spans it (#37/#38), but bound the wait (#65): a seek
             // AVPlayer can never land (producer-wedge starvation) must not leave the optimistic clock latched
             // forever. A normal/slow-but-buffering seek lands or keeps buffering well within the budget.
@@ -2323,6 +2326,28 @@ public final class AetherEngine: ObservableObject {
                     )
                     return
                 }
+                // Overshoot landing: a zero-tolerance seek lands AT the target, then a *playing* item keeps
+                // moving in the seek direction while the deadline continuation settles, so a forward seek can
+                // render a GOP PAST the target (device: rendered=1289.70 vs target=1288.14, contiguous buffer,
+                // timeControlStatus=playing). The old tolerance treated that overshoot as "not landed" and the
+                // fallthrough re-seeked backward to the exact target, dragging a playing playhead back ~1.5s and
+                // re-stalling it (Brandon: "loading even though it had already started playing, then reverted
+                // back a second or 2"). Accept a landing at/past the target in the seek direction and finalize;
+                // NEVER issue a backward correction for a forward overshoot (overshoot is strictly better for
+                // the user than a re-stall + yank). The opposite bound stays tight so the pinned pre-seek
+                // playhead (forward: far below target; backward: far above) is never mistaken for a landing.
+                if Self.seekLandedAtTarget(
+                    rendered: avpReal, target: clockTarget, forward: seekIsForward) {
+                    EngineLog.emit(
+                        "[AetherEngine] seek landed at deadline "
+                        + "(rendered=\(String(format: "%.2f", avpReal))s "
+                        + "target=\(String(format: "%.2f", clockTarget))s "
+                        + "\(seekIsForward ? "fwd" : "back")); finalizing without re-seek",
+                        category: .engine
+                    )
+                    landed = true
+                    break deadlineLoop
+                }
                 // DV/SMB forward-seek revert fix: `seekIsWedged`/`bufferedEnd` only measure the buffer
                 // contiguous with AVPlayer's pre-seek playhead, which stays pinned during a pending
                 // zero-tolerance forward seek — so a slow-but-working forward seek (the producer IS
@@ -2359,7 +2384,8 @@ public final class AetherEngine: ObservableObject {
                     )
                     landed = await host.awaitPendingSeekLanding(
                         target: clockTarget,
-                        deadlineSeconds: Self.nativeSeekExtensionBudgetSeconds)
+                        deadlineSeconds: Self.nativeSeekExtensionBudgetSeconds,
+                        forward: seekIsForward)
                     continue deadlineLoop
                 }
                 // No forward island (or extend budget exhausted). This is a true wedge, a
@@ -2431,7 +2457,8 @@ public final class AetherEngine: ObservableObject {
                     )
                     landed = await host.awaitPendingSeekLanding(
                         target: clockTarget,
-                        deadlineSeconds: Self.nativeSeekExtensionBudgetSeconds)
+                        deadlineSeconds: Self.nativeSeekExtensionBudgetSeconds,
+                        forward: seekIsForward)
                     continue deadlineLoop
                 }
                 // Budget fully spent and still buffering after the re-anchor: leave the spinner parked at
@@ -2571,6 +2598,25 @@ public final class AetherEngine: ObservableObject {
         renderedTimePublished: Bool
     ) -> Bool {
         renderedTimePublished
+    }
+
+    /// Pure decision: has a zero-tolerance seek physically landed at the target by the deadline, allowing
+    /// for a directional overshoot? A zero-tolerance `avPlayer.seek` lands AT the target, but a *playing*
+    /// item keeps advancing in the seek direction while the deadline continuation settles, so by the time
+    /// the engine samples `rendered` a forward seek can sit a GOP PAST the target and a backward seek a
+    /// hair past it (downward). Accept a landing at/past the target in the seek direction; keep the
+    /// opposite bound tight (`tolerance`) so the pinned pre-seek playhead — which sits far BELOW the target
+    /// for a forward seek and far ABOVE it for a backward seek until the seek completes — is never mistaken
+    /// for a landing. Prevents the fallthrough from issuing a backward exact re-seek to "correct" a forward
+    /// overshoot (which drags a playing playhead back and re-stalls it).
+    nonisolated static func seekLandedAtTarget(
+        rendered: Double,
+        target: Double,
+        forward: Bool,
+        tolerance: Double = 0.75
+    ) -> Bool {
+        guard rendered.isFinite else { return false }
+        return forward ? rendered >= target - tolerance : rendered <= target + tolerance
     }
 
     /// Deprecated alias. The engine clock is now unified onto source PTS; prefer `seek(to:)` in new code.
