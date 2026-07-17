@@ -53,16 +53,46 @@ struct RecoverySeekTargetTests {
         #expect(AetherEngine.isPendingSeekStale(progressWhilePending: 3.5))
     }
 
-    @Test("deadline recovery restarts only a starved producer")
+    @Test("deadline recovery restarts a starved producer OR an unbuffered forward-seek target")
     func deadlineRestartDecision() {
-        #expect(AetherEngine.shouldReanchorProducerAfterSeekDeadline(isStarved: true))
-        #expect(!AetherEngine.shouldReanchorProducerAfterSeekDeadline(isStarved: false))
+        // Starved wedge (#65): always re-anchor regardless of target buffering.
+        #expect(AetherEngine.shouldReanchorProducerAfterSeekDeadline(
+            isStarved: true, targetWithinContiguousBuffer: true))
+        #expect(AetherEngine.shouldReanchorProducerAfterSeekDeadline(
+            isStarved: true, targetWithinContiguousBuffer: false))
+        // DV/SMB forward-seek revert: NOT starved by the old-playhead buffer metric, but the target
+        // is unbuffered -> must re-anchor (previously suppressed, which parked the session).
+        #expect(AetherEngine.shouldReanchorProducerAfterSeekDeadline(
+            isStarved: false, targetWithinContiguousBuffer: false))
+        // Raced-the-budget seek whose target is already contiguously buffered: lands organically,
+        // no needless producer restart.
+        #expect(!AetherEngine.shouldReanchorProducerAfterSeekDeadline(
+            isStarved: false, targetWithinContiguousBuffer: true))
         #expect(AetherEngine.shouldReanchorSubtitlesOnLateSeekLanding(
             alreadyReanchored: false
         ))
         #expect(!AetherEngine.shouldReanchorSubtitlesOnLateSeekLanding(
             alreadyReanchored: true
         ))
+    }
+
+    @Test("a forward seek target beyond the contiguous buffer is treated as unbuffered")
+    func seekTargetBufferCoverage() {
+        // DV/SMB shape: rendered/old playhead ~2648, thin forward buffer to ~2653, target 4829.9.
+        // The target is far beyond bufferedEnd -> unbuffered.
+        #expect(!AetherEngine.seekTargetWithinContiguousBuffer(
+            target: 4829.90, bufferedEnd: 2653.41))
+        // A backward/short seek whose target sits inside the contiguous buffer -> covered.
+        #expect(AetherEngine.seekTargetWithinContiguousBuffer(
+            target: 2647.91, bufferedEnd: 2663.0))
+        // Boundary: bufferedEnd within tolerance of the target counts as covered.
+        #expect(AetherEngine.seekTargetWithinContiguousBuffer(
+            target: 100.0, bufferedEnd: 99.7))
+        #expect(!AetherEngine.seekTargetWithinContiguousBuffer(
+            target: 100.0, bufferedEnd: 99.0))
+        // No pending target: fall back to the starved signal alone (treated as covered).
+        #expect(AetherEngine.seekTargetWithinContiguousBuffer(
+            target: nil, bufferedEnd: 0.0))
     }
 
     @Test("a published completion is the authoritative deadline catch-up signal")

@@ -2293,6 +2293,10 @@ public final class AetherEngine: ObservableObject {
                 }
                 let wasStarved = seekIsWedged(
                     renderedTime: avpReal, bufferedEnd: host.bufferedEnd)
+                // The pending target sits on AVPlayer's HLS clock axis, same axis `bufferedEnd`
+                // reports, so they compare directly (both are pre-display-origin playlist seconds).
+                let targetWithinBuffer = Self.seekTargetWithinContiguousBuffer(
+                    target: pendingRecoverySeekClockTarget, bufferedEnd: host.bufferedEnd)
                 nativeClockSeconds = avpReal
                 // currentTime on the 0-based display axis (AE#105 origin); sourceTime stays source PTS for subs.
                 clock.currentTime = PresentationAxis.display(sourcePTS: avpReal + playlistShiftSeconds,
@@ -2303,7 +2307,9 @@ public final class AetherEngine: ObservableObject {
                 let recoveryAnchor = Self.recoveryAnchorPosition(
                     frozenPosition: avpReal, pendingSeekTarget: pendingRecoverySeekClockTarget,
                     currentRendered: avpReal)
-                if Self.shouldReanchorProducerAfterSeekDeadline(isStarved: wasStarved) {
+                let didReanchor = Self.shouldReanchorProducerAfterSeekDeadline(
+                    isStarved: wasStarved, targetWithinContiguousBuffer: targetWithinBuffer)
+                if didReanchor {
                     reanchorProducerToPlaylistTime(recoveryAnchor)
                     // The playhead will jump when the restarted producer lets the pending seek land.
                     reanchorSubtitleOverlays()
@@ -2314,10 +2320,10 @@ public final class AetherEngine: ObservableObject {
                 // output reaches it or organic playback proves AVPlayer abandoned the seek.
                 EngineLog.emit(
                     "[AetherEngine] seek did not land within \(Self.nativeSeekReconcileBudgetSeconds)s "
-                    + "(\(wasStarved ? "starved" : "old position still buffered"), "
+                    + "(\(wasStarved ? "starved" : (targetWithinBuffer ? "target buffered" : "target unbuffered")), "
                     + "rendered=\(String(format: "%.2f", avpReal))s "
                     + "buffered=\(String(format: "%.2f", host.bufferedEnd))s); reconciled clock"
-                    + (wasStarved
+                    + (didReanchor
                         ? " and re-anchored producer at \(String(format: "%.2f", recoveryAnchor))s"
                         : " without restarting the progressing producer"),
                     category: .engine
@@ -2385,8 +2391,37 @@ public final class AetherEngine: ObservableObject {
         }
     }
 
-    nonisolated static func shouldReanchorProducerAfterSeekDeadline(isStarved: Bool) -> Bool {
-        isStarved
+    /// Whether a seek that missed its deadline should re-base the producer at the recovery target.
+    ///
+    /// `isStarved` (issue #65) catches a wedge where AVPlayer's forward buffer collapsed to the
+    /// rendered frame. But `seekIsWedged` measures the buffer contiguous with AVPlayer's *old*
+    /// playhead (`bufferedEnd`, held there during a pending zero-tolerance seek), so a **forward**
+    /// seek into unbuffered territory on a slow source (Dolby-Vision over SMB) is misread as "not
+    /// starved" whenever a thin pre-seek forward buffer survives (avBufAhead ~4.8 s): the old
+    /// position looks healthy while the target is nowhere near loaded. That case must still re-anchor
+    /// — otherwise the clock reverts to the old position and the session parks flapping on a
+    /// slow-serving producer that never lands (the DV/SMB forward-seek revert). So also re-anchor
+    /// whenever the pending target is not yet inside AVPlayer's contiguous forward buffer. A target
+    /// that IS already buffered (a short/backward seek that merely raced the budget) lands organically
+    /// and needs no restart.
+    nonisolated static func shouldReanchorProducerAfterSeekDeadline(
+        isStarved: Bool,
+        targetWithinContiguousBuffer: Bool
+    ) -> Bool {
+        isStarved || !targetWithinContiguousBuffer
+    }
+
+    /// Pure decision: is the pending seek target already covered by AVPlayer's contiguous forward
+    /// buffer (`bufferedEnd`)? Used to tell a "raced the budget but about to land" seek from a
+    /// forward seek whose target is unbuffered. A nil target (no recovery intent) counts as covered
+    /// so the caller falls back to the `isStarved` signal alone.
+    nonisolated static func seekTargetWithinContiguousBuffer(
+        target: Double?,
+        bufferedEnd: Double,
+        tolerance: Double = 0.5
+    ) -> Bool {
+        guard let target else { return true }
+        return bufferedEnd + tolerance >= target
     }
 
     nonisolated static func shouldCatchUpDeadlineLanding(
