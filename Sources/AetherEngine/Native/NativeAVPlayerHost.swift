@@ -34,6 +34,11 @@ final class NativeAVPlayerHost {
     /// at .paused, which every pause-guarded recovery layer misreads as user intent; the engine
     /// subscribes and escalates into the stage-2 item reload with the pause guard bypassed.
     @Published private(set) var endFailureCount: Int = 0
+    /// End of the last seekable time range (seconds); tracks the live edge for EVENT playlists.
+    /// KVO mirror of `seekableTimeRanges`, NOT a live read: the getter is a sync XPC round-trip
+    /// to mediaserverd, and clock-tick sinks plus the 1 Hz paused-live timer read this at a
+    /// cadence that turns a busy media server into a main-thread hang (#134).
+    @Published private(set) var seekableEnd: Double = 0
 
     /// Published when a startup `.failed` is a display-rejection of the served master (#98). The
     /// engine's fallback subscriber reads it, decides, and either reloads the media playlist or
@@ -81,6 +86,7 @@ final class NativeAVPlayerHost {
     private var playIntent = false
     private var rateObservation: NSKeyValueObservation?
     private var timeControlObservation: NSKeyValueObservation?
+    private var seekableObservation: NSKeyValueObservation?
     /// Diagnostic: isReadyForDisplay is the only signal for first-frame-on-screen; t+ stamps localize the audio-leads-black-video gap.
     private var layerReadyObservation: NSKeyValueObservation?
     /// t+ reference for startup diagnostics; written on MainActor, read off-main from KVO -- diagnostic-only, a torn read is harmless.
@@ -177,6 +183,15 @@ final class NativeAVPlayerHost {
         pendingDisplayRejection = nil
         lastSuppressedStartupFailure = nil
         isReady = false
+        seekableEnd = 0
+
+        // #134: mirror seekableTimeRanges instead of reading it per call. The callback runs on
+        // the item's queue where the re-read is a harmless off-main XPC; live playlist refreshes
+        // keep it current, including while paused.
+        seekableObservation = item.observe(\.seekableTimeRanges, options: [.initial, .new]) { [weak self] item, _ in
+            let end = Self.seekableEnd(from: item.seekableTimeRanges)
+            Task { @MainActor in self?.seekableEnd = end }
+        }
 
         // KVO fires on AVPlayerItem's queue; Task round-trips to MainActor.
         statusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
@@ -599,9 +614,9 @@ final class NativeAVPlayerHost {
     /// stamping `sourceTime`/`renderedTime` to a target the picture has not reached yet (#123).
     var isBufferingTowardSeekTarget: Bool { avPlayer.timeControlStatus == .waitingToPlayAtSpecifiedRate }
 
-    /// End of the last seekable time range (seconds); tracks the live edge for EVENT playlists.
-    var seekableEnd: Double {
-        guard let r = avPlayer.currentItem?.seekableTimeRanges.last?.timeRangeValue else { return 0 }
+    /// Maps `seekableTimeRanges` to the end of the last range (seconds); 0 when empty or non-finite.
+    nonisolated static func seekableEnd(from ranges: [NSValue]) -> Double {
+        guard let r = ranges.last?.timeRangeValue else { return 0 }
         let end = CMTimeGetSeconds(r.start + r.duration)
         return end.isFinite ? end : 0
     }
@@ -733,6 +748,8 @@ final class NativeAVPlayerHost {
         rateObservation = nil
         timeControlObservation?.invalidate()
         timeControlObservation = nil
+        seekableObservation?.invalidate()
+        seekableObservation = nil
         layerReadyObservation?.invalidate()
         layerReadyObservation = nil
         for obs in notificationObservers {

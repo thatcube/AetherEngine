@@ -27,29 +27,37 @@ extension AetherEngine {
     func startMemoryProbe() {
         memoryProbeTask?.cancel()
         let sessionStart = Date()
+        // #134: currentTime()/loadedTimeRanges are sync XPC reads; hop them off the main actor.
+        let probeReadQueue = DispatchQueue(label: "engine.memprobe.avfread", qos: .utility)
         memoryProbeTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(30))
                 if Task.isCancelled { return }
                 guard let self = self else { return }
-                let elapsed = Int(Date().timeIntervalSince(sessionStart))
-                let rssMB = Self.residentMemoryMB()
-                let cueCount = self.subtitleCues.count
 
                 // AVPlayer buffer probe: if ahead > preferredForwardBufferDuration, suspect linear-growth memory leak.
                 var bufferAheadSec = 0.0
                 var bufferBehindSec = 0.0
                 if let avPlayer = self.currentAVPlayer,
                    let item = avPlayer.currentItem {
-                    let now = item.currentTime().seconds
-                    for value in item.loadedTimeRanges {
-                        let range = value.timeRangeValue
-                        let start = range.start.seconds
-                        let end = (range.start + range.duration).seconds
-                        if end > now { bufferAheadSec += end - max(start, now) }
-                        if start < now { bufferBehindSec += min(end, now) - start }
+                    (bufferAheadSec, bufferBehindSec) = await AVFoundationOffMain.read(item, on: probeReadQueue) { item in
+                        let now = item.currentTime().seconds
+                        var ahead = 0.0
+                        var behind = 0.0
+                        for value in item.loadedTimeRanges {
+                            let range = value.timeRangeValue
+                            let start = range.start.seconds
+                            let end = (range.start + range.duration).seconds
+                            if end > now { ahead += end - max(start, now) }
+                            if start < now { behind += min(end, now) - start }
+                        }
+                        return (ahead, behind)
                     }
+                    if Task.isCancelled { return }
                 }
+                let elapsed = Int(Date().timeIntervalSince(sessionStart))
+                let rssMB = Self.residentMemoryMB()
+                let cueCount = self.subtitleCues.count
 
                 // Zero on SW path or pre-start; 30 s cadence makes non-atomic field drift irrelevant.
                 let stats = self.nativeVideoSession?.diagnosticStats()
