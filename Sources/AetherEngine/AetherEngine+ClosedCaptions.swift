@@ -57,6 +57,13 @@ final class ClosedCaptionTap: @unchecked Sendable {
     /// long no-caption gaps (silence / music) that are normal for a sparse caption track.
     private var resetRequested = false
 
+    /// #131 A53 mode (`ccStreamIndex == AetherEngine.a53ClosedCaptionTrackID`): triplets come from
+    /// video-packet SEI (producer path, decode order) or decoded-frame side data (SW path,
+    /// presentation order) instead of a demuxable caption stream. Guarded by `lock`.
+    private var reorder = A53ReorderBuffer()
+    private var reorderOverflowLogged = false
+    private var a53Detected = false
+
     init(engine: AetherEngine, ccStreamIndex: Int32) {
         self.engine = engine
         self.ccStreamIndex = ccStreamIndex
@@ -65,6 +72,95 @@ final class ClosedCaptionTap: @unchecked Sendable {
     /// Drop decoder + cue-buffer state on the next ingest. Called from `seek()` so a scrub starts clean.
     func requestReset() {
         lock.lock(); resetRequested = true; lock.unlock()
+    }
+
+    /// Consume a pending seek reset: drop decoder, cue-buffer, and reorder state at a known
+    /// discontinuity so a scrub starts clean. Caller holds `lock`.
+    private func consumeResetIfRequestedLocked() {
+        guard resetRequested else { return }
+        resetRequested = false
+        reorder.reset()
+        decoder.reset()
+        cues.removeAll(keepingCapacity: true)
+        openCueID = nil
+    }
+
+    /// Shared decode feed at a known presentation PTS; returns true when the cue buffer changed.
+    /// A backward PTS jump means the producer re-anchored (live reopen / restart): drop stale
+    /// decoder state AND the cue buffer so the old region can't bleed across the cut (or duplicate
+    /// when the new region is re-pumped). A forward PTS gap is NOT treated as a seek; it's a normal
+    /// silence/music gap in a sparse caption track. Caller holds `lock`.
+    private func feedLocked(pairs: [A53ReorderBuffer.Pair], pts: Double) -> Bool {
+        if lastPTS >= 0, pts < lastPTS - 1.0 {
+            decoder.reset()
+            cues.removeAll(keepingCapacity: true)
+            openCueID = nil
+        }
+        lastPTS = pts
+        var changed = false
+        for p in pairs {
+            for action in decoder.feed(p.d0, p.d1) {
+                applyAction(action, pts: pts)
+                changed = true
+            }
+        }
+        return changed
+    }
+
+    /// #131 lazy track surfacing: the first non-null field-1 pair (parity bits stripped) proves a
+    /// real 608 service. Padding-only cc_data never surfaces a track.
+    static func containsRealCaptionData(_ pairs: [A53ReorderBuffer.Pair]) -> Bool {
+        pairs.contains { ($0.d0 & 0x7F) != 0 || ($0.d1 & 0x7F) != 0 }
+    }
+
+    /// Caller holds `lock`. Fires the engine's synthetic-track surfacing exactly once.
+    private func detectCaptionDataLocked(_ pairs: [A53ReorderBuffer.Pair]) {
+        guard !a53Detected, Self.containsRealCaptionData(pairs) else { return }
+        a53Detected = true
+        Task { @MainActor [weak engine, weak self] in
+            guard let self else { return }
+            engine?.notifyA53CaptionsDetected(from: self)
+        }
+    }
+
+    /// #131 producer-path ingest: decode-order SEI triplet groups, reordered to presentation order
+    /// before decode (see `A53ReorderBuffer`). Runs on the producer pump thread.
+    func ingestA53(_ triplets: [CCDataParser.CCTriplet], ptsSeconds: Double, dtsSeconds: Double?) {
+        let pairs = triplets.filter { $0.type == 0 }
+            .map { A53ReorderBuffer.Pair(d0: $0.data0, d1: $0.data1) }
+        guard !pairs.isEmpty else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        consumeResetIfRequestedLocked()
+        detectCaptionDataLocked(pairs)
+        let ready = reorder.insert(pts: ptsSeconds, pairs: pairs, dts: dtsSeconds)
+        if reorder.overflowed, !reorderOverflowLogged {
+            reorderOverflowLogged = true
+            EngineLog.emit("[AetherEngine] A53 reorder buffer overflow (non-monotonic video DTS?)",
+                           category: .engine)
+        }
+        var changed = false
+        for group in ready {
+            changed = feedLocked(pairs: group.pairs, pts: group.pts) || changed
+        }
+        guard changed else { return }
+        prune(referencePTS: lastPTS)
+        publishSnapshot()
+    }
+
+    /// #131 SW-path ingest: decoded frames arrive in presentation order; bypasses the reorder
+    /// buffer. Runs on the SW host's demux thread.
+    func ingestA53Ordered(_ triplets: [CCDataParser.CCTriplet], ptsSeconds: Double) {
+        let pairs = triplets.filter { $0.type == 0 }
+            .map { A53ReorderBuffer.Pair(d0: $0.data0, d1: $0.data1) }
+        guard !pairs.isEmpty else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        consumeResetIfRequestedLocked()
+        detectCaptionDataLocked(pairs)
+        guard feedLocked(pairs: pairs, pts: ptsSeconds) else { return }
+        prune(referencePTS: ptsSeconds)
+        publishSnapshot()
     }
 
     /// Called on the producer pump thread for each CC-stream packet.
@@ -84,26 +180,9 @@ final class ClosedCaptionTap: @unchecked Sendable {
             pts = lastPTS >= 0 ? lastPTS : 0
         }
 
-        // Discontinuity: an explicit seek (resetRequested) or a backward PTS jump means the producer
-        // re-anchored. Drop stale decoder state AND the cue buffer so the old region can't bleed across the
-        // cut (or duplicate when the new region is re-pumped). A forward PTS gap is NOT treated as a seek.
-        // It's a normal silence/music gap in a sparse caption track.
-        if resetRequested || (lastPTS >= 0 && pts < lastPTS - 1.0) {
-            resetRequested = false
-            decoder.reset()
-            cues.removeAll(keepingCapacity: true)
-            openCueID = nil
-        }
-        lastPTS = pts
-
-        var changed = false
-        for t in triplets {
-            for action in decoder.feed(t.data0, t.data1) {
-                applyAction(action, pts: pts)
-                changed = true
-            }
-        }
-        guard changed else { return }
+        consumeResetIfRequestedLocked()
+        guard feedLocked(pairs: triplets.map { A53ReorderBuffer.Pair(d0: $0.data0, d1: $0.data1) },
+                         pts: pts) else { return }
         prune(referencePTS: pts)
         publishSnapshot()
     }
@@ -158,28 +237,70 @@ extension AetherEngine {
         return Self.isEmbeddedClosedCaptionCodec(codec)
     }
 
+    /// Synthetic `TrackInfo.id` for A53/SEI-embedded captions (#131): no AVStream exists for them.
+    /// Far above any real stream index, below `externalSubtitleTrackIDBase`.
+    public static let a53ClosedCaptionTrackID = 99_608
+
+    /// First subtitle track that is a REAL demuxable in-band CC stream. Excludes the synthetic A53
+    /// entry (#131): reload paths that rebuild a session without re-probing still carry it in
+    /// `subtitleTracks`, and it has no AVStream to tap or serve; session-arming code must never
+    /// key on it (the #98 rendition and the c608 tap would bind to nonexistent stream 99608).
+    var demuxableClosedCaptionTrack: TrackInfo? {
+        subtitleTracks.first { Self.isEmbeddedClosedCaptionCodec($0.codec) && $0.id != Self.a53ClosedCaptionTrackID }
+    }
+
+    /// #131: an A53-mode tap saw its first real caption data. Surface the synthetic `eia_608` track
+    /// once; every existing CC selection/mirroring path (and host menus) keys off the codec + id.
+    @MainActor
+    func notifyA53CaptionsDetected(from tap: ClosedCaptionTap) {
+        // A stale tap's pending notify (queued before a teardown/successor session swapped
+        // `closedCaptionTap` out) must not resurrect the track on the wrong session.
+        guard closedCaptionTap === tap else { return }
+        guard !subtitleTracks.contains(where: { $0.id == Self.a53ClosedCaptionTrackID }) else { return }
+        subtitleTracks.append(TrackInfo(
+            id: Self.a53ClosedCaptionTrackID, name: "Closed Captions", codec: "eia_608",
+            language: nil, isDefault: false))
+        EngineLog.emit("[AetherEngine] A53 captions detected, surfaced synthetic CC track id=\(Self.a53ClosedCaptionTrackID)",
+                       category: .engine)
+    }
+
     /// Create the CC tap and wire it onto the video session before `start()` so the first producer keeps
     /// the CC stream. The tap runs for the whole session (CC packets are sparse, negligible cost) and
     /// maintains the cue buffer; cues are mirrored into `subtitleCues` only while CC is the active subtitle.
-    /// No-op when the source has no in-band CC track.
+    /// #131: when the source has NO demuxable CC track, arm an A53-mode tap instead: the producer scans
+    /// video-packet SEI for GA94 cc_data (H.264/HEVC only; the producer self-gates on codec) and the
+    /// synthetic eia_608 track surfaces lazily on first real caption data (`notifyA53CaptionsDetected`).
+    /// The tap buffers from packet 1, so no cues are lost before the menu entry exists.
     func setupClosedCaptionTapIfNeeded(session: HLSVideoEngine) {
-        guard let ccTrack = subtitleTracks.first(where: { Self.isEmbeddedClosedCaptionCodec($0.codec) }) else {
-            closedCaptionTap = nil
-            ccCueSnapshot = []
-            ccLastSnapshotSeq = 0
-            ccNativeStore = nil
+        closedCaptionTap = nil
+        ccCueSnapshot = []
+        ccLastSnapshotSeq = 0
+        ccNativeStore = nil
+        // Excludes the synthetic A53 entry via `demuxableClosedCaptionTrack` (see its doc comment):
+        // a reload that rebuilds the session without re-probing (audio switch, custom-source reload)
+        // still carries it in subtitleTracks, and treating it as a real stream would arm a dead
+        // observer, silently dropping captions after the reload.
+        if let ccTrack = demuxableClosedCaptionTrack {
+            let idx = Int32(ccTrack.id)
+            let tap = ClosedCaptionTap(engine: self, ccStreamIndex: idx)
+            closedCaptionTap = tap
+            session.closedCaptionStreamIndexForSession = idx
+            session.closedCaptionObserverForSession = { [weak tap] packet, tb in
+                tap?.ingest(packet, timeBase: tb)
+            }
+            EngineLog.emit("[AetherEngine] CC tap armed on source stream=\(idx)", category: .engine)
             return
         }
-        let idx = Int32(ccTrack.id)
-        let tap = ClosedCaptionTap(engine: self, ccStreamIndex: idx)
+        let tap = ClosedCaptionTap(engine: self, ccStreamIndex: Int32(Self.a53ClosedCaptionTrackID))
         closedCaptionTap = tap
-        ccCueSnapshot = []
-        ccLastSnapshotSeq = 0   // fresh tap's publishSeq restarts at 1
-        session.closedCaptionStreamIndexForSession = idx
-        session.closedCaptionObserverForSession = { [weak tap] packet, tb in
-            tap?.ingest(packet, timeBase: tb)
+        session.a53CaptionObserverForSession = { [weak tap] triplets, pts, dts, tb in
+            guard pts != Int64.min, tb.num > 0, tb.den > 0 else { return }
+            let scale = Double(tb.num) / Double(tb.den)
+            tap?.ingestA53(triplets, ptsSeconds: Double(pts) * scale,
+                           dtsSeconds: dts != Int64.min ? Double(dts) * scale : nil)
         }
-        EngineLog.emit("[AetherEngine] CC tap armed on source stream=\(idx)", category: .engine)
+        EngineLog.emit("[AetherEngine] A53 SEI caption tap armed (synthetic id \(Self.a53ClosedCaptionTrackID))",
+                       category: .engine)
     }
 
     /// Receive the tap's latest cue snapshot (off the pump thread). Drops out-of-order snapshots (the

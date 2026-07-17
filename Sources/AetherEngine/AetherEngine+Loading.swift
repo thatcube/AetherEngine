@@ -461,7 +461,10 @@ extension AetherEngine {
         let hasTextSubtitleTrack = !nativeSubtitleTrackTable.isEmpty
         // #98: an in-band CEA-608 track (no text track needed) also warrants the native path so its
         // decoded cues can ride a WebVTT rendition (survives PiP/AirPlay) instead of overlay-only.
-        let hasCC608 = subtitleTracks.contains { Self.isEmbeddedClosedCaptionCodec($0.codec) }
+        // Load-bearing (#131): must exclude the synthetic A53 entry. With a stale synthetic track
+        // after a no-reprobe reload (e.g. an audio switch), a plain codec match here would flip
+        // this true and arm a #98 rendition bound to nonexistent stream 99608.
+        let hasCC608 = demuxableClosedCaptionTrack != nil
         session.enableNativeSubtitleTrackForSession = loadedOptions.prepareNativeSubtitles && (hasTextSubtitleTrack || hasCC608)
         // Sodalite#32 Phase 2: tap decoders honor the host's markup preference (overlay renders styled
         // ASS; the WebVTT rendition strips at serve). #112 rework: the overlay itself is fed by the
@@ -499,7 +502,7 @@ extension AetherEngine {
             // ClosedCaptionTap (no FFmpeg decoder, so the side-demuxer reader self-skips it), so we
             // append a store the tap fills and expose it as the last native subtitle ordinal. Never
             // the default: 608 is user-selected.
-            if let ccTrack = subtitleTracks.first(where: { Self.isEmbeddedClosedCaptionCodec($0.codec) }) {
+            if let ccTrack = demuxableClosedCaptionTrack {
                 let ccStore = NativeSubtitleCueStore()
                 self.ccNativeStore = ccStore
                 let ccOrdinal = session.nativeSubtitleCueStoresForSession.count
@@ -860,6 +863,25 @@ extension AetherEngine {
             self?.publishLiveWindow(edgeSessionTime: edge)
         }
         self.softwareHost = host
+        // #131: no demuxable CC track on the SW path either: arm an A53 tap fed by decoded-frame
+        // side data. Same lazy synthetic-track surfacing as the producer path.
+        // Same synthetic-entry exclusion as setupClosedCaptionTapIfNeeded (via `demuxableClosedCaptionTrack`):
+        // a stale A53 track from a prior session must not read as a demuxable CC stream on a no-reprobe reload.
+        // Resets run unconditionally, hoisted above the arming guard: a SW-routed source WITH a real
+        // demuxable c608 track otherwise inherits the previous session's tap/cue snapshot, and selecting
+        // that track mirrors stale cross-session cues (`selectSubtitleTrack`'s CC branch does
+        // `subtitleCues = ccCueSnapshot`).
+        closedCaptionTap = nil
+        ccCueSnapshot = []
+        ccLastSnapshotSeq = 0
+        ccNativeStore = nil
+        if demuxableClosedCaptionTrack == nil {
+            let ccTap = ClosedCaptionTap(engine: self, ccStreamIndex: Int32(Self.a53ClosedCaptionTrackID))
+            closedCaptionTap = ccTap
+            host.onA53Captions = { [weak ccTap] triplets, pts in
+                ccTap?.ingestA53Ordered(triplets, ptsSeconds: pts)
+            }
+        }
         applyDesiredVolume(to: host)
         // #112 rework: SW-host subtitle tap feeds a session packet store; the shared
         // playhead-paced drainer reads it exactly like the HLS session's store.

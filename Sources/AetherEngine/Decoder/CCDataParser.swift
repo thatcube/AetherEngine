@@ -19,14 +19,20 @@ enum CCDataParser {
     /// All valid `cc_data` triplets in `packet`, in stream order. The packet is a bare triplet sequence;
     /// each triplet is 3 bytes and only those with the cc_valid bit (`0x04`) set are returned.
     static func parseCCDataTriplets(packet: UnsafePointer<AVPacket>) -> [CCTriplet] {
-        guard let data = packet.pointee.data, packet.pointee.size >= 3 else { return [] }
-        let n = Int(packet.pointee.size)
+        guard let data = packet.pointee.data else { return [] }
+        return parseCCDataTriplets(bytes: data, count: Int(packet.pointee.size))
+    }
+
+    /// Byte-level core of the triplet walk, shared with the A53 paths (#131): SEI-extracted `cc_data`
+    /// (`A53SEIParser`) and decoded-frame `AV_FRAME_DATA_A53_CC` side data carry the same triplet layout.
+    static func parseCCDataTriplets(bytes: UnsafePointer<UInt8>, count: Int) -> [CCTriplet] {
+        guard count >= 3 else { return [] }
         var triplets: [CCTriplet] = []
         var i = 0
-        while i + 3 <= n {
-            let a = data[i]
+        while i + 3 <= count {
+            let a = bytes[i]
             if (a & 0x04) != 0 {   // cc_valid
-                triplets.append(CCTriplet(type: a & 0x03, data0: data[i + 1], data1: data[i + 2]))
+                triplets.append(CCTriplet(type: a & 0x03, data0: bytes[i + 1], data1: bytes[i + 2]))
             }
             i += 3
         }
