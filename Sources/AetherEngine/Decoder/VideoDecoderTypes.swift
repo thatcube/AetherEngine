@@ -15,6 +15,11 @@ typealias DecodedFrameHandler = @Sendable (CVPixelBuffer, CMTime, Data?) -> Void
 protocol VideoDecodingPipeline: AnyObject, Sendable {
     var onFrame: DecodedFrameHandler? { get set }
     var onFirstHDR10PlusDetected: (@Sendable () -> Void)? { get set }
+    /// #131: fires per decoded frame carrying `AV_FRAME_DATA_A53_CC` side data, with the raw
+    /// cc_data triplets and the frame PTS in seconds. Decoder output is presentation order.
+    /// Only the software decoder produces it; VideoToolbox surfaces no A53 side data (H.264/HEVC
+    /// never route through the SW host, so nothing is missed there).
+    var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)? { get set }
     var skipUntilPTS: CMTime? { get set }
 
     func open(stream: UnsafeMutablePointer<AVStream>, onFrame: @escaping DecodedFrameHandler) throws

@@ -860,6 +860,18 @@ extension AetherEngine {
             self?.publishLiveWindow(edgeSessionTime: edge)
         }
         self.softwareHost = host
+        // #131: no demuxable CC track on the SW path either: arm an A53 tap fed by decoded-frame
+        // side data. Same lazy synthetic-track surfacing as the producer path.
+        if !subtitleTracks.contains(where: { Self.isEmbeddedClosedCaptionCodec($0.codec) }) {
+            let ccTap = ClosedCaptionTap(engine: self, ccStreamIndex: Int32(Self.a53ClosedCaptionTrackID))
+            closedCaptionTap = ccTap
+            ccCueSnapshot = []
+            ccLastSnapshotSeq = 0
+            ccNativeStore = nil
+            host.onA53Captions = { [weak ccTap] triplets, pts in
+                ccTap?.ingestA53Ordered(triplets, ptsSeconds: pts)
+            }
+        }
         applyDesiredVolume(to: host)
         // #112 rework: SW-host subtitle tap feeds a session packet store; the shared
         // playhead-paced drainer reads it exactly like the HLS session's store.

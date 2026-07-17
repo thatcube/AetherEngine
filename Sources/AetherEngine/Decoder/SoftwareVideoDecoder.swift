@@ -19,6 +19,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// Fires once (demux thread) on first HDR10+ side data; engine flips videoFormat to .hdr10Plus.
     private var seenHDR10Plus = false
     var onFirstHDR10PlusDetected: (@Sendable () -> Void)?
+    var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)?
 
     /// True when the source is >8-bit (HDR10, AV1 HDR).
     private var use10Bit = false
@@ -134,6 +135,19 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             guard codecContext != nil else { lock.unlock(); break }
             let ret = avcodec_receive_frame(ctx, f)
             guard ret >= 0 else { lock.unlock(); break }
+
+            // #131: A53 captions surface as decoded-frame side data on the FFmpeg path (MPEG-2
+            // picture user data and friends). Presentation order by construction of decoder output.
+            if let onA53 = onA53Captions,
+               let sd = av_frame_get_side_data(f, AV_FRAME_DATA_A53_CC),
+               let sdData = sd.pointee.data, sd.pointee.size >= 3,
+               f.pointee.pts != Int64.min, timeBase.den > 0 {
+                let extracted = CCDataParser.parseCCDataTriplets(bytes: sdData, count: Int(sd.pointee.size))
+                if !extracted.isEmpty {
+                    let pts = Double(f.pointee.pts) * Double(timeBase.num) / Double(timeBase.den)
+                    onA53(extracted, pts)
+                }
+            }
 
             let isInterlaced = (f.pointee.flags & (1 << 3)) != 0  // AV_FRAME_FLAG_INTERLACED
             if isInterlaced || deinterlacer.isActive {
