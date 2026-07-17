@@ -543,6 +543,21 @@ public final class AetherEngine: ObservableObject {
     /// (no forward buffer after the budget) is reconciled.
     static let nativeSeekReconcileBudgetSeconds: Double = 8.0
 
+    /// DV/SMB forward-seek revert fix: when the first budget expires but the producer is demonstrably
+    /// serving the target region (a disjoint forward buffer island past the playhead is filling), the
+    /// seek is slow — not wedged — and the recovery (clock revert + producer re-anchor) would destroy
+    /// in-flight download progress and park the session. Grant a bounded number of shorter extension
+    /// windows so a slow SMB / Dolby-Vision source can land, before falling back to recovery.
+    static let nativeSeekMaxDeadlineExtensions: Int = 4
+    /// Per-extension budget (shorter than the initial budget so a landing is detected promptly and the
+    /// absolute wait stays bounded: initial 8s + 4×4s ≈ 24s worst case before recovery).
+    static let nativeSeekExtensionBudgetSeconds: Double = 4.0
+    /// A disjoint forward buffer island at least this large (seconds beyond the buffer contiguous with
+    /// AVPlayer's pinned pre-seek playhead) proves the producer is serving the seek target: extend
+    /// rather than recover. `bufferedEnd` is blind to this island (it only spans the old playhead);
+    /// `avPlayerBufferAheadSeconds()` sums the disjoint forward ranges that hold it.
+    static let nativeSeekProgressIslandFloorSeconds: Double = 1.0
+
     /// Native AVPlayer + AVPlayerLayer host. Non-nil between load and stop.
     var nativeHost: NativeAVPlayerHost?
 
@@ -2249,9 +2264,10 @@ public final class AetherEngine: ObservableObject {
             // Await real AVPlayer landing so isSeeking spans it (#37/#38), but bound the wait (#65): a seek
             // AVPlayer can never land (producer-wedge starvation) must not leave the optimistic clock latched
             // forever. A normal/slow-but-buffering seek lands or keeps buffering well within the budget.
-            let landed = await nativeHost?.seek(to: clockTarget,
+            var deadlineExtensionsUsed = 0
+            var landed = await nativeHost?.seek(to: clockTarget,
                                                 deadlineSeconds: Self.nativeSeekReconcileBudgetSeconds) ?? true
-            if !landed {
+            deadlineLoop: while !landed {
                 // Deadline expired. Only the surviving (winning) generation reconciles; a superseded seek
                 // returns at the guard below and lets the newer seek own the final state.
                 guard loadGeneration == gen, seekGeneration == seekGen else { return }
@@ -2263,11 +2279,6 @@ public final class AetherEngine: ObservableObject {
                     return
                 }
                 pendingRecoverySeekDeadlineExpired = true
-                // Eight seconds is a hard interactive cap. A second unbounded AVPlayer seek could
-                // inherit repeated 20 s source stalls and leave the caller suspended for 40+ s.
-                // Keep the original pending seek alive. Re-anchor only a starved producer; a
-                // healthy-but-slow producer is already filling toward the target and restarting it
-                // would throw away useful progress.
                 let avpReal = host.renderedTime
                 // The deadline continuation and AVPlayer completion are both MainActor jobs. If the
                 // completion published renderedTime first, its sink still saw deadlineExpired=false.
@@ -2291,6 +2302,47 @@ public final class AetherEngine: ObservableObject {
                     )
                     return
                 }
+                // DV/SMB forward-seek revert fix: `seekIsWedged`/`bufferedEnd` only measure the buffer
+                // contiguous with AVPlayer's pre-seek playhead, which stays pinned during a pending
+                // zero-tolerance forward seek — so a slow-but-working forward seek (the producer IS
+                // serving the target into a disjoint forward island) reads identically to a true wedge.
+                // Reconciling here (clock revert + producer re-anchor) would discard the in-flight
+                // download and park the session flapping on a slow SMB source. If that disjoint island is
+                // present/filling, the seek is slow, not wedged: hold the optimistic clock, leave the
+                // producer untouched, and grant a bounded extension so it can land.
+                let disjointIsland = Self.disjointForwardIslandSeconds(
+                    totalForwardAhead: avPlayerBufferAheadSeconds(),
+                    contiguousForwardAhead: host.bufferedEnd - avpReal)
+                if Self.shouldExtendSeekDeadlineForProgress(
+                    disjointIslandSeconds: disjointIsland,
+                    extensionsUsed: deadlineExtensionsUsed,
+                    maxExtensions: Self.nativeSeekMaxDeadlineExtensions,
+                    islandFloor: Self.nativeSeekProgressIslandFloorSeconds
+                ) {
+                    deadlineExtensionsUsed += 1
+                    // Re-assert the optimistic scrub clock at the target: the host cleared seekInFlight at
+                    // the deadline, un-gating the periodic observer, which could otherwise stick the clock
+                    // at the old playhead while the island fills. `awaitPendingSeekLanding` re-gates it and
+                    // waits on the SAME in-flight seek (no new avPlayer.seek, so the loaded target island is
+                    // not flushed); the producer is deliberately NOT restarted — together that preserves the
+                    // in-flight target download that the old re-anchor discarded (the ~40s device stall).
+                    nativeClockSeconds = clockTarget
+                    clock.currentTime = target
+                    EngineLog.emit(
+                        "[AetherEngine] seek slow but producer serving target "
+                        + "(island=\(String(format: "%.2f", disjointIsland))s, "
+                        + "rendered=\(String(format: "%.2f", avpReal))s "
+                        + "buffered=\(String(format: "%.2f", host.bufferedEnd))s); extending budget "
+                        + "\(deadlineExtensionsUsed)/\(Self.nativeSeekMaxDeadlineExtensions)",
+                        category: .engine
+                    )
+                    landed = await host.awaitPendingSeekLanding(
+                        target: clockTarget,
+                        deadlineSeconds: Self.nativeSeekExtensionBudgetSeconds)
+                    continue deadlineLoop
+                }
+                // True wedge (no forward island) or extensions exhausted: reconcile the clock to the real
+                // rendered position and re-anchor a genuinely starved / target-unbuffered producer.
                 let wasStarved = seekIsWedged(
                     renderedTime: avpReal, bufferedEnd: host.bufferedEnd)
                 // The pending target sits on AVPlayer's HLS clock axis, same axis `bufferedEnd`
@@ -2319,8 +2371,10 @@ public final class AetherEngine: ObservableObject {
                 // clock gives up the phantom target, but recovery keeps aiming there until rendered
                 // output reaches it or organic playback proves AVPlayer abandoned the seek.
                 EngineLog.emit(
-                    "[AetherEngine] seek did not land within \(Self.nativeSeekReconcileBudgetSeconds)s "
-                    + "(\(wasStarved ? "starved" : (targetWithinBuffer ? "target buffered" : "target unbuffered")), "
+                    "[AetherEngine] seek did not land within budget "
+                    + "(\(deadlineExtensionsUsed) extension\(deadlineExtensionsUsed == 1 ? "" : "s"); "
+                    + "\(wasStarved ? "starved" : (targetWithinBuffer ? "target buffered" : "target unbuffered")), "
+                    + "island=\(String(format: "%.2f", disjointIsland))s, "
                     + "rendered=\(String(format: "%.2f", avpReal))s "
                     + "buffered=\(String(format: "%.2f", host.bufferedEnd))s); reconciled clock"
                     + (didReanchor
@@ -2422,6 +2476,33 @@ public final class AetherEngine: ObservableObject {
     ) -> Bool {
         guard let target else { return true }
         return bufferedEnd + tolerance >= target
+    }
+
+    /// Seconds of forward buffer that sit in a *disjoint* island past AVPlayer's pinned pre-seek
+    /// playhead — i.e. total forward buffer minus the portion contiguous with the playhead. During a
+    /// pending zero-tolerance forward seek AVPlayer's `currentTime` (and thus `bufferedEnd`) stays at
+    /// the old position while the producer serves the target region into a non-contiguous island; that
+    /// island is exactly this difference. A meaningful value means the producer is progressing toward
+    /// the target even though `bufferedEnd`/`seekIsWedged` (contiguous-only) read "starved".
+    nonisolated static func disjointForwardIslandSeconds(
+        totalForwardAhead: Double,
+        contiguousForwardAhead: Double
+    ) -> Double {
+        max(0, totalForwardAhead - max(0, contiguousForwardAhead))
+    }
+
+    /// Pure decision: on a seek-deadline expiry, should the engine grant another (shorter) extension
+    /// window instead of reverting the clock + re-anchoring the producer? Yes while the producer is
+    /// demonstrably serving the target (a disjoint forward island ≥ `islandFloor` is present) and the
+    /// extension budget is not yet exhausted. This keeps a slow-but-working forward seek (DV/SMB) from
+    /// being converted into a permanent wedge by a recovery that would discard the in-flight download.
+    nonisolated static func shouldExtendSeekDeadlineForProgress(
+        disjointIslandSeconds: Double,
+        extensionsUsed: Int,
+        maxExtensions: Int,
+        islandFloor: Double
+    ) -> Bool {
+        extensionsUsed < maxExtensions && disjointIslandSeconds >= islandFloor
     }
 
     nonisolated static func shouldCatchUpDeadlineLanding(

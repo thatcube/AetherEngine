@@ -716,6 +716,38 @@ final class NativeAVPlayerHost {
         }
     }
 
+    /// DV/SMB forward-seek revert fix: wait longer for the seek already in flight WITHOUT issuing a
+    /// new `avPlayer.seek`. A deadline expiry does not cancel the underlying seek (see `seek(to:deadlineSeconds:)`),
+    /// so it is still progressing toward `target` and its completion (which settles `currentTime` for the
+    /// unchanged generation) can still fire; the engine gave up too early on a slow source. Re-issuing the
+    /// seek would bump the generation and could make AVPlayer re-fetch the target segment it has already
+    /// partly loaded — the opposite of what a starved SMB source needs. This just re-arms the wait and
+    /// re-gates the periodic observer (which the deadline un-gated) so the optimistic clock is not walked
+    /// back to the pre-seek position while the target buffers.
+    ///
+    /// - Returns: `true` once the pending seek has landed (AVPlayer's `currentTime` reached `target`),
+    ///   `false` if it is still pending after `deadlineSeconds` or a newer seek superseded it.
+    func awaitPendingSeekLanding(target seconds: Double, deadlineSeconds: Double) async -> Bool {
+        // Re-gate: the prior deadline cleared seekInFlight, so the periodic observer would otherwise
+        // publish AVPlayer's still-pre-seek position and un-latch the optimistic clock. The original
+        // seek's completion clears this again when it lands.
+        let gen = seekGeneration
+        if !seekInFlight { seekInFlight = true }
+        try? await Task.sleep(nanoseconds: UInt64(deadlineSeconds * 1_000_000_000))
+        // A newer seek arrived while we waited: let it own the final state.
+        guard gen == seekGeneration else { return false }
+        let now = avPlayer.currentTime().seconds
+        // Zero-tolerance seeks complete with currentTime AT the target; a small window covers timescale rounding.
+        let landed = now.isFinite && abs(now - seconds) <= 0.75
+        if landed {
+            // The completion may not have run its MainActor job yet; settle so the observer stays gated
+            // until the engine finalizes and mirror what the completion would publish.
+            seekInFlight = false
+            currentTime = now
+        }
+        return landed
+    }
+
     func setRate(_ value: Float) {
         // Non-zero rate counts as play intent (must survive replaceCurrentItem swap like play() does).
         playIntent = (value != 0)

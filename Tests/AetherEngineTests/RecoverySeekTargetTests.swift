@@ -95,6 +95,81 @@ struct RecoverySeekTargetTests {
             target: nil, bufferedEnd: 0.0))
     }
 
+    @Test("a disjoint forward buffer island is total forward ahead minus the contiguous portion")
+    func disjointForwardIsland() {
+        // DV/SMB failing forward seek at deadline: AVPlayer buffered ~4s of the TARGET region into a
+        // non-contiguous island while bufferedEnd (contiguous with the pinned old playhead) reads 0.
+        #expect(AetherEngine.disjointForwardIslandSeconds(
+            totalForwardAhead: 4.0, contiguousForwardAhead: 0.0) == 4.0)
+        // Later window: 6.4s of target buffered, still nothing contiguous with the frozen playhead.
+        #expect(AetherEngine.disjointForwardIslandSeconds(
+            totalForwardAhead: 6.4, contiguousForwardAhead: 0.0) == 6.4)
+        // A healthy seek that landed contiguously: all forward buffer is contiguous, no island.
+        #expect(AetherEngine.disjointForwardIslandSeconds(
+            totalForwardAhead: 14.4, contiguousForwardAhead: 14.4) == 0.0)
+        // A true wedge: nothing anywhere -> no island.
+        #expect(AetherEngine.disjointForwardIslandSeconds(
+            totalForwardAhead: 0.0, contiguousForwardAhead: 0.0) == 0.0)
+        // Mixed: 10s total, 3s contiguous -> 7s island.
+        #expect(AetherEngine.disjointForwardIslandSeconds(
+            totalForwardAhead: 10.0, contiguousForwardAhead: 3.0) == 7.0)
+        // A negative contiguous reading (bufferedEnd behind rendered) clamps to 0, not inflating the island.
+        #expect(AetherEngine.disjointForwardIslandSeconds(
+            totalForwardAhead: 5.0, contiguousForwardAhead: -2.0) == 5.0)
+        // Total smaller than contiguous (transient) never yields a negative island.
+        #expect(AetherEngine.disjointForwardIslandSeconds(
+            totalForwardAhead: 2.0, contiguousForwardAhead: 5.0) == 0.0)
+    }
+
+    @Test("a filling forward island extends the deadline; a wedge or exhausted budget does not")
+    func extendSeekDeadlineDecision() {
+        let floor = 1.0
+        let maxExt = 4
+        // DV/SMB slow forward seek: 4s island present, budget fresh -> extend instead of recovering.
+        #expect(AetherEngine.shouldExtendSeekDeadlineForProgress(
+            disjointIslandSeconds: 4.0, extensionsUsed: 0, maxExtensions: maxExt, islandFloor: floor))
+        // Still filling on a later extension, budget not exhausted -> keep extending.
+        #expect(AetherEngine.shouldExtendSeekDeadlineForProgress(
+            disjointIslandSeconds: 6.4, extensionsUsed: 3, maxExtensions: maxExt, islandFloor: floor))
+        // True wedge: no island -> do NOT extend, fall through to recovery.
+        #expect(!AetherEngine.shouldExtendSeekDeadlineForProgress(
+            disjointIslandSeconds: 0.0, extensionsUsed: 0, maxExtensions: maxExt, islandFloor: floor))
+        // Sub-floor sliver is not convincing progress -> recover, don't extend forever.
+        #expect(!AetherEngine.shouldExtendSeekDeadlineForProgress(
+            disjointIslandSeconds: 0.5, extensionsUsed: 0, maxExtensions: maxExt, islandFloor: floor))
+        // Budget exhausted even with a healthy island -> stop extending, bound the total wait.
+        #expect(!AetherEngine.shouldExtendSeekDeadlineForProgress(
+            disjointIslandSeconds: 6.4, extensionsUsed: 4, maxExtensions: maxExt, islandFloor: floor))
+        // Exactly at the floor counts as progress.
+        #expect(AetherEngine.shouldExtendSeekDeadlineForProgress(
+            disjointIslandSeconds: 1.0, extensionsUsed: 0, maxExtensions: maxExt, islandFloor: floor))
+    }
+
+    @Test("the device-trace forward seek extends while the target island fills, then lands not wedges")
+    @MainActor
+    func deviceTraceForwardSeekPrefersExtension() {
+        // Reconstruct the failing repro at deadline (build 2017 trace): rendered==buffered==old playhead,
+        // so the contiguous-only metric reads starved, but avPlayerBufferAheadSeconds() saw the target
+        // island growing 0.55 -> 4.0 -> 6.4s. The engine must EXTEND, not run the harmful recovery.
+        let islandAtDeadline = AetherEngine.disjointForwardIslandSeconds(
+            totalForwardAhead: 4.0, contiguousForwardAhead: 896.35 - 896.35)
+        #expect(islandAtDeadline == 4.0)
+        #expect(AetherEngine.shouldExtendSeekDeadlineForProgress(
+            disjointIslandSeconds: islandAtDeadline, extensionsUsed: 0,
+            maxExtensions: AetherEngine.nativeSeekMaxDeadlineExtensions,
+            islandFloor: AetherEngine.nativeSeekProgressIslandFloorSeconds))
+
+        // Contrast: a genuinely wedged seek (producer never served the target) has no island and must
+        // NOT be kept alive by endless extensions — it falls through to recovery + re-anchor.
+        let wedgeIsland = AetherEngine.disjointForwardIslandSeconds(
+            totalForwardAhead: 0.0, contiguousForwardAhead: 0.0)
+        #expect(wedgeIsland == 0.0)
+        #expect(!AetherEngine.shouldExtendSeekDeadlineForProgress(
+            disjointIslandSeconds: wedgeIsland, extensionsUsed: 0,
+            maxExtensions: AetherEngine.nativeSeekMaxDeadlineExtensions,
+            islandFloor: AetherEngine.nativeSeekProgressIslandFloorSeconds))
+    }
+
     @Test("a published completion is the authoritative deadline catch-up signal")
     func completionPublicationDecision() {
         #expect(AetherEngine.shouldCatchUpDeadlineLanding(renderedTimePublished: true))
