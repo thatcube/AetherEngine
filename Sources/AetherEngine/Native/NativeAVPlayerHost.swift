@@ -472,8 +472,16 @@ final class NativeAVPlayerHost {
         }
     }
 
-    func tearDown() {
-        unloadCurrentItem()
+    /// - Parameter deactivateAudioSession: on a TRUE final teardown (leaving playback entirely, not a
+    ///   native->native / native->audio / native->software handoff where audio keeps playing) release the
+    ///   AVAudioSession after the item is unloaded. The native path never explicitly activates the session
+    ///   (issue #24: AVKit / implicit activation drives per-playback HDMI route negotiation), so it also never
+    ///   deactivated it -- which strands an EAC3/JOC Atmos bitstream-passthrough render ring on the HDMI sink:
+    ///   releasing the AVPlayer without deactivating leaves the receiver looping the last MAT frame ("audio
+    ///   stutters/loops after leaving the video"). Deactivation is the counterpart to that implicit activation
+    ///   and only fires on final teardown so handoffs/reloads (which must keep audio alive) are untouched.
+    func tearDown(deactivateAudioSession: Bool = false) {
+        unloadCurrentItem(deactivateAudioSession: deactivateAudioSession)
     }
 
     // MARK: - Failure handling
@@ -788,7 +796,7 @@ final class NativeAVPlayerHost {
 
     // MARK: - Internal
 
-    private func unloadCurrentItem(inPlaceSwap: Bool = false) {
+    private func unloadCurrentItem(inPlaceSwap: Bool = false, deactivateAudioSession: Bool = false) {
         if let to = timeObserver {
             avPlayer.removeTimeObserver(to)
             timeObserver = nil
@@ -833,6 +841,29 @@ final class NativeAVPlayerHost {
         renderedTime = 0
         duration = 0
         rate = 0
+        // Final teardown only: release the AVAudioSession now that the item is unloaded and the player paused.
+        // pause() + replaceCurrentItem(nil) flush AVPlayer's own render pipeline, but on an EAC3/JOC Atmos
+        // BITSTREAM PASSTHROUGH route the HDMI sink keeps its own decode ring and, with the session still
+        // active, loops the last MAT frame after the player is released (Brandon: audio stutters/loops after
+        // pressing Back to leave the video, persists off-screen). Deactivating is the counterpart to the
+        // native path's implicit/AVKit per-playback activation (issue #24) and closes that ring. Gated to true
+        // teardown so native->native / native->audio / native->software handoffs and #93 reloads -- which must
+        // keep audio alive -- never hit it. Best-effort + .notifyOthersOnDeactivation so other audio resumes.
+        #if os(iOS) || os(tvOS)
+        if deactivateAudioSession {
+            do {
+                try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+                EngineLog.emit(
+                    "[NativeAVPlayerHost] #\(sessionID) deactivated AVAudioSession on final teardown "
+                    + "(release passthrough render ring)",
+                    category: .engine)
+            } catch {
+                EngineLog.emit(
+                    "[NativeAVPlayerHost] #\(sessionID) AVAudioSession deactivate on teardown failed: \(error)",
+                    category: .engine)
+            }
+        }
+        #endif
     }
 
     /// Dump asset URL + track FourCCs on .failed and asset.load failure; d9b8aa5 added the asset.load path because item.status never went .failed in DrHurt's P5 MKV session.

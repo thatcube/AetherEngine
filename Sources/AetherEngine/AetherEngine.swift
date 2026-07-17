@@ -2981,7 +2981,11 @@ public final class AetherEngine: ObservableObject {
         liveTelemetrySampler = nil
         diagnostics.liveTelemetry = nil
         nativeCancellables.removeAll()
-        nativeHost?.tearDown()
+        // deactivateAudioSession only on a TRUE final teardown (!keepNativeHost): a keepNativeHost reload keeps
+        // the session/host alive for the next item, and the native->audio/software handoff callers (which pass
+        // the default false) keep audio playing on another host. This releases the EAC3/Atmos passthrough ring
+        // that otherwise loops on the HDMI sink after leaving playback.
+        nativeHost?.tearDown(deactivateAudioSession: !keepNativeHost)
         if !keepNativeHost {
             nativeHost = nil
             currentAVPlayer = nil
