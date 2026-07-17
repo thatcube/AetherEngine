@@ -38,4 +38,19 @@ struct CCDataParserTests {
         #expect(triplets(of: [0xFC, 0x94, 0x20, 0xFC, 0x13]).count == 1)  // trailing 2-byte remainder dropped
         #expect(triplets(of: []).isEmpty)
     }
+
+    @Test("Byte-level overload matches the packet path (#131)")
+    func byteLevelOverload() {
+        let bytes: [UInt8] = [0xFC, 0x94, 0x20,
+                              0xFD, 0x41, 0x42,
+                              0xF8, 0x55, 0x66]
+        let out = bytes.withUnsafeBufferPointer {
+            CCDataParser.parseCCDataTriplets(bytes: $0.baseAddress!, count: $0.count)
+        }
+        #expect(out == [
+            .init(type: 0, data0: 0x94, data1: 0x20),
+            .init(type: 1, data0: 0x41, data1: 0x42),
+        ])
+        #expect(CCDataParser.parseCCDataTriplets(bytes: bytes, count: 2).isEmpty)
+    }
 }
