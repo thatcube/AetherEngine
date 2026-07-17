@@ -262,7 +262,13 @@ extension AetherEngine {
         ccCueSnapshot = []
         ccLastSnapshotSeq = 0
         ccNativeStore = nil
-        if let ccTrack = subtitleTracks.first(where: { Self.isEmbeddedClosedCaptionCodec($0.codec) }) {
+        // Exclude the synthetic A53 entry: a reload that rebuilds the session without re-probing
+        // (audio switch, custom-source reload) still carries it in subtitleTracks, and it has no
+        // demuxable stream to tap; treating it as one would arm a dead observer (and the SW guard
+        // below would skip arming), silently dropping captions after the reload.
+        if let ccTrack = subtitleTracks.first(where: {
+            Self.isEmbeddedClosedCaptionCodec($0.codec) && $0.id != Self.a53ClosedCaptionTrackID
+        }) {
             let idx = Int32(ccTrack.id)
             let tap = ClosedCaptionTap(engine: self, ccStreamIndex: idx)
             closedCaptionTap = tap

@@ -862,7 +862,11 @@ extension AetherEngine {
         self.softwareHost = host
         // #131: no demuxable CC track on the SW path either: arm an A53 tap fed by decoded-frame
         // side data. Same lazy synthetic-track surfacing as the producer path.
-        if !subtitleTracks.contains(where: { Self.isEmbeddedClosedCaptionCodec($0.codec) }) {
+        // Same synthetic-entry exclusion as setupClosedCaptionTapIfNeeded: a stale A53 track from
+        // a prior session must not read as a demuxable CC stream on a no-reprobe reload.
+        if !subtitleTracks.contains(where: {
+            Self.isEmbeddedClosedCaptionCodec($0.codec) && $0.id != Self.a53ClosedCaptionTrackID
+        }) {
             let ccTap = ClosedCaptionTap(engine: self, ccStreamIndex: Int32(Self.a53ClosedCaptionTrackID))
             closedCaptionTap = ccTap
             ccCueSnapshot = []
