@@ -1151,16 +1151,6 @@ public final class AetherEngine: ObservableObject {
             && reasserts < maxStallRecoveryReasserts
     }
 
-    /// #122: the state a seek lands in. A seek must preserve the transport intent in effect when it
-    /// was issued: the normal finalize used to force `.playing`, which reported playing after a
-    /// paused scrub and made the #93 recovery reassert misread the seek's own paused landing as a
-    /// spurious pause (`engineStateIsPlaying` was true) and call `host.play()`. Deriving from the
-    /// durable `playIntent` (a seek never touches it) lands a paused seek paused and a playing seek
-    /// playing, and keeps `engineStateIsPlaying` honest so the reassert only fires on real stalls.
-    nonisolated static func seekFinalizeState(transportIntentIsPlaying: Bool) -> PlaybackState {
-        transportIntentIsPlaying ? .playing : .paused
-    }
-
     /// Reconcile native seek completion while the regular time-control sink was gated by `.seeking`.
     /// Live AVPlayer status captures an external play that superseded older engine pause intent; a
     /// live pause wins unless the bounded stall-recovery policy deliberately reasserts playback.
